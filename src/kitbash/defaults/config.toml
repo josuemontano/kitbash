@@ -1,0 +1,188 @@
+# kitbash default configuration.
+# Copy this file, edit what you need and pass it with `--config my.toml`.
+# Only the keys you set are overridden; everything else falls back to these defaults.
+
+[paths]
+# Global, reusable asset library. Never inside a scene output directory.
+backlot = "~/.local/share/backlot"
+trellis = "/Volumes/Vault/Projects/bethel/trellis-mac"
+# Cache for downloaded HDRIs and textures (Poly Haven).
+downloads = "~/.cache/kitbash/downloads"
+
+[tools]
+omp = "omp"
+blender = "blender"
+# Python used to run Trellis. Empty = "<paths.trellis>/.venv/bin/python" when it exists, else "python3".
+trellis_python = ""
+
+# Model per role. Override per run with `--model.<role>=<name>`
+# or per phase with `--model.<phase>.<role>=<name>`.
+[models]
+code = "claude-opus-5"               # all Python written for Blender, and every patch
+image_analysis = "gemini-3.8-flash"  # breakdown of a reference image
+reference_selection = "gemini-3.8-flash"
+visual_critic = "gemini-3.8-flash"
+prompt_analysis = "gpt-6-sol"        # breakdown of a text prompt (no reference image)
+technical_critic = "claude-opus-5"
+
+# Per-phase overrides, for example:
+# [models.phases.layout]
+# code = "claude-opus-5"
+[models.phases]
+
+# Roles that need image input. The preflight checks their models accept images.
+[models.capabilities]
+image_roles = ["image_analysis", "reference_selection", "visual_critic", "code"]
+
+[models.thinking]
+code = "high"
+image_analysis = "medium"
+reference_selection = "low"
+visual_critic = "medium"
+prompt_analysis = "high"
+technical_critic = "medium"
+
+[omp]
+timeout_s = 900
+retries = 2
+retry_backoff_s = 5.0
+# Extra flags appended to every `omp -p` call.
+extra_args = []
+# At startup, send one tiny prompt per configured model so rejected credentials or budgets fail fast.
+preflight_ping = true
+
+[pipeline]
+style = "photorealistic"
+threads = 2
+review_buffer = 6
+
+[critic]
+max_cycles = 4
+# Weighted rubric score needed to pass, in [0, 1].
+pass_threshold = 0.8
+# Also require every applicable criterion to pass.
+require_all_pass = true
+# Stop early when the best score has not improved by `stall_epsilon` for `stall_cycles` cycles.
+stall_cycles = 2
+stall_epsilon = 0.01
+# Revert a patch whose score drops by more than this.
+revert_epsilon = 0.02
+# Attempts at producing a patch that applies cleanly, per cycle.
+patch_attempts = 2
+
+[breakdown]
+# Items below this confidence are unrecognized and need the user's help.
+confidence_threshold = 0.45
+max_items = 40
+
+[backlot]
+# Cosine similarity in [0, 1] needed to propose reusing an asset.
+match_threshold = 0.78
+top_k = 3
+# Only propose assets built for the same --style.
+match_style = false
+
+[embedding]
+# "sentence-transformers" (local), "http" (OpenAI-compatible /v1/embeddings, e.g. LM Studio) or "hashing" (offline, tests).
+backend = "sentence-transformers"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+base_url = "http://127.0.0.1:1234/v1"
+dimensions = 384
+timeout_s = 60
+
+[reference]
+# Candidate sources: "input_crop" (crop from the reference image), "omp_web" (the omp agent's web_search tool:
+# slower, but finds product photos on white backgrounds), "wikimedia" and "openverse" (free image APIs).
+providers = ["input_crop", "omp_web", "wikimedia", "openverse"]
+max_candidates = 8
+per_provider = 6
+min_side_px = 256
+max_download_mb = 15
+timeout_s = 30
+query_suffix = "isolated white background"
+
+[polyhaven]
+# Offer Poly Haven HDRIs and textures (catalog listings) to the code writer.
+enabled = true
+cache_ttl_s = 86400
+
+[trellis]
+steps = 64
+pipeline_type = "1024"
+no_texture = true
+retries = 2
+# The 1024 pipeline with 64 steps can take 30-60+ minutes per mesh on Apple Silicon.
+timeout_s = 7200
+# Concurrent Trellis jobs. 0 = same as --threads.
+max_concurrent = 0
+seed = 42
+# Up axis of the vertices Trellis writes with --no-texture (raw, Z-up even inside its .glb).
+mesh_up_axis = "Z"
+
+[blender]
+timeout_s = 900
+bake_timeout_s = 1800
+render_engine = "CYCLES"
+cycles_device = "CPU"
+preview_resolution = [768, 768]
+preview_samples = 32
+preview_views = ["front_3q", "side", "back_3q"]
+final_resolution = [1920, 1080]
+final_samples = 128
+# Face budget for Trellis meshes imported by the build script.
+max_faces = 150000
+
+[usd]
+# "auto" = MaterialX when the installed Blender supports it, "off" = always UsdPreviewSurface.
+materialx = "auto"
+# Also bake textures for the UsdPreviewSurface fallback of MaterialX materials, so
+# consumers that only read UsdPreviewSurface (including Blender's importer) match the .blend.
+bake_preview_fallback = true
+bake_resolution = 1024
+bake_samples = 16
+# Round-trip render comparison.
+roundtrip_resolution = [384, 384]
+roundtrip_samples = 16
+roundtrip_threshold = 0.85
+
+[naming]
+# Placeholders: {slug} = asset slug (snake_case), {part} = material or image part name, {channel} = texture channel.
+object = "{slug}"
+mesh = "{slug}_mesh"
+material = "mat_{slug}_{part}"
+image = "tex_{slug}_{part}"
+collection = "{slug}"
+
+[assembly]
+# "append" copies asset data into scene.blend (fully self-contained), "link" keeps library links to scene/assets/.
+mode = "append"
+
+[ui]
+refresh_per_second = 4
+show_previews = true
+
+[styles.photorealistic]
+render_engine = "CYCLES"
+guidance = """
+Physically based lighting. Use an HDRI world (Poly Haven) that matches the reference's light direction,
+color temperature and environment, plus key/fill area lights only where needed. Filmic/AgX view transform,
+realistic exposure, perspective camera matching the reference focal length and height.
+Match the reference's color palette and contrast.
+"""
+
+[styles.2d]
+render_engine = "BLENDER_EEVEE"
+guidance = """
+Flat or toon shading: convert shading with Shader to RGB + Color Ramp (constant interpolation) in
+material overrides or world/light setup, bold outlines with Freestyle or Line Art, simple even lighting,
+orthographic or stylized camera, Standard view transform, saturated flat color palette.
+Keep the asset materials editable; express the style at the scene level.
+"""
+
+[styles.animated-3d]
+render_engine = "CYCLES"
+guidance = """
+Stylized PBR as in feature animation: soft large area lights, gentle rim light, saturated but harmonious
+colors, low-contrast HDRI or gradient world, slightly wider lens, AgX with a punchy look and stylized
+color grading. Avoid harsh shadows.
+"""

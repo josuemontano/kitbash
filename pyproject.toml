@@ -1,0 +1,59 @@
+[project]
+name = "kitbash"
+version = "0.1.0"
+description = "Turn a reference image or a text prompt into an editable Blender scene, one asset at a time."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+authors = [{ name = "Josue Montano" }]
+dependencies = [
+    "attrs (>=25.3)",
+    "typer (>=0.19)",
+    "rich (>=14.0)",
+    "httpx (>=0.28)",
+    "sqlite-vec (>=0.1.6)",
+    "numpy (>=2.3)",
+    "pillow (>=11.3)",
+    "tomli-w (>=1.2)",
+    "sentence-transformers (>=5.1)",
+]
+
+[project.scripts]
+kitbash = "kitbash.cli:main"
+
+[tool.poetry]
+packages = [{ include = "kitbash", from = "src" }]
+include = [
+    { path = "src/kitbash/defaults/*", format = ["sdist", "wheel"] },
+    { path = "src/kitbash/prompts/*", format = ["sdist", "wheel"] },
+    { path = "src/kitbash/blender/**/*", format = ["sdist", "wheel"] },
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.4"
+pytest-timeout = ">=2.4"
+ruff = "^0.16.9"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "blender: needs a real Blender executable (skipped when Blender is missing)",
+    "integration: end-to-end tests with mocked omp and Trellis",
+]
+addopts = "-ra"
+timeout = 900
+
+[tool.ruff]
+line-length = 130
+target-version = "py314"
+extend-exclude = ["src/kitbash/blender/templates"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "B008", "UP040"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/kitbash/blender/*" = ["UP", "RUF"]

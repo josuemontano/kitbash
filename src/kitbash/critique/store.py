@@ -1,0 +1,205 @@
+"""Checkpoints of the critic loop: ``cycles/NN/`` files plus the cycles and diffs tables of state.db."""
+
+import json
+import time
+from pathlib import Path
+
+from attrs import define, field, frozen
+
+from kitbash.critique.history import DiffHistory, DiffStatus, HistoryEntry
+from kitbash.critique.subject import Evaluation, LoopSubject
+from kitbash.domain.critique import Critique, Edit, ScoreCard, scorecard_from_dict
+from kitbash.paths import OutputLayout
+from kitbash.store.state import CycleRepository, CycleRow, DiffRow
+
+PENDING = "pending"
+ABANDONED = "abandoned"  # written but never evaluated: superseded by a new request
+PRIORITY = {"high": 0, "medium": 1, "low": 2}
+
+
+@frozen
+class CycleResult:
+    cycle: int
+    script_path: Path
+    scorecard: ScoreCard
+    critiques: tuple[Critique, ...]
+    evaluation: Evaluation
+    status: DiffStatus
+
+    @property
+    def score(self) -> float:
+        return self.scorecard.overall
+
+    def edits(self) -> list[Edit]:
+        """Critic edits plus one edit per failing criterion, most important first."""
+        edits = [edit for critique in self.critiques for edit in critique.edits]
+        edits += [
+            Edit(instruction=f"Make '{entry.name}' pass. {' '.join(entry.notes)}".strip(), source="rubric", priority="high")
+            for entry in self.scorecard.failing()
+            if entry.decided_by == "check" or not entry.notes
+        ]
+        return sorted(edits, key=lambda e: PRIORITY.get(e.priority, 1))
+
+
+@define
+class LoopState:
+    results: dict[int, CycleResult] = field(factory=dict)
+    pending: tuple[int, Path] | None = None
+    history: DiffHistory = field(factory=DiffHistory)
+    last_cycle: int = 0
+
+    @property
+    def next_cycle(self) -> int:
+        return self.last_cycle + 1
+
+    def best(self, since: int = 1) -> CycleResult | None:
+        candidates = [r for c, r in self.results.items() if c >= since]
+        return max(candidates, key=lambda r: (r.score, r.cycle), default=None)
+
+    def session_cycles(self, start: int) -> int:
+        return sum(1 for c in self.results if c >= start)
+
+
+
+class CycleStore:
+    """Reads and writes everything a loop needs to resume: scripts, diffs, critiques and statuses."""
+
+    def __init__(self, cycles: CycleRepository, layout: OutputLayout) -> None:
+        self._cycles = cycles
+        self._layout = layout
+
+    def cycle_dir(self, subject: LoopSubject, cycle: int) -> Path:
+        return self._layout.cycle_dir(subject.phase, cycle, subject.subject_id)
+
+    def write_cycle(
+        self, subject: LoopSubject, state: LoopState, cycle: int, script: str, diff: str, *, score_before: float | None, initial: bool = False
+    ) -> None:
+        directory = self.cycle_dir(subject, cycle)
+        directory.mkdir(parents=True, exist_ok=True)
+        script_path = directory / "script.py"
+        diff_path = directory / "diff.patch"
+        script_path.write_text(script, encoding="utf-8")
+        diff_path.write_text(diff, encoding="utf-8")
+        entry = HistoryEntry(cycle=cycle, status=DiffStatus.APPLIED, diff=diff, score_before=score_before, initial=initial)
+        self._cycles.save_cycle(
+            CycleRow(
+                phase=subject.phase.value, subject=subject.subject_id, cycle=cycle, script_path=str(script_path),
+                diff_path=str(diff_path), critique_path=None, score=None, passed=None, status=PENDING,
+                summary="initial script" if initial else "", created_at=time.time(),
+            )
+        )
+        self._cycles.save_diff(
+            DiffRow(
+                phase=subject.phase.value, subject=subject.subject_id, cycle=cycle, status=DiffStatus.APPLIED.value,
+                fingerprint=entry.fingerprint, diff_path=str(diff_path), reason="initial" if initial else "",
+                score_before=score_before, score_after=None,
+            )
+        )
+        state.history.add(entry)
+        state.pending = (cycle, script_path)
+        state.last_cycle = max(state.last_cycle, cycle)
+
+    def reject(self, subject: LoopSubject, state: LoopState, cycle: int, diff: str, reason: str, score: float) -> None:
+        directory = self.cycle_dir(subject, cycle)
+        directory.mkdir(parents=True, exist_ok=True)
+        attempt = len(list(directory.glob("rejected_*.patch"))) + 1
+        path = directory / f"rejected_{attempt}.patch"
+        path.write_text(f"# rejected: {reason}\n{diff}", encoding="utf-8")
+        entry = HistoryEntry(cycle=cycle, status=DiffStatus.REJECTED, diff=diff, reason=reason, score_before=score)
+        state.history.add(entry)
+        self._cycles.save_diff(
+            DiffRow(
+                phase=subject.phase.value, subject=subject.subject_id, cycle=cycle, status=DiffStatus.REJECTED.value,
+                fingerprint=entry.fingerprint, diff_path=str(path), reason=reason, score_before=score, score_after=None,
+            )
+        )
+
+    def save_evaluation(self, subject: LoopSubject, result: CycleResult) -> None:
+        directory = result.script_path.parent
+        critique_path = directory / "critique.json"
+        (directory / "report.json").write_text(json.dumps(result.evaluation.report, indent=2, default=str), encoding="utf-8")
+        critique_path.write_text(
+            json.dumps(
+                {
+                    "cycle": result.cycle,
+                    "status": result.status.value,
+                    "scorecard": result.scorecard.to_dict(),
+                    "critiques": [c.to_dict() for c in result.critiques],
+                    "evaluation": result.evaluation.to_dict(),
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        summary = " | ".join(c.summary for c in result.critiques if c.summary)[:1000]
+        self._cycles.save_cycle(
+            CycleRow(
+                phase=subject.phase.value, subject=subject.subject_id, cycle=result.cycle,
+                script_path=str(result.script_path), diff_path=str(directory / "diff.patch"),
+                critique_path=str(critique_path), score=result.score, passed=result.scorecard.passed,
+                status=result.status.value, summary=summary, created_at=time.time(),
+            )
+        )
+        self._cycles.update_diff(subject.phase, subject.subject_id, result.cycle, status=result.status.value, score_after=result.score)
+
+    def abandon_pending(self, subject: LoopSubject) -> None:
+        """Retire a cycle that was written but never evaluated (a crashed session a new request replaces)."""
+        state = self.load(subject)
+        if state.pending is None:
+            return
+        cycle, script_path = state.pending
+        self._cycles.save_cycle(
+            CycleRow(
+                phase=subject.phase.value, subject=subject.subject_id, cycle=cycle, script_path=str(script_path),
+                diff_path=str(script_path.parent / "diff.patch"), critique_path=None, score=None, passed=None,
+                status=ABANDONED, summary="superseded before evaluation", created_at=time.time(),
+            )
+        )
+        self._cycles.update_diff(subject.phase, subject.subject_id, cycle, status=DiffStatus.REJECTED.value, score_after=None)
+
+    def load(self, subject: LoopSubject) -> LoopState:
+        state = LoopState()
+        for row in self._cycles.cycles(subject.phase, subject.subject_id):
+            state.last_cycle = max(state.last_cycle, row.cycle)
+            if row.status == ABANDONED:
+                continue
+            if row.status == PENDING or not row.critique_path:
+                state.pending = (row.cycle, Path(row.script_path))
+                continue
+            state.results[row.cycle] = _result_from_files(row)
+        for diff in self._cycles.diffs(subject.phase, subject.subject_id):
+            path = Path(diff.diff_path)
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if diff.status == DiffStatus.REJECTED.value and text.startswith("# rejected:"):
+                text = text.split("\n", 1)[1] if "\n" in text else ""
+            state.history.add(
+                HistoryEntry(
+                    cycle=diff.cycle, status=DiffStatus(diff.status), diff=text, reason=diff.reason or "",
+                    score_before=diff.score_before, score_after=diff.score_after, initial=diff.reason == "initial",
+                )
+            )
+        return state
+
+
+def _result_from_files(row: CycleRow) -> CycleResult:
+    data = json.loads(Path(row.critique_path).read_text(encoding="utf-8"))
+    evaluation_data = data.get("evaluation", {})
+    report_path = Path(row.script_path).parent / "report.json"
+    evaluation = Evaluation(
+        ok=bool(evaluation_data.get("ok")),
+        images=tuple(Path(p) for p in evaluation_data.get("images", [])),
+        facts=evaluation_data.get("facts", {}),
+        report=json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {},
+        error=evaluation_data.get("error"),
+        artifacts=evaluation_data.get("artifacts", {}),
+    )
+    critiques = tuple(Critique.parse(c["critic"], c, model=c.get("model", "")) for c in data.get("critiques", []))
+    return CycleResult(
+        cycle=row.cycle,
+        script_path=Path(row.script_path),
+        scorecard=scorecard_from_dict(data.get("scorecard", {})),
+        critiques=critiques,
+        evaluation=evaluation,
+        status=DiffStatus(row.status),
+    )

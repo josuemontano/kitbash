@@ -1,0 +1,1 @@
+src/kitbash/defaults/rubric.md

@@ -1,0 +1,33 @@
+"""Breakdown blockout: one labelled proxy box per inventory item, seen through the estimated camera.
+
+INVENTORY is the source of truth for this cycle. Critic patches edit it (names, dimensions,
+positions, rotations, relationships, missing or duplicate items) and kitbash reads it back.
+Units: meters, Z up, positions are the base center of each object, rotations are XYZ degrees.
+"""
+
+import kitbash_bpy as kb
+
+INVENTORY = $inventory
+
+
+def build():
+    kb.reset_scene()
+    kb.color_world((0.55, 0.55, 0.58), 1.0)
+    kb.ground_plane(size=40.0)
+    kb.light("SUN", (0.0, 0.0, 10.0), energy=3.0, rotation_deg=(40.0, 0.0, 30.0))
+    for item in INVENTORY["items"]:
+        size = item["dimensions_m"]
+        kb.place_placeholder(
+            item["id"],
+            (size["width"], size["depth"], size["height"]),
+            item["position"]["location_m"],
+            item["position"]["rotation_deg"],
+            label=item["name"],
+        )
+    camera = INVENTORY["scene"]["camera"]
+    kb.camera(camera["location_m"], rotation_deg=camera["rotation_deg"], focal_length_mm=camera["focal_length_mm"])
+    kb.emit("inventory", INVENTORY)
+    kb.save_scene()
+
+
+build()
