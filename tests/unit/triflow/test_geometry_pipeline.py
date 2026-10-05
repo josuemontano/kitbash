@@ -15,6 +15,7 @@ from kitbash.retopology.triflow.geometry import (
     get_precise_occupancy,
     process_one_mesh,
     robust_remesh,
+    sdf_proxy_mesh,
     to_grid_frame,
     to_input_frame,
     topology_flow2mesh_QEM,
@@ -131,6 +132,23 @@ def test_geometry_pipeline_ground_truth_nvv_reproduces_input(name, target):
     )
     assert hausdorff < 0.02 * diag(mesh)
     assert chamfer < 0.005 * diag(mesh)
+
+
+def test_marching_cubes_proxy_simplifies_without_breaking_closed_geometry():
+    source = low_poly_box_cylinder()
+    results, target, _, metadata = process_one_mesh(source, **_kwargs(128))
+    proxy = sdf_proxy_mesh(results["occ_coarse"], results["sdf_coarse2fine"], 128, 16)
+    proxy_native = mrmeshnumpy.meshFromFacesVerts(proxy.faces, proxy.vertices)
+    coords = get_precise_occupancy(proxy_native, 128, verbose=False)
+    target_native = mrmeshnumpy.meshFromFacesVerts(target.faces, target.vertices)
+    nvv, _ = compute_sparse_direction(target_native, coords, 128, get_metadata=False, verbose=False)
+    output = to_input_frame(_qem(proxy, coords, nvv, 128), metadata)
+    assert output.is_watertight and output.is_winding_consistent
+    assert output.nondegenerate_faces().all()
+    assert len(output.faces) <= 1000
+    hausdorff, chamfer = surface_distances(output, source)
+    assert hausdorff < 0.02 * diag(source)
+    assert chamfer < 0.005 * diag(source)
 
 
 def test_geometry_pipeline_dense_input_with_low_poly_prediction():

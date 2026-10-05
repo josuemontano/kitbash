@@ -11,7 +11,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
-from scipy.ndimage import binary_fill_holes, gaussian_filter
+from scipy.ndimage import binary_fill_holes, binary_propagation, gaussian_filter
 from skimage.measure import marching_cubes
 
 # ---------------------------------------------------------------------------
@@ -457,10 +457,10 @@ def sparse2dense(coords, feats, resolution):
 def sparse_sdf2dense(coords, sdf, resolution):
     """Convert sparse SDF samples to a dense ``(B, 1, D, H, W)`` grid.
 
-    Voxels not in ``coords`` are filled with ``+pad_sdf`` (``= 2 / R``), and
-    voxels *inside* the boundary (via ``binary_fill_holes`` on the
-    occupancy mask) are filled with ``-pad_sdf``. The explicit ``coords``
-    then overwrite with their actual SDF values.
+    Unsampled regions inherit the sign of their sampled boundary: negative seeds
+    propagate only through unsampled cells, never through positive SDF samples.
+    This preserves enclosed cavities as well as solid interiors. Explicit samples
+    retain their values; unknown exterior cells use ``+pad_sdf`` (``= 2 / R``).
 
     Args:
         coords: ``(N, 3)`` or ``(N, 4)`` tensor or numpy array.
@@ -498,7 +498,7 @@ def sparse_sdf2dense(coords, sdf, resolution):
     pad_sdf = 2.0 / resolution
     D = H = W = resolution
     B = int(coords_np[:, 0].max()) + 1 if coords_np.size > 0 else 1
-    dense_sdf_np = np.ones((B, 1, D, H, W), dtype=float) * pad_sdf
+    dense_sdf_np = np.full((B, 1, D, H, W), pad_sdf, dtype=np.float32)
 
     for b in range(B):
         slice_mask = coords_np[:, 0] == b
@@ -514,10 +514,12 @@ def sparse_sdf2dense(coords, sdf, resolution):
             continue
         zv, yv, xv = z[valid], y[valid], x[valid]
         b_sdf_vals = np.asarray(b_sdf).ravel()[valid]
-        interior = np.zeros((D, H, W), dtype=int)
-        interior[zv, yv, xv] = 1
-        interior = binary_fill_holes(interior).astype(int)
-        dense_sdf_np[b, 0, interior == 1] = -pad_sdf
+        sampled = np.zeros((D, H, W), dtype=bool)
+        sampled[zv, yv, xv] = True
+        negative = np.zeros_like(sampled)
+        negative[zv, yv, xv] = b_sdf_vals < 0
+        interior = binary_propagation(negative, mask=(~sampled | negative))
+        dense_sdf_np[b, 0, interior] = -pad_sdf
         dense_sdf_np[b, 0, zv, yv, xv] = b_sdf_vals
 
     ret = dense_sdf_np
@@ -624,6 +626,6 @@ def get_mc_mesh(sdf, level=0.0):
     if isinstance(sdf, torch.Tensor):
         sdf = sdf.detach().cpu().numpy()
     sdf = np.asarray(sdf, dtype=np.float32)
-    verts, faces, _normals, _values = marching_cubes(sdf, level, gradient_direction="descent")
+    verts, faces, _normals, _values = marching_cubes(sdf, level, gradient_direction="descent", allow_degenerate=False)
     verts = verts.astype(np.float64) + 0.5
     return verts, faces.astype(np.int64)

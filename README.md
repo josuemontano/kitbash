@@ -242,8 +242,19 @@ ratio, predicts a nearest-vertex vector field. Watershed clustering plus a const
 simplification then extract the mesh. kitbash vendors and adapts the code (`src/kitbash/retopology/triflow/`),
 so it runs in-process and no separate checkout is needed.
 
+The encoder's SDF samples include a halo around surface cells to cover the full narrow band. Marching
+cubes extracts the proxy from that same SDF, preserving signed cavities; NVF support is voxelized from
+the proxy rather than the original triangulation. Inputs must define a closed signed surface inside
+the padded grid: an unbounded or open extracted surface raises a retopology error instead of being
+silently replaced by adaptive remeshing.
+
+Face count and quad ratio are conditioning signals, not hard guarantees. Output remains triangular;
+quad ratio encourages regular triangle pairings, not native quad faces. Topology and geometry guards
+take precedence over reaching the requested count.
+
 The constrained QEM is compiled from the vendored C++ source during `poetry install` (a C++17 compiler is
-required; on macOS install Xcode Command Line Tools). It rejects inverted or degenerate contractions;
+required; on macOS install Xcode Command Line Tools). It rejects inverted or degenerate contractions,
+using safe endpoint/midpoint candidates when the quadric minimizer would invalidate the current face fan;
 the final mesh is not welded or stripped of faces after simplification, which would bypass topology checks.
 
 Watershed roots use the transferred displacement at mesh vertices (paper Eq. 6). If a connected

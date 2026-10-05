@@ -371,6 +371,7 @@ namespace Simplify
   int custom_quadratics_size;      // total double count (n_vertices * 10), 0 if unset
   bool has_target_vertex_ids = false; // set when target_vertex_ids[] is passed to simplify_mesh()
   double minimum_edge_length = -1.0;  // threshold for the intra-group short-edge collapse rule
+  double minimum_triangle_height = 0.0;
 
   // [triflow][reserved] namespace-level tunables not wired to the Python API.
   // Kept for future extensibility. Do not remove without updating README.
@@ -425,6 +426,12 @@ namespace Simplify
         }
     }
     minimum_edge_length = min_edge_length;
+    vec3f lo = vertices[0].p, hi = lo;
+    for (const Vertex &v : vertices) {
+      lo.x = min(lo.x, v.p.x); lo.y = min(lo.y, v.p.y); lo.z = min(lo.z, v.p.z);
+      hi.x = std::fmax(hi.x, v.p.x); hi.y = std::fmax(hi.y, v.p.y); hi.z = std::fmax(hi.z, v.p.z);
+    }
+    minimum_triangle_height = (hi - lo).length() * 1e-8;
 
     // init
     loopi(0,triangles.size())
@@ -658,10 +665,29 @@ namespace Simplify
           deleted0.resize(v0.tcount); // normals temporarily
           deleted1.resize(v1.tcount); // normals temporarily
 
-          // Reject the contraction before changing connectivity. Distance from
-          // the edge alone does not prevent flipped or zero-area triangles.
-          if (flipped(p,i0,i1,v0,v1,deleted0)) continue;
-          if (flipped(p,i1,i0,v1,v0,deleted1)) continue;
+          // The unconstrained minimizer can invert a fine marching-cubes fan.
+          // Minimize the same quadric over safe endpoint/midpoint candidates
+          // before rejecting the edge; never relax the validity checks.
+          if (flipped(p,i0,i1,v0,v1,deleted0) || flipped(p,i1,i0,v1,v0,deleted1)) {
+            SymetricMatrix q_geom = v0.q + v1.q;
+            SymetricMatrix q = q_geom + v0.custom_q + v1.custom_q;
+            vec3f candidates[3] = {v0.p, v1.p, (v0.p + v1.p) / 2.0};
+            double best = DBL_MAX;
+            bool found = false;
+            for (const vec3f &candidate : candidates) {
+              if (flipped(candidate,i0,i1,v0,v1,deleted0) ||
+                  flipped(candidate,i1,i0,v1,v0,deleted1)) continue;
+              double area = v0.area + v1.area;
+              double geom_error = vertex_error(q_geom,candidate.x,candidate.y,candidate.z);
+              if (geom_error / (area > 0.0 ? area : 1.0) > threshold) continue;
+              double cost = vertex_error(q,candidate.x,candidate.y,candidate.z);
+              if (cost < best) { best = cost; p = candidate; found = true; }
+            }
+            if (!found) continue;
+            // Restore the deletion masks for the chosen candidate.
+            flipped(p,i0,i1,v0,v1,deleted0);
+            flipped(p,i1,i0,v1,v0,deleted1);
+          }
 
           if ( (t.attr & TEXCOORD) == TEXCOORD  )
           {
@@ -905,15 +931,16 @@ namespace Simplify
       vec3f d1 = vertices[id1].p-p;
       vec3f d2 = vertices[id2].p-p;
       double l1 = d1.length(), l2 = d2.length();
-      if (l1 == 0.0 || l2 == 0.0) { is_flipped = true; continue; }
-      d1 = d1 / l1;
-      d2 = d2 / l2;
-      if(fabs(d1.dot(d2))>0.999) is_flipped=true;
-      vec3f n;
-      n.cross(d1,d2);
-      n.normalize();
-      // deleted[k]=0;
-      if(n.dot(t.n)<0.2) is_flipped=true;
+      vec3f area_vector;
+      area_vector.cross(d1, d2);
+      double longest = std::fmax(std::fmax(l1, l2), (d1 - d2).length());
+      if (area_vector.length() <= minimum_triangle_height * longest) {
+        is_flipped = true;
+        continue;
+      }
+      // Slender triangles are valid topology; reject only degeneration or
+      // inversion relative to the current (not original proxy) face normal.
+      if (area_vector.dot(t.n) <= 0.0) is_flipped = true;
     }
     return is_flipped;
   }
@@ -953,6 +980,10 @@ namespace Simplify
       }
       t.v[r.tvertex]=i0;
       t.dirty=1;
+      vec3f e1 = vertices[t.v[1]].p - vertices[t.v[0]].p;
+      vec3f e2 = vertices[t.v[2]].p - vertices[t.v[0]].p;
+      t.n.cross(e1, e2);
+      t.n.normalize();
       t.err[0]=calculate_error(t.v[0],t.v[1],p);
       t.err[1]=calculate_error(t.v[1],t.v[2],p);
       t.err[2]=calculate_error(t.v[2],t.v[0],p);

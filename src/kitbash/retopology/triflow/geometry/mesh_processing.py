@@ -23,7 +23,7 @@ import trimesh
 from scipy.spatial import cKDTree
 
 from .occupancy import triangle_voxel_overlap
-from .sparse_voxel import get_coords_coarse2fine
+from .sparse_voxel import get_coords_coarse2fine, get_mc_mesh, sparse_sdf2dense
 
 
 def pack_trimesh(mesh):
@@ -706,6 +706,13 @@ def _compute_coarse_sdf(augmented_mrmesh, res_fine, res_coarse, ratio, verbose):
     mesh_coarse.invalidateCaches()
 
     occ_coarse = get_precise_occupancy(mesh_coarse, res_coarse, verbose=verbose)
+    # Surface-intersecting coarse cells alone omit SDF samples across their
+    # boundaries. A one-cell halo covers the paper's 1/128-extent narrow band
+    # (four fine voxels at resolution 512) and closes the sign barrier used by MC.
+    offsets = np.indices((3, 3, 3), dtype=np.int32).reshape(3, -1).T - 1
+    neighbors = (occ_coarse[:, None, :] + offsets).reshape(-1, 3)
+    in_grid = np.all((neighbors >= 0) & (neighbors < res_coarse), axis=1)
+    occ_coarse = np.unique(neighbors[in_grid], axis=0)
     N = len(occ_coarse)
     ratio_cubed = int(ratio) ** 3
 
@@ -729,6 +736,25 @@ def _compute_coarse_sdf(augmented_mrmesh, res_fine, res_coarse, ratio, verbose):
         sdf_coarse = np.array([], dtype=np.float32).reshape(0, ratio_cubed)
 
     return occ_coarse, sdf_coarse
+
+
+def sdf_proxy_mesh(occ_coarse, sdf_coarse2fine, res_fine, res_coarse):
+    """Paper §3.3: extract the zero surface of the same sampled SDF used by the encoder.
+
+    Samples are at voxel centers in normalized distance units. The returned mesh
+    is in grid units, with no adaptive remeshing or post-extraction vertex welding.
+    A signed field must enclose its surface inside the padded grid.
+    """
+    coords = get_coords_coarse2fine(occ_coarse, res_fine // res_coarse)
+    sdf = sparse_sdf2dense(coords, np.asarray(sdf_coarse2fine).reshape(-1), res_fine)[0]
+    boundary = (sdf[0], sdf[-1], sdf[:, 0], sdf[:, -1], sdf[:, :, 0], sdf[:, :, -1])
+    if any(np.any(face <= 0) for face in boundary):
+        raise ValueError("The sampled SDF does not enclose a closed surface inside the grid")
+    vertices, faces = get_mc_mesh(sdf)
+    mesh = trimesh.Trimesh(vertices, faces, process=False)
+    if not mesh.is_watertight:
+        raise ValueError("The sampled SDF does not enclose a closed surface inside the grid")
+    return mesh
 
 
 def load_mesh(input_file):

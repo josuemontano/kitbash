@@ -21,6 +21,7 @@ from .mesh_processing import (
     pack_trimesh,
     process_one_mesh,
     robust_remesh,
+    sdf_proxy_mesh,
     sdf_remesh,
 )
 from .mesh_reconstruction import topology_flow2mesh_QEM
@@ -81,6 +82,7 @@ __all__ = [
     "points_to_input_frame",
     "process_one_mesh",
     "robust_remesh",
+    "sdf_proxy_mesh",
     "sdf_remesh",
     "sparse2dense",
     "sparse_sdf2dense",

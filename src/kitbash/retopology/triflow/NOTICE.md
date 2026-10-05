@@ -32,6 +32,9 @@ generated meshes in-process, on CUDA, Apple MPS or CPU.
 * `open3d` (voxelization) is replaced by a numba implementation; `PyMCubes` by scikit-image.
 * The constrained QEM is built in-package through a small Cython binding. Flip/degeneracy rejection is enabled;
   output connectivity is retained instead of welding vertices and deleting faces after QEM.
+* Extraction follows the paper's SDF marching-cubes proxy rather than upstream inference's adaptive remesh.
+  The sparse SDF includes a full narrow-band halo; watershed roots use transferred mesh displacements.
+  Unseeded components receive their deterministic minimum-displacement vertex as a recovery root.
 * Training, dataset-preparation, augmentation and rendering code is dropped; only inference is vendored.
 * Checkpoints are fetched from a pinned Hugging Face revision and verified by SHA-256 (`weights.py`).
 * Meshes are mapped back into the coordinate frame of the input mesh (`geometry.to_input_frame`), so kitbash's

@@ -137,11 +137,19 @@ class TriflowRetopologizer:
 
         device = rt.device
         with self._span("triflow.prepare_mesh"):
-            results, source, augmented, metadata = geometry.process_one_mesh(
-                mesh_path, res_fine=RES_FINE, pad=1.5, round_verts=False, decimate_length=1.0, vertex_merge_threshold=0.0,
+            results, source, _, metadata = geometry.process_one_mesh(
+                mesh_path, res_fine=RES_FINE, pad=1.5, round_verts=False, decimate_length=0.0, vertex_merge_threshold=0.0,
                 augment=False, augment_strength=1.0, augment_density=False, cast=False, get_metadata=False,
             )
             faces_in = len(source.faces)
+            proxy = geometry.sdf_proxy_mesh(
+                results["occ_coarse"], results["sdf_coarse2fine"], results["res_fine"], results["res_coarse"],
+            )
+            # Generate the NVF on the surface of G, not on the input triangulation.
+            from meshlib import mrmeshnumpy
+
+            proxy_native = mrmeshnumpy.meshFromFacesVerts(proxy.faces, proxy.vertices)
+            results["occ_fine"] = geometry.get_precise_occupancy(proxy_native, RES_FINE, verbose=False)
             data = _batch(results, self._face_count, self._quad_ratio, device)
 
         with self._span("triflow.encode_sdf"):
@@ -154,11 +162,8 @@ class TriflowRetopologizer:
             recon = _decode(rt, data, sample, device)
 
         with self._span("triflow.extract_mesh"):
-            remeshed, _ = geometry.robust_remesh(
-                augmented, remesh_method="adaptive", allow_collapse=False, get_metadata=False, verbose=False
-            )
             mesh = geometry.topology_flow2mesh_QEM(
-                remeshed, recon["coords"], recon["nvv"], recon["resolution"],
+                proxy, recon["coords"], recon["nvv"], recon["resolution"],
                 nvv_smooth_kwargs=NVV_SMOOTH, root_threshold=ROOT_THRESHOLD, merge_threshold=MERGE_THRESHOLD,
                 target_face_count=self._face_count, max_quadratic_error=self._qem_threshold,
                 target_position_weight=TARGET_POSITION_WEIGHT, verbose=False, debug_output=None,

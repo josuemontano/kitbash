@@ -15,6 +15,7 @@ def build() -> None:
         [str(source)],
         language="c++",
         include_dirs=[str(source.parent)],
+        depends=[str(source.with_name("Simplify.h"))],
         extra_compile_args=["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"],
     )
     distribution = Distribution({
