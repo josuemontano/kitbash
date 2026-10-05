@@ -9,12 +9,18 @@ from attrs import define, field, frozen
 from kitbash.critique.history import DiffHistory, DiffStatus, HistoryEntry
 from kitbash.critique.subject import Evaluation, LoopSubject
 from kitbash.domain.critique import Critique, Edit, ScoreCard, scorecard_from_dict
+from kitbash.domain.phases import PhaseName
 from kitbash.paths import OutputLayout
 from kitbash.store.state import CycleRepository, CycleRow, DiffRow
 
 PENDING = "pending"
 ABANDONED = "abandoned"  # written but never evaluated: superseded by a new request
 PRIORITY = {"high": 0, "medium": 1, "low": 2}
+REQUIRED_ARTIFACTS = {
+    PhaseName.BREAKDOWN: ("inventory", "blend", "render"),
+    PhaseName.MODELLING: ("blend", "usd", "preview"),
+    PhaseName.LAYOUT: ("blend", "render"),
+}
 
 
 @frozen
@@ -25,10 +31,30 @@ class CycleResult:
     critiques: tuple[Critique, ...]
     evaluation: Evaluation
     status: DiffStatus
+    phase: PhaseName
 
     @property
     def score(self) -> float:
         return self.scorecard.overall
+
+    @property
+    def eligible(self) -> bool:
+        """A kept, fully evaluated result whose required files are still available."""
+        return (
+            self.status is DiffStatus.KEPT
+            and self.evaluation.ok
+            and bool(self.scorecard.entries)
+            and all(entry.score is not None and entry.passed is not None for entry in self.scorecard.entries)
+            and self.script_path.is_file()
+            and all(
+                (path := self.evaluation.artifacts.get(key)) and Path(path).is_file()
+                for key in REQUIRED_ARTIFACTS[self.phase]
+            )
+        )
+
+    @property
+    def passed(self) -> bool:
+        return self.eligible and self.scorecard.passed
 
     def edits(self) -> list[Edit]:
         """Critic edits plus one edit per failing criterion, most important first."""
@@ -52,9 +78,12 @@ class LoopState:
     def next_cycle(self) -> int:
         return self.last_cycle + 1
 
-    def best(self, since: int = 1) -> CycleResult | None:
+    def best(self, since: int = 1, *, base_cycle: int | None = None) -> CycleResult | None:
+        """Prefer eligible passes, then score; only an unevaluated session can fall back to its base."""
         candidates = [r for c, r in self.results.items() if c >= since]
-        return max(candidates, key=lambda r: (r.score, r.cycle), default=None)
+        if not candidates and base_cycle is not None and (base := self.results.get(base_cycle)) is not None:
+            candidates = [base]
+        return max((r for r in candidates if r.eligible), key=lambda r: (r.scorecard.passed, r.score, r.cycle), default=None)
 
     def session_cycles(self, start: int) -> int:
         return sum(1 for c in self.results if c >= start)
@@ -137,7 +166,7 @@ class CycleStore:
             CycleRow(
                 phase=subject.phase.value, subject=subject.subject_id, cycle=result.cycle,
                 script_path=str(result.script_path), diff_path=str(directory / "diff.patch"),
-                critique_path=str(critique_path), score=result.score, passed=result.scorecard.passed,
+                critique_path=str(critique_path), score=result.score, passed=result.passed,
                 status=result.status.value, summary=summary, created_at=time.time(),
             )
         )
@@ -202,4 +231,5 @@ def _result_from_files(row: CycleRow) -> CycleResult:
         critiques=critiques,
         evaluation=evaluation,
         status=DiffStatus(row.status),
+        phase=PhaseName(row.phase),
     )
