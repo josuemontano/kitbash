@@ -6,7 +6,7 @@ The object to model:
 - category: $category
 - materials: $materials
 
-The first attachment is a contact sheet of $count numbered candidates: $candidates
+The first attachment is a contact sheet of $count candidates numbered from 1: $candidates
 $context
 
 The chosen image is fed to an image-to-3D model (Trellis) that only reconstructs the object's SHAPE:

@@ -82,7 +82,29 @@ class TerminalUser:
         with self._dashboard.paused():
             self._console.rule(f"[bold magenta]Input needed: {asset.id}[/bold magenta]")
             self._console.print(request)
-            answer = Prompt.ask("[n]ame to search for, [p]ath to a reference image, [s]kip", choices=["n", "p", "s"], default="n", console=self._console)
+            review = asset.extra.get("reference_review") or {}
+            candidates = review.get("candidates", [])
+            if review.get("contact_sheet"):
+                self._images.show([Path(review["contact_sheet"])])
+            if candidates:
+                rows = tuple(
+                    (
+                        str(index + 1), candidate.get("title", ""),
+                        f"{candidate.get('license_id') or candidate.get('license') or 'unknown'} "
+                        f"({'allowed' if candidate.get('rights_allowed') else 'not allowed'})",
+                        candidate.get("creator") or "unknown", f"{candidate.get('quality', {}).get('score', 0):.2f}",
+                    )
+                    for index, candidate in enumerate(candidates)
+                )
+                self._console.print(simple_table("Reference candidates (heuristic scores)", ("#", "title", "rights", "creator", "score"), rows))
+            choices = [str(index + 1) for index in range(len(candidates))] + ["n", "p", "s"]
+            label = "Candidate number, " if candidates else ""
+            answer = Prompt.ask(
+                label + "n: name to search for, p: path to a reference image, s: skip",
+                choices=choices, default="n", console=self._console,
+            )
+            if answer.isdecimal():
+                return ReviewDecision(ReviewAction.PROVIDE_INPUT, reference_index=int(answer) - 1)
             match answer:
                 case "n":
                     return ReviewDecision(ReviewAction.PROVIDE_INPUT, search_name=self._text("Item name to search for"))

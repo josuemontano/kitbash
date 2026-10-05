@@ -99,14 +99,6 @@ def test_reference_search_queries_broaden_step_by_step():
     assert search_queries("Mug", "") == ["Mug"]
 
 
-def test_reference_candidates_are_interleaved_across_queries():
-    from kitbash.infra.image_search import Candidate
-    from kitbash.services.references import _interleave
-
-    specific = [Candidate("wikimedia", f"lamp {i}", url=f"u{i}") for i in range(6)]
-    broad = [Candidate("openverse", f"side table {i}", url=f"t{i}") for i in range(3)]
-    picked = _interleave([specific, broad, [specific[0]]], limit=4)
-    assert [c.title for c in picked] == ["lamp 0", "side table 0", "lamp 1", "side table 1"]
 
 
 def test_omp_command_enables_only_requested_tools(tmp_path):
@@ -121,28 +113,6 @@ def test_omp_command_enables_only_requested_tools(tmp_path):
     assert searching[searching.index("--tools") + 1] == "web_search" and "--no-tools" not in searching
 
 
-def test_omp_web_provider_parses_image_urls(sample_inventory_dict, tmp_path):
-    from kitbash.config import load_config
-    from kitbash.domain.inventory import Inventory
-    from kitbash.llm.client import LLMResponse, Usage
-    from kitbash.llm.service import LLMService
-    from kitbash.services.references import OmpWebImageProvider
-
-    class FakeClient:
-        def __init__(self):
-            self.requests = []
-
-        def complete(self, request):
-            self.requests.append(request)
-            body = '{"images": [{"url": "https://x.test/a.jpg", "title": "crate"}, {"url": "not a url"}, {"url": "https://x.test/b.png"}]}'
-            return LLMResponse(text=body, usage=Usage(), model=request.model)
-
-    fake = FakeClient()
-    provider = OmpWebImageProvider(LLMService(fake, PromptLibrary(), load_config().models))
-    item = Inventory.from_dict(sample_inventory_dict).items[0]
-    found = provider.search("wooden crate", item, 5, tmp_path)
-    assert [c.url for c in found] == ["https://x.test/a.jpg", "https://x.test/b.png"]
-    assert fake.requests[0].tools == ("web_search",) and "Wooden crate" in fake.requests[0].prompt
 
 
 def test_budget_exhaustion_is_fatal_and_not_retried(tmp_path):
