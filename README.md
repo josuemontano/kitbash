@@ -263,14 +263,21 @@ and the final scene also get a `.usd`, exported per material with this ladder:
 
 1. **MaterialX**: used when the installed Blender can export it *and* a probe export shows every linked
    Principled input still connected in the MaterialX network.
-2. **UsdPreviewSurface, baked**: otherwise, every input UsdPreviewSurface cannot express (noise,
-   voronoi, ramps, math and so on) is baked to image textures next to the `.usd`, referenced by
-   relative path.
+2. **UsdPreviewSurface, baked**: otherwise, procedural graphs (noise, voronoi, ramps, math and so on)
+   feeding supported preview inputs are baked to image textures next to the `.usd`, referenced by
+   relative path. Baking cannot add channels that UsdPreviewSurface cannot represent.
 
 Baking happens in a temporary copy, so the original `.blend` is never modified. Blender's own USD
 importer only reads UsdPreviewSurface, so by default (`usd.bake_preview_fallback = true`) MaterialX
-materials also get a baked preview-surface fallback. That keeps UsdPreviewSurface-only consumers
-consistent with the `.blend`.
+materials also get a baked preview-surface fallback for supported channels.
+
+**Known preview loss is a failure**, not a successful round trip. Before importing or comparing renders,
+the fidelity checker rejects any material with `lost_in_preview` channels, naming the material and
+inputs in the error. This includes unsupported linked inputs such as transmission or subsurface,
+whether driven by procedural nodes or a direct image, and applies even when MaterialX preserves them.
+Asset evaluation reports the error to the critic; final assembly stops. Low-level export reports retain
+the loss diagnostics, but those exports are not accepted by the fidelity checker. This guard does not
+certify arbitrary shader graphs or every unlinked Principled value; the render comparison remains required.
 
 **Round-trip validation** is part of the critic loop:
 
@@ -298,7 +305,16 @@ inside a scene directory. Each asset folder holds the `.blend`, its `textures/`,
 preview and `metadata.json`.
 
 Scenes copy the asset folders they use into `scene/assets/`, so the export is self-contained and every
-texture path stays relative and valid. External files such as HDRIs are copied into `scene/textures/`.
+texture path stays relative and valid. Linked image paths resolve against their owning library, not
+`scene.blend`; localization leaves those library-owned paths unchanged. External linked libraries must
+already be bundled with their textures by assembly; localization does not copy arbitrary library trees.
+
+Asset image copies, external scene images (including HDRIs), and temporary USD source-image copies use
+full SHA-256 content names plus the file extension. Different files named `albedo.png` cannot overwrite
+or reuse each other's images; identical content can share a copy. USD staging also protects existing
+libraries whose texture filenames are not hashed. External local image sequences/UDIMs that require
+multi-file copying are not renamed as single textures: localization reports unresolved paths or fails
+explicitly rather than silently dropping frames/tiles. Packed images remain packed.
 
 ## Output directory
 
@@ -344,7 +360,9 @@ headless Blender. They cover:
 - generation continuing during review;
 - resume;
 - the MaterialX and baked-fallback export paths;
-- relative texture paths after an asset is copied into a scene.
+- relative texture paths after an asset is copied into a scene;
+- distinct same-basename textures across asset, scene, and USD copies, including relocated linked libraries;
+- rejection of known lost preview channels before round-trip validation.
 
 ### Code map
 

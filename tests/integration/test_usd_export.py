@@ -116,7 +116,7 @@ def test_materialx_network_is_used_when_it_keeps_every_link(toolkit, tmp_path):
     text = usd_text(result.usd_path)
     assert "outputs:mtlx:surface" in text and "ND_open_pbr_surface_surfaceshader" in text
     # The preview fallback is baked too, so UsdPreviewSurface readers (Blender's importer) match the .blend.
-    assert material["baked"] == {"Base Color": "./textures/bake_mat_noisy_body_base_color.png"}
+    assert set(material["baked"]) == {"Base Color"}
     assert result.facts()["usd_broken_materials"] == 0 and result.facts()["usd_missing_textures"] == 0
     assert result.score > 0.85
 
@@ -132,7 +132,7 @@ def test_unsupported_nodes_fall_back_to_a_baked_preview_surface(toolkit, tmp_pat
     for relative in material["baked"].values():
         assert not Path(relative).is_absolute() and (result.usd_path.parent / relative).is_file()
     text = usd_text(result.usd_path)
-    assert "UsdUVTexture" in text and "@./textures/bake_mat_voronoi_body_base_color.png@" in text
+    assert "UsdUVTexture" in text
     assert "outputs:mtlx:surface" not in text  # the lossy MaterialX network is not offered
     assert result.roundtrip["materials"]["mat_voronoi_body"]["missing_channels"] == []
     assert result.score > 0.8
@@ -159,7 +159,7 @@ kb.save_scene()
 
 CHECK_IMAGES = """import bpy, json, os
 print("<<IMAGES>>" + json.dumps([
-    {"path": i.filepath, "exists": os.path.isfile(bpy.path.abspath(i.filepath))}
+    {"path": i.filepath, "exists": os.path.isfile(bpy.path.abspath(i.filepath, library=i.library))}
     for i in bpy.data.images if i.source == "FILE"
 ]))
 """
@@ -194,7 +194,7 @@ def test_texture_paths_stay_relative_after_copying_into_a_scene(toolkit, tmp_pat
     probe.write_text(CHECK_IMAGES)
     output = subprocess.run(["blender", "-b", str(scene_blend), "--python", str(probe)], capture_output=True, text=True, timeout=120).stdout
     images = json.loads(output.split("<<IMAGES>>", 1)[1].splitlines()[0])
-    label = next(i for i in images if "label" in i["path"])
+    label, = images
     assert label["path"].startswith("//") and label["exists"]
 
     scene_usd = UsdFidelityChecker(kit).check(

@@ -151,8 +151,8 @@ max_faces = 150000
 [usd]
 # "auto" = MaterialX when the installed Blender supports it, "off" = always UsdPreviewSurface.
 materialx = "auto"
-# Also bake textures for the UsdPreviewSurface fallback of MaterialX materials, so
-# consumers that only read UsdPreviewSurface (including Blender's importer) match the .blend.
+# Also bake supported inputs for the UsdPreviewSurface fallback of MaterialX materials.
+# Known lost preview channels fail fidelity validation even if MaterialX preserves them.
 bake_preview_fallback = true
 bake_resolution = 1024
 bake_samples = 16

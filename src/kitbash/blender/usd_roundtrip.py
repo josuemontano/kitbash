@@ -11,6 +11,7 @@ import bpy
 import kb_materials as km
 import kb_render
 import kitbash_bpy as kb
+from kb_files import image_path
 
 options = kb.args()
 kb.reset_scene()
@@ -50,7 +51,7 @@ for name, expected_channels in options.get("expected", {}).items():
 for image in bpy.data.images:
     if image.source != "FILE" or image.packed_file is not None:
         continue
-    path = bpy.path.abspath(image.filepath)
+    path = image_path(image)
     if not os.path.isfile(path):
         missing.add(image.filepath)
 

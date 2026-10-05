@@ -2,7 +2,7 @@
 
 import os
 
-import bpy
+from kb_files import image_path
 
 # Principled input -> (UsdPreviewSurface input, USD value type, texture output, source color space)
 PREVIEW_INPUTS = {
@@ -129,7 +129,7 @@ def _value(socket):
 
 def image_info(image, base_dir=None):
     filepath = image.filepath or image.filepath_raw
-    absolute = bpy.path.abspath(filepath, start=base_dir) if filepath else ""
+    absolute = image_path(image, base_dir)
     return {
         "name": image.name,
         "filepath": filepath,
