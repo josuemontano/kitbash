@@ -14,6 +14,7 @@ from kitbash.infra.blender import BlenderCapabilities, BlenderRunner
 from kitbash.infra.omp import OmpClient, load_catalog, omp_version
 from kitbash.llm.client import LLMRequest
 from kitbash.llm.prompts import TASK_MARKER
+from kitbash.retopology.base import Retopologizer, RetopologyMethod
 
 
 @frozen
@@ -55,8 +56,9 @@ def ping_models(config: Config, omp: str, models: Mapping[str, Role], log_dir: P
     return [message for message, _ in answers], [hint for _, hint in answers if hint]
 
 
-def run_preflight(config: Config, log_dir: Path) -> PreflightReport:
+def run_preflight(config: Config, log_dir: Path, retopologizer: Retopologizer) -> PreflightReport:
     problems: list[str] = []
+    retopology_hints: list[str] = []
     omp = resolve_executable(config.tools.omp, "omp", "Install omp or set tools.omp in your config.")
     blender = resolve_executable(config.tools.blender, "Blender", "Install Blender or set tools.blender in your config.")
     trellis_python = config.tools.resolved_trellis_python(config.paths.trellis)
@@ -64,6 +66,13 @@ def run_preflight(config: Config, log_dir: Path) -> PreflightReport:
         problems.append(f"Trellis not found: {config.paths.trellis / 'generate.py'} does not exist (set paths.trellis)")
     if shutil.which(trellis_python) is None and not Path(trellis_python).is_file():
         problems.append(f"Trellis Python not found: {trellis_python} (set tools.trellis_python)")
+    if retopologizer.method is RetopologyMethod.TRIFLOW:
+        try:
+            retopologizer.check()
+        except PreflightError as exc:
+            problems.append(exc.message)
+            if exc.hint:
+                retopology_hints.append(exc.hint)
 
     version = omp_version(omp)
     catalog = load_catalog(omp)
@@ -87,7 +96,7 @@ def run_preflight(config: Config, log_dir: Path) -> PreflightReport:
     blender_version = runner.version()
     capabilities = runner.probe(log_dir / "blender_probe.log")
     if problems:
-        raise PreflightError("Preflight failed:\n  - " + "\n  - ".join(problems), hint=" ".join(hints))
+        raise PreflightError("Preflight failed:\n  - " + "\n  - ".join(problems), hint=" ".join([*retopology_hints, *hints]))
     return PreflightReport(
         omp_version=version,
         blender_version=blender_version,

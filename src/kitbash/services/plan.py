@@ -1,6 +1,7 @@
 """The plan printed by ``--dry-run``: phases, models, paths and estimated steps. Runs nothing."""
 
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from attrs import frozen
@@ -10,7 +11,11 @@ from kitbash.domain.phases import PhaseName
 from kitbash.domain.roles import Role
 from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import InputMode, RunInput
+from kitbash.errors import KitbashError
+from kitbash.infra.blender import SpanRecorder
 from kitbash.paths import OutputLayout
+from kitbash.retopology import NullRecorder, make_retopologizer
+from kitbash.retopology.base import Retopologizer, RetopologyMethod
 
 
 @frozen
@@ -21,7 +26,15 @@ class PlanRow:
 
 
 class Planner:
-    def __init__(self, config: Config, layout: OutputLayout, run_input: RunInput, rubric: Rubric) -> None:
+    def __init__(
+        self,
+        config: Config,
+        layout: OutputLayout,
+        run_input: RunInput,
+        rubric: Rubric,
+        retopology_factory: Callable[[Config, SpanRecorder], Retopologizer] = make_retopologizer,
+    ) -> None:
+        self._retopology_factory = retopology_factory
         self._config = config
         self._layout = layout
         self._input = run_input
@@ -45,6 +58,7 @@ class Planner:
             PlanRow("breakdown", "backlot lookup, unrecognized items, user gate", "embedding search per item"),
             PlanRow("modelling", "per asset: reference image", f"{', '.join(cfg.reference.providers)} + 1 call to {self._model(Role.REFERENCE_SELECTION, M)}"),
             PlanRow("modelling", "per asset: Trellis", f"1 run (<= {cfg.trellis.retries} retries), {cfg.trellis.steps} steps, pipeline {cfg.trellis.pipeline_type}"),
+            PlanRow("modelling", "per asset: retopology", self._retopology_estimate()),
             PlanRow("modelling", "per asset: build script", f"1 call to {self._model(Role.CODE, M)}"),
             PlanRow("modelling", "per asset: critic loop", f"<= {c} cycles x (7 Blender runs incl. USD export + round trip, 2 critics: {self._critics(M)})"),
             PlanRow("modelling", "per asset: patches", f"<= {c - 1} calls to {self._model(Role.CODE, M)}"),
@@ -57,6 +71,25 @@ class Planner:
             PlanRow("assembly", "USD export + round trip", f"materialx={cfg.usd.materialx}, bake fallback {cfg.usd.bake_resolution}px"),
         ]
 
+    def _retopology_estimate(self) -> str:
+        r = self._config.retopology
+        if r.method_enum is RetopologyMethod.DECIMATE:
+            return "decimate: none (the build script collapses/voxel-remeshes the Trellis mesh in Blender)"
+        fallback = "falls back to the Trellis mesh on error" if r.fallback_on_error else "fails the asset on error"
+        return f"triflow: 1 run, {r.face_count} faces, {r.flow_steps} flow steps, device {r.device}; {fallback}"
+
+    def _retopology_paths(self) -> list[tuple[str, str, str]]:
+        cfg = self._config
+        if cfg.retopology.method_enum is RetopologyMethod.DECIMATE:
+            return []
+        try:
+            self._retopology_factory(cfg, NullRecorder()).check()
+        except KitbashError as exc:
+            status = f"NOT READY: {exc.message}"
+        else:
+            status = "ok"
+        return [("triflow weights", str(cfg.paths.triflow_weights), status)]
+
     def models(self) -> list[tuple[str, str, str]]:
         return [(phase.value if phase else "all", role.value, model) for phase, role, model in self._config.models.all_assignments()]
 
@@ -68,6 +101,7 @@ class Planner:
             ("backlot", str(cfg.paths.backlot), "exists" if cfg.paths.backlot.exists() else "will be created"),
             ("trellis", str(cfg.paths.trellis), "ok" if (cfg.paths.trellis / "generate.py").is_file() else "MISSING generate.py"),
             ("trellis python", cfg.tools.resolved_trellis_python(cfg.paths.trellis), ""),
+            *self._retopology_paths(),
             ("blender", cfg.tools.blender, "found" if _found(cfg.tools.blender) else "NOT FOUND"),
             ("omp", cfg.tools.omp, "found" if _found(cfg.tools.omp) else "NOT FOUND"),
             ("rubric", self._rubric.source, f"{len(self._rubric.criteria)} criteria"),

@@ -27,6 +27,8 @@ console = Console()
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Turn an image or a prompt into an editable Blender scene.")
 library_app = typer.Typer(no_args_is_help=True, help="The backlot: the reusable asset library.")
 app.add_typer(library_app, name="library")
+retopology_app = typer.Typer(no_args_is_help=True, help="Retopology tools.")
+app.add_typer(retopology_app, name="retopology")
 
 MODEL_FLAG = re.compile(r"^--model\.([\w.-]+?)(?:=(.*))?$")
 
@@ -35,6 +37,11 @@ class Style(StrEnum):
     photorealistic = "photorealistic"
     two_d = "2d"
     animated_3d = "animated-3d"
+
+
+class Retopology(StrEnum):
+    triflow = "triflow"
+    decimate = "decimate"
 
 
 def _guard(action: Callable[[], Any]) -> Any:
@@ -74,6 +81,7 @@ def _overrides(ctx: typer.Context, **options: Any) -> dict[str, Any]:
         "threads": "pipeline.threads",
         "review_buffer": "pipeline.review_buffer",
         "max_cycles": "critic.max_cycles",
+        "retopology": "retopology.method",
     }
     overrides = {keys[name]: (value.value if isinstance(value, StrEnum) else value) for name, value in options.items() if value is not None}
     return overrides | parse_extra_args(ctx.args)
@@ -102,6 +110,9 @@ def build(
     threads: Annotated[int | None, typer.Option("--threads", help="Parallel modelling workers / Trellis jobs (default 2).")] = None,
     review_buffer: Annotated[int | None, typer.Option("--review-buffer", help="Max assets waiting for review (default 6).")] = None,
     max_cycles: Annotated[int | None, typer.Option("--max-cycles", help="Critic cycles per phase and per asset (default 4).")] = None,
+    retopology: Annotated[
+        Retopology | None, typer.Option("--retopology", help="Retopology of the Trellis mesh (default: triflow; decimate = in Blender only).")
+    ] = None,
     rubric: Annotated[Path | None, typer.Option("--rubric", help="Rubric Markdown file.")] = None,
     config: Annotated[Path | None, typer.Option("--config", help="Config TOML overriding the defaults.")] = None,
     no_interactive: Annotated[bool, typer.Option("--no-interactive", help="Auto-approve every gate and review.")] = False,
@@ -111,7 +122,9 @@ def build(
 
     def action() -> None:
         run_input = RunInput.create(image, prompt)
-        overrides = _overrides(ctx, style=style, threads=threads, review_buffer=review_buffer, max_cycles=max_cycles)
+        overrides = _overrides(
+            ctx, style=style, threads=threads, review_buffer=review_buffer, max_cycles=max_cycles, retopology=retopology
+        )
         if dry_run:
             settings = load_config(config, overrides)
             planner = Planner(settings, OutputLayout.at(output), run_input, Rubric.load(rubric or default_rubric_path()))
@@ -198,6 +211,25 @@ def library_remove(
 def library_reindex(config: ConfigOption = None) -> None:
     """Re-embed every asset with the current embedding backend."""
     _guard(lambda: console.print(f"Re-indexed {_backlot(config, rebuild_index=True).reindex()} assets"))
+
+
+# -- retopology ---------------------------------------------------------------------------------------------
+
+
+@retopology_app.command("download-weights")
+def retopology_download_weights(config: ConfigOption = None) -> None:
+    """Download and verify the TriFlow weights (about 1.3 GB, once). Otherwise they are fetched on first use."""
+
+    def action() -> None:
+        from kitbash.retopology.triflow import weights
+
+        directory = load_config(config).paths.triflow_weights
+        console.print(f"Fetching TriFlow weights into {directory} ...")
+        paths = weights.ensure(directory)
+        for name, path in paths.items():
+            console.print(f"  {name}: {path} ({path.stat().st_size / 1e6:,.0f} MB, sha256 verified)")
+
+    _guard(action)
 
 
 def main() -> None:

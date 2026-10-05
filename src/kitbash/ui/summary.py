@@ -26,6 +26,7 @@ def print_summary(console: Console, report: Mapping[str, Any]) -> None:
                 ("critic cycles", totals["critic_cycles"]),
                 ("user interventions", totals["user_interventions"]),
                 ("Trellis time", f"{totals['trellis_time_s']:,.0f}s"),
+                ("Retopology time", f"{totals['retopology_time_s']:,.0f}s"),
                 ("idle (backpressure)", f"{totals['worker_idle_backpressure_s']:,.0f}s"),
             ],
         )

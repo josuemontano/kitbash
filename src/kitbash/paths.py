@@ -80,6 +80,9 @@ class OutputLayout:
     def asset_trellis_dir(self, asset_id: str) -> Path:
         return self.asset_dir(asset_id) / "trellis"
 
+    def asset_retopo_dir(self, asset_id: str) -> Path:
+        return self.asset_dir(asset_id) / "retopo"
+
     def asset_script(self, asset_id: str) -> Path:
         return self.asset_dir(asset_id) / "script.py"
 

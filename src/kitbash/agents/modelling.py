@@ -1,21 +1,25 @@
 """Modelling agent: one asset at a time (reference image, Trellis mesh, Blender build script, checks)."""
 
 import json
+import logging
 import shutil
+import time
 from pathlib import Path
 
 from kitbash.analytics import context
+from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
 from kitbash.config import Config
 from kitbash.critique.subject import CriticBrief, Evaluation
 from kitbash.domain.assets import AssetRecord
 from kitbash.domain.inventory import InventoryItem
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.roles import Role
-from kitbash.errors import KitbashError
+from kitbash.errors import KitbashError, RetopologyError
 from kitbash.infra.polyhaven import PolyHavenCatalog
 from kitbash.infra.trellis import TrellisResult, TrellisRunner
 from kitbash.llm.service import LLMService
 from kitbash.paths import OutputLayout
+from kitbash.retopology.base import Retopologizer, RetopologyMethod, RetopologyResult
 from kitbash.services.api_reference import blender_api_reference
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.references import ReferenceChoice, ReferenceFinder
@@ -24,6 +28,8 @@ from kitbash.services.usd_fidelity import UsdFidelityChecker
 BUILD_DIR = "build"
 BLEND_NAME = "asset.blend"
 USD_RELATIVE = Path("usd") / "asset.usd"
+
+log = logging.getLogger("kitbash")
 
 
 class ModellingAgent:
@@ -34,18 +40,22 @@ class ModellingAgent:
         fidelity: UsdFidelityChecker,
         finder: ReferenceFinder,
         trellis: TrellisRunner,
+        retopologizer: Retopologizer,
         catalog: PolyHavenCatalog,
         config: Config,
         layout: OutputLayout,
+        tracker: Tracker,
     ) -> None:
         self._llm = llm
         self._toolkit = toolkit
         self._fidelity = fidelity
         self._finder = finder
         self._trellis = trellis
+        self._retopologizer = retopologizer
         self._catalog = catalog
         self._config = config
         self._layout = layout
+        self._tracker = tracker
 
     def find_reference(self, item: InventoryItem) -> ReferenceChoice | None:
         with context.bind(agent="modelling_agent"):
@@ -54,6 +64,30 @@ class ModellingAgent:
     def generate_mesh(self, asset: AssetRecord, reference: Path) -> TrellisResult:
         directory = self._layout.asset_trellis_dir(asset.id) / f"attempt_{asset.attempt:02d}"
         return self._trellis.generate(reference, directory, asset.id, seed=asset.seed)
+
+    def retopologize(self, asset: AssetRecord, mesh_path: Path) -> RetopologyResult:
+        """Retopologize the Trellis mesh. With ``fallback_on_error`` a failure keeps the Trellis mesh (the decimate path)."""
+        retopologizer = self._retopologizer
+        if retopologizer.method is RetopologyMethod.DECIMATE:
+            return retopologizer.retopologize(mesh_path, mesh_path.parent, asset.id)
+        directory = self._layout.asset_retopo_dir(asset.id) / f"attempt_{asset.attempt:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        try:
+            with self._tracker.span(SpanKind.SUBPROCESS, "retopology", attempt=asset.attempt, method=retopologizer.method.value) as span:
+                result = retopologizer.retopologize(mesh_path, directory, asset.id)
+                span.meta.update(faces_in=result.faces_in, faces_out=result.faces_out, device=result.device)
+        except RetopologyError as exc:
+            if not self._config.retopology.fallback_on_error:
+                raise
+            reason = f"{retopologizer.method.value}: {exc.message}"
+            log.warning("Retopology failed for %s, keeping the Trellis mesh: %s", asset.id, reason)
+            self._tracker.event(EventKind.WARNING, "retopology_fallback", asset=asset.id, reason=reason)
+            return RetopologyResult(
+                method=RetopologyMethod.DECIMATE, mesh_path=mesh_path, faces_in=None, faces_out=None,
+                duration_s=time.monotonic() - started, fallback_reason=reason,
+            )
+        return result
 
     def write_script(self, item: InventoryItem, asset: AssetRecord) -> str:
         naming = self._config.naming
@@ -72,6 +106,7 @@ class ModellingAgent:
                     "dimensions": _dimensions(item),
                     "materials": ", ".join(item.materials_hint) or "not specified",
                     "style": self._config.pipeline.style,
+                    "retopology": _retopology_note(retopology_method(asset)),
                     "feedback": "\n".join(f"- {f}" for f in asset.feedback) or "(none)",
                     "naming": naming.describe(item.id),
                     "textures": json.dumps(textures) if textures else "(none)",
@@ -140,6 +175,7 @@ class AssetSubject:
             {
                 "mesh_path": self._asset.mesh_path,
                 "mesh_up_axis": self._config.trellis.mesh_up_axis,
+                "retopology_method": retopology_method(self._asset),
                 "output_blend": str(blend),
                 "textures_dir": str(build / "textures"),
                 "slug": self._item.id,
@@ -170,6 +206,20 @@ class AssetSubject:
                 json.dumps(usd.report(), indent=2), encoding="utf-8"
             )
         return Evaluation(ok=error is None, images=tuple(previews), facts=facts, report=report, error=error, artifacts=artifacts)
+
+
+def retopology_method(asset: AssetRecord) -> str:
+    """The method that produced the asset's mesh: ``decimate`` for a raw Trellis mesh (including after a fallback)."""
+    return asset.extra.get("retopology", {}).get("method", RetopologyMethod.DECIMATE.value)
+
+
+def _retopology_note(method: str) -> str:
+    if method == RetopologyMethod.TRIFLOW.value:
+        return (
+            "The mesh was already retopologized (clean, low-poly, mostly quads), so `kb.decimate(obj)` will be a no-op; "
+            "still call it, and do not try to reduce or remesh the mesh yourself."
+        )
+    return "The mesh is the raw Trellis output (dense triangles), so `kb.decimate(obj)` does the real reduction."
 
 
 def _dimensions(item: InventoryItem) -> str:

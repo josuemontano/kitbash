@@ -15,6 +15,16 @@ dependencies = [
     "pillow (>=11.3)",
     "tomli-w (>=1.2)",
     "sentence-transformers (>=5.1)",
+    # TriFlow retopology (default method; `--retopology decimate` does not use them at run time)
+    "torch (>=2.8)",
+    "safetensors (>=0.5)",
+    "scipy (>=1.15)",
+    "scikit-image (>=0.25)",
+    "trimesh (>=4.11)",
+    "meshlib (>=3.1.1)",
+    "numba (>=0.63)",
+    "einops (>=0.8)",
+    "pyfqmr-triflow @ git+https://github.com/DerKleineLi/pyfqmr-triflow.git@c93a7671ba4a2163dd3c7ea6ab6b52ad0167cc72",
 ]
 
 [project.scripts]

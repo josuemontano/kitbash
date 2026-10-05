@@ -17,9 +17,11 @@ from kitbash.domain.phases import PhaseName
 from kitbash.domain.roles import Role
 from kitbash.errors import ConfigError
 from kitbash.naming import NamingConvention
+from kitbash.retopology.base import RetopologyMethod
 
 DEFAULTS_PACKAGE = "kitbash.defaults"
 FREE_FORM_TABLES = frozenset({"models.phases", "styles"})
+RETOPOLOGY_DEVICES = ("auto", "cuda", "mps", "cpu")
 
 
 @frozen
@@ -27,6 +29,7 @@ class PathsConfig:
     backlot: Path
     trellis: Path
     downloads: Path
+    triflow_weights: Path
 
 
 @frozen
@@ -152,6 +155,21 @@ class TrellisConfig:
 
 
 @frozen
+class RetopologyConfig:
+    method: str
+    face_count: int
+    qem_threshold: float
+    quad_ratio: float
+    flow_steps: int
+    device: str
+    fallback_on_error: bool
+
+    @property
+    def method_enum(self) -> RetopologyMethod:
+        return RetopologyMethod(self.method)
+
+
+@frozen
 class BlenderConfig:
     timeout_s: float
     bake_timeout_s: float
@@ -207,6 +225,7 @@ class Config:
     reference: ReferenceConfig
     polyhaven: PolyHavenConfig
     trellis: TrellisConfig
+    retopology: RetopologyConfig
     blender: BlenderConfig
     usd: UsdConfig
     naming: NamingConvention
@@ -349,6 +368,15 @@ def _validate(config: Config) -> None:
         raise ConfigError("--threads and --review-buffer must be at least 1")
     if config.critic.max_cycles < 1:
         raise ConfigError("--max-cycles must be at least 1")
+    methods = [m.value for m in RetopologyMethod]
+    if config.retopology.method not in methods:
+        raise ConfigError(f"Unknown retopology method {config.retopology.method!r}", hint=f"Methods: {', '.join(methods)}.")
+    if config.retopology.device not in RETOPOLOGY_DEVICES:
+        raise ConfigError(f"Unknown retopology.device {config.retopology.device!r}", hint=f"Devices: {', '.join(RETOPOLOGY_DEVICES)}.")
+    if config.retopology.face_count < 1 or config.retopology.flow_steps < 1:
+        raise ConfigError("retopology.face_count and retopology.flow_steps must be at least 1")
+    if config.retopology.qem_threshold < 0 or not 0.0 <= config.retopology.quad_ratio <= 1.0:
+        raise ConfigError("retopology.qem_threshold must be >= 0 and retopology.quad_ratio must be in [0, 1]")
     if config.usd.materialx not in {"auto", "off"}:
         raise ConfigError("usd.materialx must be 'auto' or 'off'")
     if config.assembly.mode not in {"append", "link"}:
