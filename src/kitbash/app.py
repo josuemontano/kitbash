@@ -53,7 +53,7 @@ from kitbash.phases.scene_assets import SceneCast
 from kitbash.pipeline.commit import BacklotCommitter
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.preflight import PreflightReport, run_preflight
-from kitbash.services.references import OmpWebImageProvider, ReferenceFinder
+from kitbash.services.references import ReferenceFinder
 from kitbash.services.usd_fidelity import UsdFidelityChecker
 from kitbash.store.state import StateDB
 from kitbash.ui.dashboard import Dashboard
@@ -193,12 +193,17 @@ class Application:
         catalog = PolyHavenCatalog(
             self._http, config.paths.downloads, enabled=config.polyhaven.enabled, ttl_s=config.polyhaven.cache_ttl_s
         )
+        reference_cache = config.paths.downloads / "references"
         finder = ReferenceFinder(
-            self._providers(llm),
-            ImageDownloader(self._http, max_bytes=int(config.reference.max_download_mb * 1024 * 1024), min_side=config.reference.min_side_px),
+            self._providers(),
+            ImageDownloader(
+                self._http, max_bytes=int(config.reference.max_download_mb * 1024 * 1024),
+                min_side=config.reference.min_side_px, cache_dir=reference_cache,
+            ),
             llm,
             config.reference,
             tracker,
+            cache_dir=reference_cache,
         )
         trellis = TrellisRunner(
             config.paths.trellis,
@@ -237,10 +242,9 @@ class Application:
         self.backlot.close()
         self.state.close()
 
-    def _providers(self, llm: LLMService) -> list[CandidateProvider]:
+    def _providers(self) -> list[CandidateProvider]:
         factories = {
-            "input_crop": lambda: InputCropProvider(self.run_input.image, max(512, self.config.reference.min_side_px)),
-            "omp_web": lambda: OmpWebImageProvider(llm),
+            "input_crop": lambda: InputCropProvider(self.run_input.image, self.config.reference.min_crop_side_px),
             "wikimedia": lambda: WikimediaProvider(self._http),
             "openverse": lambda: OpenverseProvider(self._http),
         }

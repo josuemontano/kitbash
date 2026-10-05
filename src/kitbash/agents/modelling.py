@@ -51,6 +51,14 @@ class ModellingAgent:
         with context.bind(agent="modelling_agent"):
             return self._finder.find(item, self._layout.asset_reference_dir(item.id))
 
+    def reference_review(self, item: InventoryItem) -> dict | None:
+        manifest = self._layout.asset_reference_dir(item.id) / "review.json"
+        return json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
+
+    def select_reference(self, item: InventoryItem, index: int) -> ReferenceChoice | None:
+        with context.bind(agent="modelling_agent"):
+            return self._finder.select_reviewed(item, self._layout.asset_reference_dir(item.id), index)
+
     def generate_mesh(self, asset: AssetRecord, reference: Path) -> TrellisResult:
         directory = self._layout.asset_trellis_dir(asset.id) / f"attempt_{asset.attempt:02d}"
         return self._trellis.generate(reference, directory, asset.id, seed=asset.seed)

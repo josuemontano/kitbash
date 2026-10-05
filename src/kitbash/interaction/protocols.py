@@ -28,6 +28,7 @@ class ReviewDecision:
     feedback: str = ""
     reference_path: str | None = None
     search_name: str | None = None
+    reference_index: int | None = None
 
 
 @frozen

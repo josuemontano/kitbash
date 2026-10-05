@@ -108,12 +108,12 @@ Main sections:
 - `[models]`: model per role. `[models.phases.<phase>]` overrides roles for one phase.
   `[models.thinking]` sets the omp thinking level per role. `[models.capabilities].image_roles` lists
   the roles whose models must accept images (checked at startup).
-- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (Poly Haven cache).
+- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (reference and Poly Haven caches).
 - `[tools]`: executables for `omp`, `blender`, and the Python that runs Trellis.
 - `[critic]`: cycles, pass threshold, stall detection, revert tolerance, patch attempts.
-- `[reference]`: image search providers and limits. `input_crop` crops the object from your reference
-  image. `omp_web` has the omp agent search the web with its `web_search` tool: slower, but it finds
-  product photos on white backgrounds. `wikimedia` and `openverse` are free image APIs.
+- `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
+  optional `vision_fallback`. Defaults: `input_crop`, `wikimedia`, `openverse`; no model search.
+  Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
 - `[blender]`, `[usd]`: render sizes and samples, bake resolution, round-trip threshold, MaterialX switch.
@@ -228,7 +228,8 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
   onto the review queue and the worker picks up the next one.
 - **Consumer:** one review loop shows finished assets in completion order, while generation continues.
   For each asset you can approve it, give feedback, regenerate it (new Trellis seed and a new script)
-  or skip it. "Input needed" entries ask for an item name to search for, or a reference image path.
+  or skip it. "Input needed" entries show a ranked reference contact sheet when available: select a
+  candidate number, give another search name or image path, or skip. Prompts run on the main thread.
 - **Backpressure:** at most `--review-buffer` assets are in flight or waiting for review. When the
   buffer is full, workers finish their current asset and then idle. The idle time is reported.
 - **Barrier:** layout starts when every asset is approved or skipped. Skipped assets become labelled
@@ -240,6 +241,53 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 The terminal shows a single `rich.Live` display: a progress table for every asset and a pinned review
 panel. The display pauses while you answer a prompt. Previews appear inline in kitty, Ghostty, iTerm2
 and WezTerm. Elsewhere kitbash prints the path and opens the file.
+
+### Reference acquisition: deterministic first
+
+1. An approved backlot reuse decision bypasses reference acquisition and Trellis entirely.
+2. An explicit user image wins next (JPEG, PNG or WebP, subject to decode/size limits). Otherwise,
+   an input-image crop is reused only with at least `reference.min_crop_side_px = 384` pixels on its
+   **original, unpadded shorter side**, plus the automatic quality gates below. Crops are never upscaled.
+3. Commons and Openverse queries are cached and ranked deterministically. Rights are checked before
+   downloading; title/category overlap and provider rank bound download work. Decoded pixel hashes
+   deduplicate identical images across URLs; sharpness, border clipping, approximate foreground
+   occupancy/background uniformity and decoded/native dimensions determine the final ranking.
+4. Automatic selection requires supported rights, `auto_select_threshold = 0.88` and a lead of
+   `ambiguity_margin = 0.08` over the next candidate. Hard gates also require native/decoded shorter
+   sides of at least 384 pixels, token overlap ≥ 0.65, normalized sharpness ≥ 0.2, estimated occupancy
+   between 0.08 and 0.75, edge clipping ≤ 0.02 and border uniformity ≥ 0.9. A lone candidate is not
+   automatically trusted, and does not trigger a model call.
+
+These are **screening heuristics, not proof of the correct object, completeness or lack of occlusion**.
+Ambiguous/low-quality results produce `contact_sheet.png` and `review.json`, then `input_needed` before
+mesh generation. Interactive review can explicitly accept a rights-eligible, decodable candidate below
+the heuristic threshold. `--no-interactive` skips unresolved assets; they remain placeholders/partial
+input, subject to final acceptance—not an expensive mesh run on the top lexical hit.
+Set `reference.vision_fallback = true` to let OMP judge ambiguous candidates when at least one passes
+the automatic quality threshold. Visual fallback cannot override rights or the quality gates; its
+choice must still pass them. It is disabled by default.
+
+The supported rights allow-list defaults to CC0, public-domain declarations and configured versions of
+CC BY / CC BY-SA. Unknown, noncommercial, no-derivatives, conflicting or incomplete rights metadata
+is rejected. Attribution licenses require a creator and a matching license URL. This policy records
+provider claims; it is **not legal clearance**. Users remain responsible for attribution, share-alike
+and other obligations, and for rights to their supplied images/crops. `selection.json`, asset state
+and backlot metadata preserve image URL, provider item ID, page URL, creator, license identifier/URL,
+dimensions, query, content hash and quality assessment rather than only a free-form license label.
+
+Persistent caches live under `paths.downloads/references`: `searches/` uses
+`reference.search_cache_ttl_s = 86400`; `urls/` indexes content-addressed PNGs in `content/`.
+Cache hits are rechecked against current rights, byte/dimension limits and pixel hashes. Delete this
+cache to force fresh retrieval. Incoming and normalized files are limited by `max_download_mb`;
+decoded images are additionally bounded to 16,384 pixels per side and 40 million pixels total.
+
+Downloads permit only public HTTP(S) destinations on standard ports, without URL credentials or
+environment proxies. Every request/redirect validates all DNS answers and connects directly to a
+validated numeric address, retaining the original hostname for verified TLS. Private, loopback,
+link-local, reserved and mixed public/private destinations are rejected; redirects and bodies are
+bounded. HTTP remains supported for provider compatibility, without HTTPS transport guarantees.
+The OS resolver, sockets and TLS trust store are trusted. This hardens a risk boundary; it does not
+assert that the previous implementation was exploited.
 
 ### USD export and material fidelity
 

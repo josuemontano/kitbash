@@ -218,9 +218,12 @@ class ModellingPhase:
                 board.transition(asset.id, S.SKIPPED, "skipped")
                 scheduler.release(asset.id)
             case ReviewAction.PROVIDE_INPUT:
+                extra = {**asset.extra, "fresh_script": True, "reference_index": decision.reference_index}
+                if decision.reference_index is None:
+                    extra.update(search_name=decision.search_name, user_reference=decision.reference_path, reference_review=None)
                 board.transition(
                     asset.id, S.QUEUED, "user input", input_request=None, error=None, attempt=asset.attempt + 1,
-                    extra={"search_name": decision.search_name, "user_reference": decision.reference_path, "fresh_script": True},
+                    extra=extra,
                 )
                 scheduler.submit(asset.id)
 
@@ -232,7 +235,7 @@ class ModellingPhase:
         if asset.reused:  # model it from scratch instead of reusing the backlot asset
             board.reset(evolve(self._fresh_record(asset.id, asset.name, None), feedback=notes), "reuse dropped at the gate")
         elif asset.state is S.SKIPPED:
-            board.transition(asset_id, S.QUEUED, "reopened", feedback=notes, extra={"fresh_script": True})
+            board.transition(asset_id, S.QUEUED, "reopened", feedback=notes, extra={**asset.extra, "fresh_script": True})
         else:
             board.transition(asset_id, S.NEEDS_REWORK, "reopened", rework_entry=ReworkEntry.BUILD, feedback=notes)
 

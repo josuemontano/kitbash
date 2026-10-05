@@ -6,7 +6,7 @@
 # Global, reusable asset library. Never inside a scene output directory.
 backlot = "~/.local/share/backlot"
 trellis = "/Volumes/Vault/Projects/bethel/trellis-mac"
-# Cache for downloaded HDRIs and textures (Poly Haven).
+# Persistent cache for downloaded references, reference searches, HDRIs and textures.
 downloads = "~/.cache/kitbash/downloads"
 
 [tools]
@@ -91,15 +91,24 @@ dimensions = 384
 timeout_s = 60
 
 [reference]
-# Candidate sources: "input_crop" (crop from the reference image), "omp_web" (the omp agent's web_search tool:
-# slower, but finds product photos on white backgrounds), "wikimedia" and "openverse" (free image APIs).
-providers = ["input_crop", "omp_web", "wikimedia", "openverse"]
+# Local crops first, then licensed image APIs. No model search by default or implicitly.
+providers = ["input_crop", "wikimedia", "openverse"]
 max_candidates = 8
 per_provider = 6
 min_side_px = 256
 max_download_mb = 15
 timeout_s = 30
 query_suffix = "isolated white background"
+# Reuse only crops with this much ORIGINAL (unpadded, not upscaled) detail.
+min_crop_side_px = 384
+# Unknown, noncommercial and no-derivatives rights are rejected. Attribution/share-alike obligations remain.
+allowed_licenses = ["cc0-1.0", "public-domain", "cc-by-2.0", "cc-by-2.5", "cc-by-3.0", "cc-by-4.0", "cc-by-sa-2.0", "cc-by-sa-2.5", "cc-by-sa-3.0", "cc-by-sa-4.0"]
+# Heuristic confidence is not proof of identity, completeness or lack of occlusion.
+auto_select_threshold = 0.88
+ambiguity_margin = 0.08
+# Optional OMP visual judgment for ambiguous candidates; never bypasses rights/quality threshold.
+vision_fallback = false
+search_cache_ttl_s = 86400
 
 [polyhaven]
 # Offer Poly Haven HDRIs and textures (catalog listings) to the code writer.
