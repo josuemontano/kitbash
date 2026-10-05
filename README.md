@@ -153,7 +153,9 @@ Critics score against [`rubric.md`](rubric.md), a Markdown table:
 Editing the file changes critic prompts, scoring and pass or fail decisions, with no code changes.
 Facts available to checks include `scale_error`, `origin_offset_m`, `up_axis_ok`, `naming_violations`,
 `non_principled_materials`, `missing_textures`, `usd_roundtrip_score`, `usd_broken_materials`,
-`missing_assets`, `floating_assets`, `items` and `unrecognized_items`.
+`missing_assets`, `unexpected_assets`, `missing_placeholders`, `unexpected_placeholders`,
+`floating_assets`, `has_camera`, `items` and `unrecognized_items`. Final USD scene inspection supplies
+the corresponding `usd_`-prefixed instance, placeholder, grounding and camera facts.
 
 ## How it works
 
@@ -239,6 +241,33 @@ consistent with the `.blend`.
 The comparison is `score = min(SSIM, 1 − 2·mean color delta)`. The rung used for each material, and
 the score, are stored in the backlot (`usd_material_mode`, `usd_roundtrip_score`) and in the analytics.
 
+### Final acceptance
+
+Assembly inspects the **rebuilt, localized `scene.blend`**, not just its earlier layout preview, and
+inspects the **actual re-imported USD**. Both must contain the expected number of each approved asset
+instance (including inventory `same_as` copies) and skipped-item placeholders, with no missing or
+extra placements, a valid camera, available textures and grounded geometry. Inspection includes
+EMPTY-root hierarchies and linked collection instances. Support must be external geometry within
+3 cm of the placement base; the object's own geometry and an imaginary floor at z=0 do not count.
+The USD comparison uses the selected scene camera, not whichever camera imports first.
+
+Automatic publication requires the final rubric to pass with every applicable criterion scored,
+and the structural checks above cannot be disabled by omitting them from a custom rubric. A failed
+or unmeasured final criterion blocks automatic acceptance. Final assembly has no visual/technical
+LLM critic call: custom assembly criteria need measured machine checks to pass automatically.
+
+With `--no-interactive`, failed final acceptance exits nonzero and does not mark assembly complete.
+Files remain available for diagnosis; their presence is **not** proof that the run passed. Interactive
+runs show the failures and default to quitting. Only an explicit `p` choice can **publish degraded**;
+ordinary approval is not an override. Both `.blend` and USD outputs must exist for this option.
+
+`scene/assembly.json`, state metadata and analytics record `acceptance.status` (`pending`, `passed`,
+`failed` or `overridden`), `automatic_pass`, `published` and failure details. A human override records
+`status = "overridden"`, `automatic_pass = false` and the still-failing scorecard; terminal output also
+labels it degraded. Rebuilds clear previous acceptance before work starts, so a failed or interrupted
+rerun cannot retain an earlier automatic pass. Fix the scene and use `resume --from-phase layout`,
+or resume interactively to explicitly publish the degraded output.
+
 ### Performance
 
 The Trellis command from the spec (`--pipeline-type 1024 --steps 64`) is slow: expect roughly 30 to 60
@@ -301,7 +330,8 @@ headless Blender. They cover:
 - generation continuing during review;
 - resume;
 - the MaterialX and baked-fallback export paths;
-- relative texture paths after an asset is copied into a scene.
+- relative texture paths after an asset is copied into a scene;
+- scene and USD instance/placeholder counts, grounding, textures and active-camera preservation.
 
 ### Code map
 

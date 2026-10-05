@@ -53,6 +53,7 @@ class AssetReviewer(Protocol):
 
 class GateAction(StrEnum):
     APPROVE = "approve"
+    PUBLISH_DEGRADED = "publish_degraded"
     FEEDBACK = "feedback"
     REWORK_ASSET = "rework_asset"
     ABORT = "abort"

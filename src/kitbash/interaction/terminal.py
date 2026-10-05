@@ -104,6 +104,12 @@ class TerminalUser:
             if summary.scorecard:
                 console.print(scorecard_table(summary.scorecard))
             self._images.show(summary.images)
+            if summary.phase is PhaseName.ASSEMBLY:
+                answer = Prompt.ask(
+                    "p: publish degraded scene despite failed validation; q: quit without accepting",
+                    choices=["p", "q"], default="q", console=console,
+                )
+                return GateDecision(GateAction.PUBLISH_DEGRADED if answer == "p" else GateAction.ABORT)
             choices = ["a", "f", "q"] if summary.phase is not PhaseName.MODELLING else ["a", "r", "q"]
             labels = "[a]pprove and continue, [f]eedback, [q]uit" if "f" in choices else "[a]pprove and continue, [r]ework an asset, [q]uit"
             answer = Prompt.ask(labels, choices=choices, default="a", console=console)
