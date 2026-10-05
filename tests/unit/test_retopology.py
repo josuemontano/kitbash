@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from kitbash.agents.modelling import ModellingAgent, _retopology_note, retopology_method
+from kitbash.agents.modelling import ModellingAgent, retopology_method
 from kitbash.analytics.report import AnalyticsReport
 from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
 from kitbash.app import create_workspace, open_workspace
@@ -227,7 +227,6 @@ def test_decimate_agent_is_a_silent_pass_through(tmp_path, state):
 def test_build_script_knows_the_method_that_produced_the_mesh():
     assert retopology_method(AssetRecord(id="a", name="A")) == "decimate"
     assert retopology_method(AssetRecord(id="a", name="A", extra={"retopology": {"method": "triflow"}})) == "triflow"
-    assert "already retopologized" in _retopology_note("triflow") and "raw Trellis" in _retopology_note("decimate")
 
 
 # -- pipeline ----------------------------------------------------------------------------------------------

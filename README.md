@@ -223,12 +223,16 @@ and WezTerm. Elsewhere kitbash prints the path and opens the file.
 After Trellis, each asset's mesh goes through the configured retopology method before the build script
 imports it. Both methods hand the build script a Z-up mesh, so `trellis.mesh_up_axis` applies unchanged.
 
-- `triflow` (default): learned retopology that produces a clean, low-poly, mostly-quad mesh of about
+- `triflow` (default): learned retopology that produces a low-poly triangle mesh of about
   `retopology.face_count` faces. Output goes to `phases/02_modelling/<asset>/retopo/attempt_NN/`. The
   preflight checks that it can run (dependencies, weights in `paths.triflow_weights`, device) and the
   `--dry-run` plan shows the weights status.
 - `decimate`: the original behaviour. There is no retopology step, and the build script reduces the raw
   Trellis mesh in Blender with `kb.decimate` (collapse decimation, voxel remesh when needed).
+
+For TriFlow output, `kb.decimate` leaves the mesh unchanged even if Blender's face budget is lower.
+`kb.clean_mesh` updates normals and shading without welding vertices or removing small components.
+The decimate path, including fallback after a TriFlow failure, retains ordinary cleanup and reduction.
 
 #### TriFlow
 

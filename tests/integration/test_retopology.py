@@ -1,6 +1,8 @@
 """The retopology step in a full run: a fake TriFlow engine, a fake Trellis and a fake omp, with real headless Blender."""
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -102,3 +104,49 @@ def test_preflight_collects_the_retopology_problem(workspace):
         app.close()
     assert "TriFlow weights not found in /nowhere" in raised.value.message and "Download the TriFlow weights" in raised.value.hint
     assert fake.method is RetopologyMethod.TRIFLOW and fake.calls == []
+
+
+def test_blender_preserves_triflow_topology_but_reduces_fallback_meshes(tmp_path):
+    helpers = Path(__file__).resolve().parents[2] / "src/kitbash/blender"
+    result = tmp_path / "topology.json"
+    script = tmp_path / "topology.py"
+    script.write_text(f'''
+import json
+import sys
+import bpy
+sys.path.insert(0, {str(helpers)!r})
+import kitbash_bpy as kb
+
+kb.reset_scene()
+bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=4)
+obj = bpy.context.object
+bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=1, radius=1e-5, location=(2, 0, 0))
+obj.select_set(True)
+bpy.context.view_layer.objects.active = obj
+bpy.ops.object.join()
+
+def geometry():
+    return ([tuple(v.co) for v in obj.data.vertices],
+            sorted(tuple(sorted(f.vertices)) for f in obj.data.polygons))
+
+before = geometry()
+kb._configure({{"retopology_method": "triflow", "max_faces": 100}})
+kb.clean_mesh(obj, min_island_ratio=.03)
+kb.decimate(obj)
+kb.decimate(obj, max_faces=50)
+preserved = geometry() == before
+protected_faces = len(obj.data.polygons)
+kb._configure({{"retopology_method": "decimate", "max_faces": 100}})
+fallback_faces = kb.decimate(obj)
+with open({str(result)!r}, "w") as handle:
+    json.dump({{"preserved": preserved, "protected_faces": protected_faces,
+               "original_faces": len(before[1]), "fallback_faces": fallback_faces}}, handle)
+''')
+    subprocess.run(
+        ["blender", "-b", "--factory-startup", "--python-exit-code", "1", "--python", str(script)],
+        check=True, capture_output=True, text=True, timeout=120,
+    )
+    observed = json.loads(result.read_text())
+    assert observed["preserved"]
+    assert observed["protected_faces"] == observed["original_faces"] > 100
+    assert 0 < observed["fallback_faces"] <= 100

@@ -216,8 +216,8 @@ def retopology_method(asset: AssetRecord) -> str:
 def _retopology_note(method: str) -> str:
     if method == RetopologyMethod.TRIFLOW.value:
         return (
-            "The mesh was already retopologized (clean, low-poly, mostly quads), so `kb.decimate(obj)` will be a no-op; "
-            "still call it, and do not try to reduce or remesh the mesh yourself."
+            "The mesh was already retopologized (low-poly triangles), so `kb.decimate(obj)` preserves it and "
+            "`kb.clean_mesh(obj)` only updates normals and shading; still call them, and do not reduce or remesh it yourself."
         )
     return "The mesh is the raw Trellis output (dense triangles), so `kb.decimate(obj)` does the real reduction."
 
