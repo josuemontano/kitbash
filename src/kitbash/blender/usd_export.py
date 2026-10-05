@@ -1,8 +1,8 @@
 """Export the open .blend to USD with the material fidelity ladder.
 
 1. MaterialX network, when this Blender can export it and the export keeps every linked Principled input.
-2. UsdPreviewSurface otherwise; inputs it cannot express (procedural textures, ramps, math...) are baked
-   to image textures stored next to the USD and referenced by relative path.
+2. UsdPreviewSurface otherwise; procedural graphs on supported inputs are baked to image textures
+   stored next to the USD. Unsupported channels are reported in lost_in_preview and rejected by the fidelity checker.
 
 Work happens in a temporary copy of the .blend, so the original procedural node graphs are never touched.
 """
@@ -10,6 +10,7 @@ Work happens in a temporary copy of the .blend, so the original procedural node 
 import os
 
 import bpy
+import kb_files
 import kb_materials as km
 import kb_render
 import kitbash_bpy as kb
@@ -33,6 +34,12 @@ os.makedirs(textures_dir, exist_ok=True)
 
 # The rest of this script only ever modifies (and saves) the temporary copy.
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(work_dir, "export_copy.blend"), check_existing=False, relative_remap=True)
+
+# Resolve while image.library still identifies the owning .blend. Stage hashed filenames before
+# Blender flattens textures into the USD directory; existing libraries may reuse the same basename.
+for image in bpy.data.images:
+    if image.source == "FILE" and image.packed_file is None and image.filepath:
+        image.filepath = kb_files.copy_texture(kb_files.image_path(image), os.path.join(work_dir, "source_textures"))
 
 
 def localize_instances():
@@ -139,7 +146,7 @@ for info in analysis.values():
     needs_preview_bake = info["rung"] == PREVIEW_BAKED or options.get("bake_preview_fallback", True)
     procedural = [c for c in info["linked_inputs"] if c not in info["direct_image_inputs"]]
     info["bake_channels"] = [c for c in procedural if c in km.PREVIEW_INPUTS] if needs_preview_bake else []
-    info["lost_in_preview"] = [c for c in procedural if c not in km.PREVIEW_INPUTS]
+    info["lost_in_preview"] = [c for c in info["linked_inputs"] if c not in km.PREVIEW_INPUTS]
     if not info["ends_in_principled"]:
         info["lost_in_preview"].append("surface (not a Principled BSDF)")
     info["baked"] = {}

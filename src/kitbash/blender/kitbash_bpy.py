@@ -14,6 +14,7 @@ import urllib.request
 import bmesh
 import bpy
 import numpy as np
+from kb_files import copy_texture
 from mathutils import Euler, Matrix, Vector
 
 API = []
@@ -444,13 +445,10 @@ def _texture_coordinates(material, projection, scale):
 
 @api
 def image_texture(material, path, non_color=False, projection="BOX", scale=1.0, part=None):
-    """Image Texture node for ``path``. The file is copied into the asset's textures folder (saved with a
-    relative path). projection 'BOX' uses object coordinates (no UVs needed); 'UV' needs ensure_uv(obj)."""
+    """Image Texture node for ``path``. The file is content-hashed into the asset's textures folder
+    (saved with a relative path). projection 'BOX' uses object coordinates; 'UV' needs ensure_uv(obj)."""
     textures_dir = _ARGS.get("textures_dir") or os.path.join(os.path.dirname(_ARGS["output_blend"]), "textures")
-    os.makedirs(textures_dir, exist_ok=True)
-    destination = os.path.join(textures_dir, os.path.basename(path))
-    if os.path.abspath(path) != os.path.abspath(destination):
-        shutil.copy2(path, destination)
+    destination = copy_texture(path, textures_dir)
     image = bpy.data.images.load(destination, check_existing=True)
     image.name = naming("image", part or os.path.splitext(os.path.basename(path))[0])
     if non_color:
