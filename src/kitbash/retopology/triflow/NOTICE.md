@@ -9,7 +9,7 @@ generated meshes in-process, on CUDA, Apple MPS or CPU.
 | TriFlow (models, mesh processing, reconstruction) | DerKleineLi/triflow | **Automotive Development Public Non-Commercial License 1.0** (MPL-2.0 based, file-level copyleft, non-commercial use only) | `licenses/TriFlow-ADPNCL-1.0.txt` |
 | Sparse tensor / transformer / flow sampler code | microsoft/TRELLIS | MIT | `licenses/TRELLIS-MIT.txt` |
 | Sparse VAE encoder/decoder, sparse attention | DreamTechAI/Direct3D-S2 | MIT | `licenses/Direct3D-S2-MIT.txt` |
-| Constrained QEM simplification (runtime dependency `pyfqmr-triflow`, not vendored) | DerKleineLi/pyfqmr-triflow | MIT | `licenses/pyfqmr-MIT.txt` |
+| Constrained QEM simplification (`geometry/Simplify.h`, vendored at `c93a7671ba4a2163dd3c7ea6ab6b52ad0167cc72`) | DerKleineLi/pyfqmr-triflow | MIT | `licenses/pyfqmr-MIT.txt` |
 | Pretrained weights (downloaded at first use, not vendored) | huggingface.co/lihcxr/TriFlow | see the model card | |
 
 ## What this means for kitbash
@@ -30,6 +30,8 @@ generated meshes in-process, on CUDA, Apple MPS or CPU.
 * No hard-coded `.cuda()`; float32 on MPS/CPU, fp16 autocast only on CUDA (`device.py`).
 * No hydra / omegaconf / accelerate / wandb: hyper-parameters are Python constants (`models/`).
 * `open3d` (voxelization) is replaced by a numba implementation; `PyMCubes` by scikit-image.
+* The constrained QEM is built in-package through a small Cython binding. Flip/degeneracy rejection is enabled;
+  output connectivity is retained instead of welding vertices and deleting faces after QEM.
 * Training, dataset-preparation, augmentation and rendering code is dropped; only inference is vendored.
 * Checkpoints are fetched from a pinned Hugging Face revision and verified by SHA-256 (`weights.py`).
 * Meshes are mapped back into the coordinate frame of the input mesh (`geometry.to_input_frame`), so kitbash's

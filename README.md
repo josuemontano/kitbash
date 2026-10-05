@@ -238,6 +238,10 @@ ratio, predicts a nearest-vertex vector field. Watershed clustering plus a const
 simplification then extract the mesh. kitbash vendors and adapts the code (`src/kitbash/retopology/triflow/`),
 so it runs in-process and no separate checkout is needed.
 
+The constrained QEM is compiled from the vendored C++ source during `poetry install` (a C++17 compiler is
+required; on macOS install Xcode Command Line Tools). It rejects inverted or degenerate contractions;
+the final mesh is not welded or stripped of faces after simplification, which would bypass topology checks.
+
 - **Devices.** Upstream is CUDA-only. Here the sparse convolutions and attention are plain PyTorch
   (`scaled_dot_product_attention`), so TriFlow runs on CUDA, Apple MPS and CPU: `retopology.device = "auto"`
   prefers CUDA, then MPS, then CPU. fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn

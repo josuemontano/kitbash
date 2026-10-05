@@ -101,10 +101,8 @@ CASES = {"icosphere": low_poly_sphere, "capsule": low_poly_capsule, "box_cylinde
 def test_geometry_pipeline_ground_truth_nvv_reproduces_input(name, target):
     """NVV computed by process_one_mesh for the (low-poly) input itself, fed to QEM with a face-count target.
 
-    ``target="natural"`` asks for the input's own face count (what a perfect flow model would be asked for); ``500`` is the
-    production-like target, above the topology's natural size. In that case upstream's QEM keeps collapsing along zero-cost
-    edges and its final ``pack_trimesh`` (vertex merge at 1e-5 voxels + degenerate-face removal) can leave a few holes, so
-    watertightness is only required for the natural target.
+    Both natural and larger face-count targets must retain closed, consistently
+    oriented geometry: surplus faces may not collapse into degenerate triangles.
     """
     mesh = CASES[name]()
     mesh.apply_translation([3.0, -1.5, 8.0])  # input frame is deliberately far from the origin
@@ -121,8 +119,9 @@ def test_geometry_pipeline_ground_truth_nvv_reproduces_input(name, target):
     assert out.vertices.dtype == np.float64
 
     assert 0 < len(out.faces) <= 500
+    assert out.is_watertight and out.is_winding_consistent and out.volume > 0
+    assert out.nondegenerate_faces().all()
     if target == "natural":
-        assert out.is_watertight and out.volume > 0
         assert 0.9 * len(mesh.faces) <= len(out.faces) <= 1.25 * len(mesh.faces)
     # in the input frame: same bounding box as the input (within 0.5% of the diagonal)
     np.testing.assert_allclose(out.bounds, mesh.bounds, atol=0.005 * diag(mesh))

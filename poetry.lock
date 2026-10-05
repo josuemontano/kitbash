@@ -1322,25 +1322,6 @@ dev = ["pre-commit", "tox"]
 testing = ["coverage", "pytest", "pytest-benchmark"]
 
 [[package]]
-name = "pyfqmr-triflow"
-version = "0.5.0+triflow"
-description = "triflow-customized cython wrapper around C++ library for fast triangular mesh reduction"
-optional = false
-python-versions = "*"
-groups = ["main"]
-files = []
-develop = false
-
-[package.dependencies]
-numpy = "*"
-
-[package.source]
-type = "git"
-url = "https://github.com/DerKleineLi/pyfqmr-triflow.git"
-reference = "c93a7671ba4a2163dd3c7ea6ab6b52ad0167cc72"
-resolved_reference = "c93a7671ba4a2163dd3c7ea6ab6b52ad0167cc72"
-
-[[package]]
 name = "pygments"
 version = "2.21.0"
 description = "Pygments is a syntax highlighting package written in Python."
@@ -2311,4 +2292,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.14,<3.15"
-content-hash = "aa988faa537d0c820253d6cf7652880a2c7dea9a1d3efe9ddec0306287b182bf"
+content-hash = "e2d060fa7d36210ff195440deed38773e4751bef0fc06780b7581915e8365f59"

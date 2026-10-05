@@ -24,7 +24,6 @@ dependencies = [
     "meshlib (>=3.1.1)",
     "numba (>=0.63)",
     "einops (>=0.8)",
-    "pyfqmr-triflow @ git+https://github.com/DerKleineLi/pyfqmr-triflow.git@c93a7671ba4a2163dd3c7ea6ab6b52ad0167cc72",
 ]
 
 [project.scripts]
@@ -36,7 +35,14 @@ include = [
     { path = "src/kitbash/defaults/*", format = ["sdist", "wheel"] },
     { path = "src/kitbash/prompts/*", format = ["sdist", "wheel"] },
     { path = "src/kitbash/blender/**/*", format = ["sdist", "wheel"] },
+    { path = "src/kitbash/retopology/triflow/geometry/*.so", format = "wheel" },
+    { path = "src/kitbash/retopology/triflow/geometry/*.pyd", format = "wheel" },
+    { path = "src/kitbash/retopology/triflow/geometry/*.pyx", format = "sdist" },
+    { path = "src/kitbash/retopology/triflow/geometry/*.h", format = "sdist" },
 ]
+
+[tool.poetry.build]
+script = "build.py"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.4"
@@ -44,7 +50,7 @@ pytest-timeout = ">=2.4"
 ruff = "^0.16.9"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core>=2.0.0,<3.0.0", "setuptools>=75,<83", "cython>=3.1,<4"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]

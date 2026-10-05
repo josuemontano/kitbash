@@ -29,7 +29,7 @@ NVV_SMOOTH = {"radius": 3.5, "threshold": 6, "sigma_s": 1.0, "sigma_r": 1.0}
 ROOT_THRESHOLD = 0.5
 MERGE_THRESHOLD = 1.0
 TARGET_POSITION_WEIGHT = 0.1
-REQUIRED_MODULES = ("torch", "safetensors", "trimesh", "meshlib", "pyfqmr_triflow", "numba", "scipy", "einops")
+REQUIRED_MODULES = ("torch", "safetensors", "trimesh", "meshlib", "numba", "scipy", "skimage", "einops")
 
 
 class TriflowRetopologizer:
@@ -69,6 +69,10 @@ class TriflowRetopologizer:
                 f"TriFlow retopology needs Python packages that are not installed: {', '.join(missing)}",
                 hint="Run `poetry install`, or choose `--retopology decimate`.",
             )
+        try:
+            importlib.import_module("kitbash.retopology.triflow.geometry._qem")
+        except ImportError as exc:
+            raise PreflightError("TriFlow's native QEM extension is unavailable", hint="Rebuild with `poetry install`.") from exc
         if self._device_name not in DEVICES:
             raise PreflightError(f"Unknown retopology.device {self._device_name!r}", hint=f"Use one of {', '.join(DEVICES)}.")
         try:

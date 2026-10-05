@@ -7,3 +7,7 @@ dist/
 *.blend1
 out/
 audit/
+build/
+*.so
+*.pyd
+src/kitbash/retopology/triflow/geometry/_qem.cpp

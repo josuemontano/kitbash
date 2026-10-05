@@ -11,25 +11,23 @@ QEM (Quadric Error Metric) simplification with priority watershed.
 """
 
 import ctypes
-import logging
 import time
 
 import meshlib.mrmeshnumpy as mrmeshnumpy
 import meshlib.mrmeshpy as mrmesh
 import numpy as np
-import pyfqmr_triflow
 import trimesh
 from scipy.spatial import cKDTree
 
-from .mesh_processing import pack_trimesh
+from ._qem import simplify
 from .nvv import (
     filter_nvv_geodesic_fast,
     get_target_point_priority_watershed,
 )
 
-# Modified for kitbash: vendored from triflow/utils/mesh_reconstruction.py; only the imports changed. Frame note: the input
-# ``dense_mesh`` / ``coords`` and the returned mesh are all in the *grid frame* (voxel units, see ``frames.py``); use
-# ``frames.to_input_frame(mesh, metadata)`` to get back to the input mesh's coordinates.
+# Modified for kitbash: use the guarded, in-package native QEM without post-collapse welding.
+# The input dense_mesh / coords and returned mesh are in voxel units; frames.to_input_frame
+# restores the input mesh's coordinates.
 
 
 # ----------------------------------------------------------------------------
@@ -202,9 +200,6 @@ def topology_flow2mesh_QEM(
     Returns:
         A ``trimesh.Trimesh`` — the simplified output mesh.
     """
-    logging.getLogger("pyfqmr_triflow").setLevel(
-        logging.DEBUG if verbose else logging.WARNING
-    )
 
     def quadratic_vert_target_pose(vertices, target_poses, weights=1.0):
         """Build per-vertex quadratic matrices penalizing deviation from target positions.
@@ -235,9 +230,6 @@ def topology_flow2mesh_QEM(
         return custom_quadratics
 
     t0 = time.time()
-
-    mesh_simplifier = pyfqmr_triflow.Simplify()
-    mesh_simplifier.setMesh(dense_mesh.vertices, dense_mesh.faces)
 
     # --- Stage 1: bilateral smooth the NVV field and project targets to the mesh surface ---
     nvv_scaled = nvv * resolution
@@ -288,19 +280,10 @@ def topology_flow2mesh_QEM(
 
     # --- Stage 4: QEM mesh simplification with the injected quadratics ---
     t_simplify_start = time.time()
-    mesh_simplifier.simplify_mesh(
-        target_count=target_face_count,
-        aggressiveness=7,
-        max_iterations=200,
-        preserve_border=False,
-        verbose=verbose,
-        lossless=False,
-        threshold_lossless=max_quadratic_error,
-        custom_quadratics=custom_quadratics,
-        target_vertex_ids=unique_vert_ids,
-        min_edge_length=merge_threshold,
+    vertices, faces = simplify(
+        dense_mesh.vertices, dense_mesh.faces, custom_quadratics, unique_vert_ids,
+        target_face_count, max_quadratic_error, merge_threshold,
     )
-    vertices, faces, normals = mesh_simplifier.getMesh()
     if verbose:
         print(
             f"[flow2mesh] QEM simplification done: {time.time() - t_simplify_start:.2f}s"
@@ -310,8 +293,9 @@ def topology_flow2mesh_QEM(
         faces=faces,
         process=False,
     )
-    pack_trimesh(out)
-    out.fix_normals()
+    # Native contractions preserve connectivity and winding. Merging coincident
+    # vertices or deleting faces here would bypass those topology checks.
+    out.remove_unreferenced_vertices()
 
     # --- (Optional) debug output: export 4 OBJ files for visual inspection ---
     #   nvv.obj                    — dense mesh, vertex-colored by NVV direction
