@@ -25,8 +25,29 @@ wanted = {
     "import_cameras": options["mode"] == "scene",
     "import_lights": options["mode"] == "scene",
     "create_world_material": options["mode"] == "scene",
+    "property_import_mode": "USER",
+    # Merging a geometry prim into its Xform transfers the Xform's placement/camera properties
+    # onto the imported object. Multi-object placement roots remain separate Empty parents.
+    "merge_parent_xform": True,
 }
 bpy.ops.wm.usd_import(**{k: v for k, v in wanted.items() if k in import_options})
+scene_expectations = options.get("scene_expectations")
+scene_inspection = {}
+if options["mode"] == "scene":
+    cameras = [obj for obj in bpy.context.scene.objects if obj.type == "CAMERA"]
+    if scene_expectations is not None and "camera_name" in scene_expectations:
+        expected_camera = scene_expectations["camera_name"]
+        camera = next((obj for obj in cameras if obj.get("kb_camera_name", obj.name) == expected_camera), None)
+    else:
+        camera = next((obj for obj in cameras if obj.get("kb_active_camera")), None)
+        if camera is None and scene_expectations is None:
+            camera = next(iter(cameras), None)
+    bpy.context.scene.camera = camera
+    if scene_expectations is not None:
+        from inspect_scene import inspect_scene
+
+        report, facts = inspect_scene({**options, **scene_expectations})
+        scene_inspection = {"scene_report": report, "scene_facts": facts}
 
 materials_report, missing = {}, set()
 for name, expected_channels in options.get("expected", {}).items():
@@ -56,11 +77,12 @@ for image in bpy.data.images:
 
 kb_render.configure_render(options["engine"], options["samples"], options.get("device", "CPU"), options["resolution"])
 if options["mode"] == "scene":
-    cameras = [o for o in bpy.context.scene.objects if o.type == "CAMERA"]
-    if not cameras:
+    if bpy.context.scene.camera is None and scene_expectations is None:
         raise RuntimeError("The exported USD has no camera")
-    bpy.context.scene.camera = cameras[0]
-    images = [kb_render.render_to(os.path.join(options["output_dir"], f"{options['prefix']}_camera.png"))]
+    images = (
+        [kb_render.render_to(os.path.join(options["output_dir"], f"{options['prefix']}_camera.png"))]
+        if bpy.context.scene.camera is not None else []
+    )
 else:
     images = kb_render.render_views(kb_render.scene_meshes(), options["views"], options["output_dir"], options["prefix"])
 
@@ -72,5 +94,6 @@ kb.emit(
         "materials_ok": sum(1 for m in materials_report.values() if m["found"] and m["principled"] and not m["missing_channels"]),
         "missing_textures": sorted(missing),
         "images": images,
+        **scene_inspection,
     },
 )

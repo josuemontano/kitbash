@@ -76,7 +76,8 @@ class BlenderToolkit:
         return result["usd"]
 
     def usd_roundtrip(
-        self, usd: Path, expected: Mapping[str, Sequence[str]], *, mode: str, output_dir: Path, prefix: str, log_dir: Path, engine: str | None = None
+        self, usd: Path, expected: Mapping[str, Sequence[str]], *, mode: str, output_dir: Path, prefix: str, log_dir: Path,
+        engine: str | None = None, scene_expectations: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = self._fixed(
             "usd_roundtrip.py", None, log_dir, f"{prefix}_roundtrip",
@@ -84,6 +85,7 @@ class BlenderToolkit:
             views=list(self._blender.preview_views), resolution=list(self._usd.roundtrip_resolution),
             samples=self._usd.roundtrip_samples, engine=engine or self._blender.render_engine,
             device=self._blender.cycles_device, output_dir=str(output_dir), prefix=prefix,
+            scene_expectations=dict(scene_expectations) if scene_expectations is not None else None,
         )
         return result["roundtrip"]
 
@@ -104,7 +106,8 @@ class BlenderToolkit:
     ) -> tuple[dict, dict]:
         result = self._fixed(
             "inspect_scene.py", blend, log_dir, log_name,
-            assets=dict(assets), expected_assets=list(assets), expected_placeholders=list(expected_placeholders),
+            assets=dict(assets), expected_assets={key: int(spec.get("instances", 1)) for key, spec in assets.items()},
+            expected_placeholders=list(expected_placeholders),
         )
         return result["report"], result["facts"]
 

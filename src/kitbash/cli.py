@@ -86,8 +86,10 @@ def _run(application: Application, from_phase: PhaseName | None = None) -> None:
         application.close()
     print_summary(console, report)
     layout = application.layout
+    acceptance = report.get("scene", {}).get("acceptance", {})
+    label = "[bold yellow]Published degraded scene (human override).[/bold yellow]" if acceptance.get("status") == "overridden" else "[bold green]Done.[/bold green]"
     console.print(
-        f"\n[bold green]Done.[/bold green] Scene: {layout.scene_blend}\nUSD: {layout.scene_usd}\n"
+        f"\n{label} Scene: {layout.scene_blend}\nUSD: {layout.scene_usd}\n"
         f"Analytics: {layout.analytics_md}"
     )
 

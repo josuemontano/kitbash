@@ -1,6 +1,7 @@
 """Layout agent: places the approved assets, then sets camera, lighting and world for the chosen style."""
 
 import json
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -144,7 +145,11 @@ class LayoutSubject:
         return width, max(1, round(width * final_h / final_w))
 
     def run_args(self, output_blend: Path, blends: dict[str, Path] | None = None, asset_mode: str = "append") -> dict[str, Any]:
-        return {"output_blend": str(output_blend), "assets": asset_specs(self._assets, blends), "asset_mode": asset_mode}
+        assets = asset_specs(self._assets, blends)
+        counts = Counter(item.asset_key for item in self._inventory.items)
+        for key, spec in assets.items():
+            spec["instances"] = counts[key]
+        return {"output_blend": str(output_blend), "assets": assets, "asset_mode": asset_mode}
 
     def evaluate(self, script: Path, cycle_dir: Path, cycle: int) -> Evaluation:
         blend = cycle_dir / "layout.blend"
