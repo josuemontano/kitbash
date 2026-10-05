@@ -10,7 +10,7 @@ conversions, numba-accelerated bilateral filters, and the priority-watershed
 clustering used by ``topology_flow2mesh_QEM``.
 """
 
-# Modified for kitbash: vendored from triflow/utils/nvv.py. Only change: ``cache=True`` on the numba kernel.
+# Modified for kitbash: cached numba kernel and mesh-displacement watershed roots with component coverage.
 
 import heapq
 
@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from numba import njit, prange
 from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 # ---------------------------------------------------------------------------
@@ -257,18 +258,18 @@ def get_target_point_priority_watershed(
 ):
     """Cluster mesh vertices into target groups via a priority watershed on NVV targets.
 
-    For each voxel, its "ideal target" is its center + NVV offset. Voxels
-    whose NVV is smaller than ``root_threshold`` on every axis are declared
-    *roots* (they barely move); a Dijkstra-style watershed then grows each
-    root's cluster across the mesh graph by greedily absorbing neighboring
-    vertices whose ideal target is closest to the cluster's root position.
+    Each mesh vertex receives the target (center + NVV) of its nearest voxel.
+    Vertices within ``root_threshold`` of their transferred target in infinity
+    norm seed the watershed. Each unseeded mesh component receives one root:
+    its minimum-displacement vertex, breaking ties by vertex index. Regions
+    grow over mesh adjacency in order of target distance to their root target.
 
     Args:
         mesh: A ``trimesh.Trimesh``.
         coords: ``(N, 3)`` voxel coordinates.
         nvv: ``(N, 3)`` NVV vectors.
-        root_threshold: Max absolute NVV component for a voxel to be
-            considered a root.
+        root_threshold: Maximum infinity norm of target minus mesh vertex,
+            in grid units, for a vertex to be considered a root.
         resolution: If set, ``nvv`` is rescaled by this factor (use when
             ``nvv`` is normalized to ``[-1, 1]`` grid units).
 
@@ -280,21 +281,26 @@ def get_target_point_priority_watershed(
         * ``refined_root_ids``: ``(V,)`` int array; the mesh-vertex index of
           each vertex's assigned root.
     """
-    nvv_scaled = nvv if resolution is None else nvv * resolution
-    voxel_target_pos = coords.astype(float) + 0.5 + nvv_scaled
-
+    coords = np.asarray(coords)
+    nvv = np.asarray(nvv)
     mesh_vertices = mesh.vertices
     num_verts = len(mesh_vertices)
-    coords_tree = cKDTree(coords.astype(float) + 0.5)
+    if num_verts == 0:
+        raise ValueError("Watershed requires a nonempty mesh vertex set")
+    if coords.ndim != 2 or coords.shape[1] != 3 or len(coords) == 0:
+        raise ValueError("Watershed requires nonempty voxel coordinates with shape (N, 3)")
+    if nvv.shape != coords.shape:
+        raise ValueError("Watershed requires one NVV vector per voxel coordinate")
+
+    nvv_scaled = nvv if resolution is None else nvv * resolution
+    voxel_centers = coords.astype(float) + 0.5
+    voxel_target_pos = voxel_centers + nvv_scaled
+    coords_tree = cKDTree(voxel_centers)
     _, mesh_vert_to_voxel_idx = coords_tree.query(mesh_vertices)
     vert_ideal_targets = voxel_target_pos[mesh_vert_to_voxel_idx]
 
-    mask_small_nvv = np.all(np.abs(nvv_scaled) <= root_threshold, axis=1)
-    root_candidate_pts = voxel_target_pos[mask_small_nvv]
-
-    mesh_tree = cKDTree(mesh_vertices)
-    _, root_mesh_vert_ids = mesh_tree.query(root_candidate_pts)
-    root_mesh_vert_ids = np.unique(root_mesh_vert_ids)
+    displacement = np.max(np.abs(vert_ideal_targets - mesh_vertices), axis=1)
+    root_mask = displacement <= root_threshold
 
     edges = mesh.edges_unique
     v1 = edges[:, 0]
@@ -306,17 +312,27 @@ def get_target_point_priority_watershed(
     indptr = adj_matrix.indptr
     indices = adj_matrix.indices
 
+    num_components, component_ids = connected_components(adj_matrix, directed=False)
+    seeded_components = np.zeros(num_components, dtype=bool)
+    seeded_components[component_ids[root_mask]] = True
+    if not np.all(seeded_components):
+        # Supply exactly one root to each unseeded component, including isolated vertices.
+        min_displacement = np.full(num_components, np.inf)
+        np.minimum.at(min_displacement, component_ids, displacement)
+        candidates = np.flatnonzero(displacement == min_displacement[component_ids])
+        component_roots = np.full(num_components, num_verts, dtype=int)
+        np.minimum.at(component_roots, component_ids[candidates], candidates)
+        root_mask[component_roots[~seeded_components]] = True
+    root_mesh_vert_ids = np.flatnonzero(root_mask)
+
     refined_root_ids = np.full(num_verts, -1, dtype=int)
-    root_positions = vert_ideal_targets[root_mesh_vert_ids]
-    all_root_positions = np.zeros((num_verts, 3))
-    all_root_positions[root_mesh_vert_ids] = root_positions
 
     pq = []
     for r_id in root_mesh_vert_ids:
         refined_root_ids[r_id] = r_id
         neighbors = indices[indptr[r_id] : indptr[r_id + 1]]
         for v in neighbors:
-            dist = np.linalg.norm(vert_ideal_targets[v] - all_root_positions[r_id])
+            dist = np.linalg.norm(vert_ideal_targets[v] - vert_ideal_targets[r_id])
             heapq.heappush(pq, (dist, v, r_id))
 
     while pq:
@@ -324,12 +340,12 @@ def get_target_point_priority_watershed(
         if refined_root_ids[u] != -1:
             continue
         refined_root_ids[u] = r_id
-        u_root_pos = all_root_positions[r_id]
+        u_root_pos = vert_ideal_targets[r_id]
         for v in indices[indptr[u] : indptr[u + 1]]:
             if refined_root_ids[v] == -1:
                 diff = vert_ideal_targets[v] - u_root_pos
                 new_dist = np.sqrt(diff[0] ** 2 + diff[1] ** 2 + diff[2] ** 2)
                 heapq.heappush(pq, (new_dist, v, r_id))
 
-    target_pts_per_vert = all_root_positions[refined_root_ids]
+    target_pts_per_vert = vert_ideal_targets[refined_root_ids]
     return target_pts_per_vert, refined_root_ids

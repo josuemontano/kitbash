@@ -246,6 +246,10 @@ The constrained QEM is compiled from the vendored C++ source during `poetry inst
 required; on macOS install Xcode Command Line Tools). It rejects inverted or degenerate contractions;
 the final mesh is not welded or stripped of faces after simplification, which would bypass topology checks.
 
+Watershed roots use the transferred displacement at mesh vertices (paper Eq. 6). If a connected
+component has no root below the threshold, its minimum-displacement vertex seeds that component
+(ties use vertex order). No component is assigned an invalid root or a fabricated origin target.
+
 - **Devices.** Upstream is CUDA-only. Here the sparse convolutions and attention are plain PyTorch
   (`scaled_dot_product_attention`), so TriFlow runs on CUDA, Apple MPS and CPU: `retopology.device = "auto"`
   prefers CUDA, then MPS, then CPU. fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn
