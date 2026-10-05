@@ -14,6 +14,7 @@ from attrs import asdict, evolve, frozen
 from kitbash.critique.loop import CriticLoop, LoopObserver, LoopOutcome, LoopReason
 from kitbash.critique.store import CycleResult
 from kitbash.critique.subject import LoopSubject
+from kitbash.errors import StateError
 from kitbash.store.state import RunMetaRepository
 
 
@@ -65,7 +66,10 @@ class ResumableLoop:
         session = self._sessions.get(subject)
         if session is not None and session.request == request:
             if session.done:
-                return LoopOutcome(reason=LoopReason(session.reason), best=self._best(subject, session), cycles_run=0, message=session.message)
+                best = self._best(subject, session)
+                if best is None:
+                    raise StateError("The completed critic session has no eligible result", hint="Check its required artifacts and cycle reports.")
+                return LoopOutcome(reason=LoopReason(session.reason), best=best, cycles_run=0, message=session.message)
         else:
             if session is not None and not session.done:
                 self._loop.abandon_pending(subject)
@@ -99,9 +103,4 @@ class ResumableLoop:
 
     def _best(self, subject: LoopSubject, session: LoopSession) -> CycleResult | None:
         """A session's best cycle; a session without evaluated cycles still stands on its base."""
-        own = self._loop.best(subject, since=session.start)
-        if own is not None:
-            return own
-        if session.base_cycle is not None:
-            return self._loop.result(subject, session.base_cycle)
-        return self._loop.best(subject)
+        return self._loop.best(subject, since=session.start, base_cycle=session.base_cycle)

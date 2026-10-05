@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from typing import Protocol
 
-from attrs import define, frozen
+from attrs import define, evolve, frozen
 
 from kitbash.analytics import context
 from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
@@ -21,7 +21,7 @@ from kitbash.critique.store import CycleResult, CycleStore, LoopState
 from kitbash.critique.subject import Evaluation, LoopSubject
 from kitbash.domain.critique import Critique, Edit
 from kitbash.domain.rubric import Rubric
-from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, LLMError, PatchError
+from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, LLMError, PatchError, StateError
 from kitbash.infra.patching import apply_diff, make_diff
 from kitbash.llm.parsing import check_python
 
@@ -62,6 +62,10 @@ class LoopOutcome:
     cycles_run: int
     message: str
 
+    def __attrs_post_init__(self) -> None:
+        if not self.best.eligible or (self.reason is LoopReason.PASSED and not self.best.passed):
+            raise StateError(f"Cycle {self.best.cycle:02d} is not eligible for a {self.reason.value} outcome")
+
     @property
     def passed(self) -> bool:
         return self.reason is LoopReason.PASSED
@@ -77,8 +81,8 @@ class _Session:
     observer: LoopObserver
 
     def best(self, state: LoopState) -> CycleResult | None:
-        """The session's highest-scoring result (what the loop hands back)."""
-        return state.best(self.start) or self.base
+        """The session's eligible result (what the loop hands back)."""
+        return state.best(self.start, base_cycle=self.base.cycle if self.base else None)
 
     def head(self, state: LoopState) -> CycleResult | None:
         """The result the next patch builds on: the latest kept cycle of the session."""
@@ -111,11 +115,8 @@ class CriticLoop:
         state = self._store.load(subject)
         return state.pending[0] if state.pending else state.next_cycle
 
-    def best(self, subject: LoopSubject, since: int = 1) -> CycleResult | None:
-        return self._store.load(subject).best(since)
-
-    def result(self, subject: LoopSubject, cycle: int) -> CycleResult | None:
-        return self._store.load(subject).results.get(cycle)
+    def best(self, subject: LoopSubject, since: int = 1, *, base_cycle: int | None = None) -> CycleResult | None:
+        return self._store.load(subject).best(since, base_cycle=base_cycle)
 
     def abandon_pending(self, subject: LoopSubject) -> None:
         self._store.abandon_pending(subject)
@@ -143,6 +144,11 @@ class CriticLoop:
         base = state.results.get(base_cycle) if base_cycle else state.best()
         session = _Session(start=start, base=None if fresh else base, fresh=fresh or base is None, observer=observer or _SilentObserver())
         budget = max_cycles or self._config.max_cycles
+        # Evaluation is checkpointed before the session is marked done. A crash in between must
+        # return the saved pass, even when it consumed the final cycle of the budget.
+        saved = state.best(start)
+        if saved is not None and saved.passed:
+            return self._outcome(state, session, LoopReason.PASSED, f"Passed the rubric at cycle {saved.cycle:02d}.")
         trend = ScoreTrend.of(
             [state.results[c].score for c in sorted(state.results) if c >= start],
             self._config.stall_cycles,
@@ -165,7 +171,7 @@ class CriticLoop:
                 pending_feedback = None
             result = self._evaluate(subject, state, session, feedback)
             trend.add(result.score)
-            if result.scorecard.passed:
+            if result.passed:
                 return self._outcome(state, session, LoopReason.PASSED, f"Passed the rubric at cycle {result.cycle:02d}.")
             if trend.stalled():
                 message = f"Scores stalled for {self._config.stall_cycles} cycles (best {trend.best:.2f})."
@@ -228,7 +234,7 @@ class CriticLoop:
         cycle, script_path = state.pending
         cycle_dir = script_path.parent
         first_of_session = state.session_cycles(session.start) == 0
-        parent_score = state.history.score_before(cycle)
+        parent = session.head(state)
         with self._tracker.span(SpanKind.STEP, f"{subject.phase.value}.cycle", cycle=cycle) as span:
             session.observer.building(cycle)
             try:
@@ -253,20 +259,26 @@ class CriticLoop:
                 threshold=self._config.pass_threshold,
                 require_all_pass=self._config.require_all_pass,
             )
-            span.meta.update(score=round(card.overall, 4), passed=card.passed, ok=evaluation.ok)
-        # A patch that makes its parent script worse is reverted; a session's first cycle (initial script or
-        # the user's feedback) is its baseline and is always kept.
-        worse = not first_of_session and parent_score is not None and card.overall < parent_score - self._config.revert_epsilon
-        status = DiffStatus.REVERTED if worse else DiffStatus.KEPT
-        result = CycleResult(cycle, script_path, card, critiques, evaluation, status)
+            result = CycleResult(cycle, script_path, card, critiques, evaluation, DiffStatus.KEPT, subject.phase)
+            # The first cycle is the feedback baseline. Otherwise, protect an eligible parent from
+            # broken patches and score regressions, but never revert a pass in favour of a failure.
+            worse = (
+                not first_of_session
+                and parent is not None
+                and parent.eligible
+                and (not result.eligible or (not result.passed and result.score < parent.score - self._config.revert_epsilon))
+            )
+            if worse:
+                result = evolve(result, status=DiffStatus.REVERTED)
+            span.meta.update(score=round(card.overall, 4), passed=result.passed, ok=evaluation.ok)
         self._store.save_evaluation(subject, result)
-        state.history.settle(cycle, status, card.overall)
+        state.history.settle(cycle, result.status, card.overall)
         state.results[cycle] = result
         state.pending = None
         session.observer.evaluated(result)
         self._tracker.event(
             EventKind.CRITIC_CYCLE, subject.phase.value, cycle=cycle, subject=subject.subject_id,
-            score=card.overall, passed=card.passed, status=status.value,
+            score=card.overall, passed=result.passed, status=result.status.value,
         )
         return result
 
@@ -285,5 +297,9 @@ class CriticLoop:
 
     def _outcome(self, state: LoopState, session: _Session, reason: LoopReason, message: str) -> LoopOutcome:
         best = session.best(state)
-        assert best is not None
+        if best is None:
+            raise KitbashError(
+                f"{message} No eligible critic result is available.",
+                hint="A result needs successful evaluation, complete rubric scores, and all required artifacts. Check the cycle reports.",
+            )
         return LoopOutcome(reason=reason, best=best, cycles_run=state.session_cycles(session.start), message=message)

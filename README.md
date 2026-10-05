@@ -166,12 +166,24 @@ Each cycle evaluates a script in headless Blender, then runs two critics in para
   graphs, texture paths) and the USD round-trip results.
 
 Each critic returns rubric scores and a structured list of edits. The **code role** turns those edits
-into a **unified diff** against the best script so far. All Python is written by the code role. Every
+into a **unified diff** against the latest kept script. All Python is written by the code role. Every
 cycle is stored in `cycles/NN/` as `script.py`, `diff.patch`, `critique.json` and `report.json`.
+
+Only kept cycles with successful evaluation, a score and verdict for every applicable criterion, and
+all required artifact files are eligible to return. Breakdown requires inventory, blend and render;
+modelling requires blend, USD and preview; layout requires blend and render. Passing cycles outrank
+non-passing cycles, regardless of score. `passed` always describes the cycle actually returned.
+If no eligible result exists, the loop reports an error instead of returning a broken build.
+
+Resume recognizes a checkpointed pass even if interruption happened before the session was marked
+complete or after the final allowed cycle. It does not patch or re-evaluate that pass. Required files
+are checked again when selecting a saved result; a cached success cannot mask missing artifacts.
 
 The loop never repeats itself:
 
-- A patch that makes the score drop is **reverted**. The next patch starts from the best script.
+- A patch that breaks an eligible build or drops its score beyond `revert_epsilon` is **reverted**.
+  A passing patch is kept even if its score is below a non-passing parent's. The next patch starts
+  from the latest kept script, including a failed initial script that still needs repair.
 - Patches that do not apply are **rejected**, and the reason goes back to the code writer.
 - The full diff history, with each status, goes into every prompt.
 - The loop stops early when a new diff repeats an earlier one, or when the best score has not
