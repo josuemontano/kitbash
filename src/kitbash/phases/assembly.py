@@ -118,11 +118,12 @@ class AssemblyPhase:
             self.name, [], facts, threshold=self._config.critic.pass_threshold, require_all_pass=True
         )
         issues = []
-        if not card.passed:
-            issues.append("Final rubric did not pass: " + ", ".join(entry.name for entry in card.failing()))
-        for entry in card.entries:
-            if entry.score is None or entry.passed is None:
-                issues.append(f"Unscored final criterion: {entry.name}")
+        if card.failing():
+            issues.append("Failed final criteria: " + ", ".join(entry.name for entry in card.failing()))
+        elif not card.passed and not card.unassessed():
+            issues.append("Final rubric score did not meet the pass threshold")
+        for entry in card.unassessed():
+            issues.append(f"Unassessed final criterion: {entry.name}")
         # These are publication invariants, not optional rubric weights. A custom or lenient rubric
         # cannot automatically publish missing instances, unsupported objects or broken textures.
         for prefix in ("", "usd_"):

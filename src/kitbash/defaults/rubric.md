@@ -1,8 +1,11 @@
 # kitbash rubric
 
-Critics score each criterion that applies to the current phase from 0 to 1 and decide
-whether it passes. Edit this file (or pass `--rubric my_rubric.md`) to change critic
-behavior. No code changes are needed.
+Critics assess every criterion assigned to their role and the current phase. With evidence,
+they give a score from 0 to 1 and a pass/fail verdict. Without evidence, they explicitly return
+null score and verdict plus a reason; the scorecard marks the criterion **unassessed**, not failed.
+Strict scoring (`require_all_pass`) cannot pass an unassessed criterion. When assigned to both
+critics, both must supply evidence to pass unless a measured machine check decides the result.
+Edit this file (or pass `--rubric my_rubric.md`) to change critic behavior. No code changes are needed.
 
 Columns:
 

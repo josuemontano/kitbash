@@ -31,12 +31,16 @@ class CycleResult:
         return self.scorecard.overall
 
     def edits(self) -> list[Edit]:
-        """Critic edits plus one edit per failing criterion, most important first."""
+        """Critic edits, fixes for failed criteria, and evidence requests for unassessed criteria."""
         edits = [edit for critique in self.critiques for edit in critique.edits]
         edits += [
             Edit(instruction=f"Make '{entry.name}' pass. {' '.join(entry.notes)}".strip(), source="rubric", priority="high")
             for entry in self.scorecard.failing()
             if entry.decided_by == "check" or not entry.notes
+        ]
+        edits += [
+            Edit(instruction=f"Provide evidence to assess '{entry.name}'. {' '.join(entry.notes)}".strip(), source="rubric", priority="high")
+            for entry in self.scorecard.unassessed()
         ]
         return sorted(edits, key=lambda e: PRIORITY.get(e.priority, 1))
 

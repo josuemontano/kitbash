@@ -119,7 +119,7 @@ class Rubric:
         scored = [e for e in entries if e.score is not None]
         weight = sum(e.weight for e in scored)
         overall = sum(e.weight * e.score for e in scored) / weight if weight else 0.0
-        all_pass = all(e.passed is not False for e in entries)
+        all_pass = all(e.passed is True for e in entries)
         passed = bool(scored) and overall >= threshold and (all_pass or not require_all_pass)
         return ScoreCard(entries=entries, overall=overall, passed=passed, threshold=threshold, facts=dict(facts))
 
@@ -135,12 +135,22 @@ def _score_criterion(criterion: Criterion, critiques: Sequence[Critique], facts:
     verdict = criterion.check.evaluate(facts) if criterion.check else None
     if verdict is not None:
         return CardEntry(**base, score=1.0 if verdict else 0.0, passed=verdict, decided_by="check")
-    numbers = [s.score for _, s in opinions if s.score is not None]
-    if not numbers:
+    assessed = [(critic, s) for critic, s in opinions if s.score is not None]
+    missing = criterion.critics - {CriticKind(critic) for critic, _ in assessed}
+    reported = {CriticKind(critic): s for critic, s in opinions}
+    base["notes"] = notes + tuple(
+        f"{critic.value}: criterion unassessed (no score provided)"
+        for critic in sorted(missing)
+        if critic not in reported or not reported[critic].notes
+    )
+    if not assessed:
         return CardEntry(**base, score=None, passed=None)
-    score = fmean(numbers)
-    flags = [s.passed if s.passed is not None else (s.score or 0.0) >= threshold for _, s in opinions]
-    return CardEntry(**base, score=score, passed=all(flags), decided_by="critics")
+    score = fmean(s.score for _, s in assessed)
+    flags = [s.passed if s.passed is not None else s.score >= threshold for _, s in assessed]
+    # A known failure remains a failure; missing evidence must never become either a pass or
+    # an invented negative assessment. Machine checks above remain authoritative.
+    passed = False if not all(flags) else (None if missing else True)
+    return CardEntry(**base, score=score, passed=passed, decided_by="critics")
 
 
 def _find_table(text: str) -> tuple[list[str], list[tuple[int, list[str]]]]:

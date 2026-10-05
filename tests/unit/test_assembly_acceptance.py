@@ -150,6 +150,9 @@ def test_unscored_final_criteria_are_not_an_automatic_pass(assembly_env):
     with pytest.raises(StateError, match="Final assembly validation failed"):
         env.run(env.make_phase(rubric=rubric))
     assert not env.state.meta.get("assembly")["scorecard"]["passed"]
+    criteria = env.state.meta.get("assembly")["scorecard"]["criteria"]
+    assert criteria["composition"]["status"] == "unassessed" and criteria["composition"]["pass"] is None
+    assert criteria["usd_quality"]["status"] == "passed"
 
 
 class Human(AutoPilot):

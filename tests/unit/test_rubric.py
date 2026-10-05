@@ -1,7 +1,7 @@
 import pytest
 
 from kitbash.config import default_rubric_path
-from kitbash.domain.critique import CriterionScore, CriticKind, Critique
+from kitbash.domain.critique import CriterionScore, CriticKind, Critique, scorecard_from_dict
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Check, Rubric, RubricError
 
@@ -16,7 +16,7 @@ TABLE = """
 """
 
 
-def critique(critic: CriticKind, **scores: tuple[float, bool | None]) -> Critique:
+def critique(critic: CriticKind, **scores: tuple[float | None, bool | None]) -> Critique:
     return Critique(
         critic=critic.value,
         summary="",
@@ -134,3 +134,72 @@ def test_editing_the_rubric_changes_the_verdict():
     facts = {"scale_error": 0.4}
     assert not strict.score(PhaseName.MODELLING, critics, facts, threshold=0.6, require_all_pass=False).entries[0].passed
     assert relaxed.score(PhaseName.MODELLING, critics, facts, threshold=0.6, require_all_pass=False).entries[0].passed
+
+
+def test_required_unknown_criterion_blocks_an_otherwise_perfect_score():
+    card = Rubric.parse(TABLE).score(
+        PhaseName.MODELLING, [], {"scale_error": 0.0}, threshold=0.8, require_all_pass=True,
+    )
+    assert card.overall == 1.0
+    assert not card.passed
+    assert card.entries[1].passed is None
+
+
+def test_lenient_scoring_keeps_unknown_criteria_explicit_without_relabeling_them():
+    card = Rubric.parse(TABLE).score(
+        PhaseName.MODELLING, [], {"scale_error": 0.0}, threshold=0.8, require_all_pass=False,
+    )
+    assert card.passed
+    assert [entry.criterion_id for entry in card.unassessed()] == ["looks_right"]
+    assert card.entries[1].status == "unassessed" and card.entries[1].score is None
+    assert not card.failing()
+
+
+@pytest.mark.parametrize("unavailable", [False, True], ids=["missing-critic", "explicitly-unavailable"])
+def test_one_assigned_critic_cannot_pass_for_an_unavailable_other_critic(unavailable):
+    critics = [critique(CriticKind.TECHNICAL, lighting=(0.95, True))]
+    if unavailable:
+        critics.append(critique(CriticKind.VISUAL, lighting=(None, None)))
+    card = Rubric.parse(TABLE).score(PhaseName.LAYOUT, critics, {}, threshold=0.8, require_all_pass=True)
+    assert card.overall == 0.95 and not card.passed
+    assert card.entries[0].passed is None and card.entries[0].status == "unassessed"
+    assert not card.failing() and card.unassessed() == list(card.entries)
+
+
+def test_known_failure_is_not_erased_by_an_unavailable_second_critic():
+    critics = [
+        critique(CriticKind.TECHNICAL, lighting=(0.95, False)),
+        critique(CriticKind.VISUAL, lighting=(None, None)),
+    ]
+    card = Rubric.parse(TABLE).score(PhaseName.LAYOUT, critics, {}, threshold=0.8, require_all_pass=True)
+    assert not card.passed and card.entries[0].status == "failed"
+    assert card.failing() == list(card.entries) and not card.unassessed()
+
+
+def test_measured_check_can_assess_a_criterion_when_critic_evidence_is_unavailable():
+    critics = [
+        critique(CriticKind.TECHNICAL, scale_is_plausible=(None, None)),
+        critique(CriticKind.VISUAL, looks_right=(0.95, True)),
+    ]
+    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, critics, {"scale_error": 0.0}, threshold=0.8, require_all_pass=True)
+    assert card.passed and not card.unassessed()
+    assert card.entries[0].decided_by == "check" and card.entries[0].status == "passed"
+
+
+def test_pass_verdict_without_a_score_is_not_evidence():
+    critics = [critique(CriticKind.VISUAL, looks_right=(None, True))]
+    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, critics, {"scale_error": 0.0}, threshold=0.8, require_all_pass=True)
+    assert not card.passed and card.entries[1].status == "unassessed"
+
+
+def test_scorecard_roundtrip_preserves_unassessed_versus_failed_criteria():
+    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, [], {"scale_error": 0.4}, threshold=0.8, require_all_pass=True)
+    data = card.to_dict()
+    assert data["criteria"]["scale_is_plausible"]["status"] == "failed"
+    assert data["criteria"]["scale_is_plausible"]["pass"] is False
+    assert data["criteria"]["looks_right"]["status"] == "unassessed"
+    assert data["criteria"]["looks_right"]["pass"] is None
+    restored = scorecard_from_dict(data)
+    assert not restored.passed
+    assert [entry.criterion_id for entry in restored.failing()] == ["scale_is_plausible"]
+    assert [entry.criterion_id for entry in restored.unassessed()] == ["looks_right"]

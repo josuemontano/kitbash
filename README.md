@@ -150,6 +150,20 @@ Critics score against [`rubric.md`](rubric.md), a Markdown table:
   `` `usd_roundtrip_score >= 0.85 and missing_textures == 0` ``. When every fact it names was measured,
   the check decides pass or fail. Otherwise the critics decide.
 
+With `critic.require_all_pass = true`, every applicable criterion must have an affirmative assessment:
+missing evidence is **unassessed**, not an implicit pass or an invented failure. A criterion assigned
+to `both` critics needs evidence from both to pass, unless a measured machine check decides it. A
+known negative assessment still makes the criterion failed even if the other critic is unavailable.
+Threshold-only scoring (`require_all_pass = false`) retains its configured behavior, but never
+relabels an unassessed criterion as passed. Final assembly always requires all criteria to pass.
+
+Critic responses must cover every criterion assigned to that role and phase. Omitted criteria use
+the existing response-repair path; unavailable evidence must be represented with `score: null`,
+`pass: null`, and an explanatory `notes` value. A visual critic with no available render marks each
+of its criteria unassessed without asking the model to guess. Scorecard JSON exposes each criterion's
+`status` (`passed`, `failed`, or `unassessed`); terminal tables use the same labels. Unknown verdicts
+remain `pass: null`, distinct from evidenced failures (`pass: false`), across saved scorecards.
+
 Editing the file changes critic prompts, scoring and pass or fail decisions, with no code changes.
 Facts available to checks include `scale_error`, `origin_offset_m`, `up_axis_ok`, `naming_violations`,
 `non_principled_materials`, `missing_textures`, `usd_roundtrip_score`, `usd_broken_materials`,

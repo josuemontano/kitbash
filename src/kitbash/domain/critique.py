@@ -115,6 +115,12 @@ class CardEntry:
     notes: tuple[str, ...] = ()
     decided_by: str = ""  # "check", "critics" or "" when unscored
 
+    @property
+    def status(self) -> str:
+        if self.passed is None:
+            return "unassessed"
+        return "passed" if self.passed else "failed"
+
 
 @frozen
 class ScoreCard:
@@ -127,6 +133,9 @@ class ScoreCard:
     def failing(self) -> Sequence[CardEntry]:
         return [e for e in self.entries if e.passed is False]
 
+    def unassessed(self) -> Sequence[CardEntry]:
+        return [e for e in self.entries if e.passed is None]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "overall": round(self.overall, 4),
@@ -138,6 +147,7 @@ class ScoreCard:
                     "weight": e.weight,
                     "score": None if e.score is None else round(e.score, 4),
                     "pass": e.passed,
+                    "status": e.status,
                     "decided_by": e.decided_by,
                     "notes": list(e.notes),
                 }

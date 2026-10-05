@@ -41,7 +41,7 @@ def inventory_table(inventory: Inventory, threshold: float) -> Table:
 def scorecard_table(card: ScoreCard, title: str = "Rubric") -> Table:
     rows = []
     for entry in card.entries:
-        verdict = {True: Text("pass", style="green"), False: Text("fail", style="red"), None: Text("-", style="dim")}[entry.passed]
+        verdict = Text(entry.status, style={"passed": "green", "failed": "red", "unassessed": "yellow"}[entry.status])
         score = "-" if entry.score is None else f"{entry.score:.2f}"
         rows.append((entry.name, f"{entry.weight:g}", score, verdict, entry.decided_by, " / ".join(entry.notes)[:160]))
     table = simple_table(f"{title}: {card.overall:.2f} ({'passed' if card.passed else 'not passed'})", ("criterion", "weight", "score", "", "by", "notes"), rows)
