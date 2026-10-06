@@ -1,17 +1,59 @@
 """Subprocess execution with timeouts, logs and clean shutdown."""
 
+import codecs
+import io
 import os
+import selectors
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
+from typing import BinaryIO, TextIO
+from uuid import uuid4
 
-from attrs import frozen
+from attrs import field, frozen
+
+from kitbash.analytics import context
+from kitbash.analytics.context import TraceContext
+
+
+@frozen
+class ProcessEvent:
+    """One invocation's lifecycle or a bounded, not necessarily line-complete output chunk."""
+
+    kind: str
+    job_id: str
+    args: tuple[str, ...] = ()
+    trace: TraceContext = field(factory=TraceContext)
+    log_path: Path | None = None
+    text: str = ""
+    stream: str = "stdout"
+    returncode: int | None = None
+    timed_out: bool = False
+    cancelled: bool = False
+
+
+_OBSERVER: ContextVar[Callable[[ProcessEvent], None] | None] = ContextVar("process_observer", default=None)
+_OUTPUT_CHUNK = 8192
+
+
+@contextmanager
+def observe_processes(callback: Callable[[ProcessEvent], None]) -> Iterator[None]:
+    """Observe this context's calls; propagate the context to observe work in other threads.
+
+    Callbacks run synchronously on the launching thread and must not block. A nested observer
+    replaces the outer observer until its scope exits. Callback failures unwind and clean up the child.
+    """
+    token = _OBSERVER.set(callback)
+    try:
+        yield
+    finally:
+        _OBSERVER.reset(token)
 
 
 @frozen
@@ -40,6 +82,7 @@ class ProcessCancelled(BaseException):
 class _Child:
     def __init__(self) -> None:
         self.process: subprocess.Popen | None = None
+        self.timed_out = False
         self._lock = threading.Lock()
         self._stopped = False
 
@@ -125,56 +168,64 @@ def run_process(
     """Run a child in its own session, owning its group until all exit paths are cleaned up.
 
     With ``log_path`` combined output streams into that file; otherwise streams are captured apart.
+    Observers receive both streams separately, including partial lines, before the command finishes.
     A cancelled owner raises ``ProcessCancelled`` rather than returning a retryable tool failure.
     """
-    registry = registry or _CURRENT.get() or ProcessRegistry()
+    registry = registry or current_registry()
+    command, trace, job_id = tuple(args), context.current(), uuid4().hex
+    observer = _OBSERVER.get()
+
+    def emit(kind: str, **values) -> None:
+        if observer is not None:
+            observer(ProcessEvent(kind, job_id, args=command, trace=trace, log_path=log_path, **values))
+
     started = time.monotonic()
     child = _Child()
     log = None
-    timed_out = False
+    cancelled = False
+    failure: BaseException | None = None
     try:
+        emit("started")
         # Launch and registration share the shutdown gate. Register before spawning so interruption
         # cannot leave a successfully returned Popen outside its owner's cleanup scope.
         with defer_interrupts(), registry._lock:
             registry.check_cancelled()
             registry._children.add(child)
-            log = _open_log(log_path, args, cwd) if log_path else None
+            log = _open_log(log_path, command, cwd) if log_path else None
             child.process = subprocess.Popen(
-                list(args),
+                command,
                 cwd=cwd,
                 env={**os.environ, **env} if env else None,
                 stdin=subprocess.DEVNULL,
-                stdout=log or subprocess.PIPE,
-                stderr=subprocess.STDOUT if log else subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
                 start_new_session=True,
             )
         process = child.process
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            child.terminate()
-            stdout, stderr = process.communicate()
+        stdout, stderr = _stream_output(child, timeout_s, log, emit)
         child.terminate()
         registry.check_cancelled()
         duration = time.monotonic() - started
         if log is not None:
-            status = "TIMEOUT" if timed_out else f"exit {process.returncode}"
+            status = "TIMEOUT" if child.timed_out else f"exit {process.returncode}"
             log.write(f"\n# {status} after {duration:.1f}s\n")
             log.flush()
             stdout, stderr = log_path.read_text(encoding="utf-8", errors="replace"), ""
         result = ProcessResult(
-            args=tuple(args),
+            args=command,
             returncode=process.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
+            stdout=stdout,
+            stderr=stderr,
             duration_s=duration,
-            timed_out=timed_out,
+            timed_out=child.timed_out,
             log_path=log_path,
         )
+        registry.check_cancelled()
+    except BaseException as exc:
+        failure = exc
+        cancelled = isinstance(exc, (ProcessCancelled, KeyboardInterrupt))
+        raise
     finally:
         with defer_interrupts():
             try:
@@ -190,8 +241,82 @@ def run_process(
                 with registry._lock:
                     if child.process is None or child._stopped:
                         registry._children.discard(child)
+                # A broken observer must not replace the failure already being unwound.
+                unwinding = sys.exception() is not None
+                try:
+                    emit(
+                        "finished", returncode=process.returncode if process is not None else None,
+                        timed_out=child.timed_out, cancelled=cancelled or registry._cancelled.is_set(),
+                        text=str(failure) if failure is not None else "",
+                    )
+                except BaseException:
+                    if not unwinding:
+                        raise
     registry.check_cancelled()
     return result
+
+
+def _stream_output(
+    child: _Child, timeout_s: float, log: TextIO | None, emit: Callable[..., None],
+) -> tuple[str, str]:
+    """Multiplex raw pipes without line buffering or reader threads that could outlive the run."""
+    process = child.process
+    assert process is not None and process.stdout is not None and process.stderr is not None
+    captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    decoders = {
+        stream: io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), translate=True)
+        for stream in captured
+    }
+
+    def output(stream: str, data: bytes, *, final: bool = False) -> None:
+        if log is not None and data:
+            # Preserve the file's original bytes, even across split/invalid UTF-8 sequences.
+            log.buffer.write(data)
+            log.flush()
+        text = decoders[stream].decode(data, final=final)
+        if text:
+            if log is None:
+                captured[stream].append(text)
+            emit("output", stream=stream, text=text)
+
+    deadline = time.monotonic() + timeout_s
+    drain_deadline: float | None = None
+    with selectors.DefaultSelector() as selector:
+        for stream, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, stream)
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if not child._stopped:
+                # Logged calls have always waited for the leader, not pipe-owning descendants.
+                if log is not None and process.poll() is not None:
+                    child.terminate()
+                elif remaining <= 0:
+                    child.timed_out = True
+                    child.terminate()
+            if child._stopped:
+                if drain_deadline is None:
+                    drain_deadline = time.monotonic() + 1
+                elif time.monotonic() >= drain_deadline:
+                    break
+            ready = selector.select(0 if child._stopped else min(0.1, max(0, remaining)))
+            if child._stopped and not ready:
+                break
+            for key, _ in ready:
+                pipe: BinaryIO = key.fileobj
+                try:
+                    data = os.read(pipe.fileno(), _OUTPUT_CHUNK)
+                except BlockingIOError:
+                    continue
+                output(key.data, data, final=not data)
+                if not data:
+                    selector.unregister(pipe)
+        # An escaped descendant can retain or continually write a pipe after our group is gone.
+        # Drain buffered output after cleanup, but never wait indefinitely for that unrelated owner.
+        for key in tuple(selector.get_map().values()):
+            output(key.data, b"", final=True)
+    process.wait()
+    return "".join(captured["stdout"]), "".join(captured["stderr"])
 
 
 def _open_log(path: Path, args: Sequence[str], cwd: Path | None):

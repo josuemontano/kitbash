@@ -161,7 +161,7 @@ class Application:
         self.state = StateDB(layout.state_db, self.embedder)
         self.tracker = Tracker(self.state.spans)
         self.rubric = Rubric.load(layout.rubric_snapshot)
-        self.dashboard = Dashboard(console, config.ui.refresh_per_second)
+        self.dashboard = Dashboard(console, config.ui.refresh_per_second, show_previews=config.ui.show_previews)
         images = ImagePresenter(console, enabled=config.ui.show_previews, open_files=interactive)
         self.user: UserChannel = TerminalUser(console, self.dashboard, images) if interactive else AutoPilot()
         self.backlot = Backlot(config.paths.backlot, self.embedder)
@@ -247,12 +247,17 @@ class Application:
     def run(self, from_phase: PhaseName | None = None) -> dict:
         # Each invocation has its own cancellation gate; resume/re-run in this interpreter is safe.
         self._processes = ProcessRegistry()
-        with self._processes.bind():
-            try:
-                report = self.preflight()
-                return self.scene_agent(report).run(from_phase)
-            finally:
-                self._processes.terminate_all()
+
+        def execute() -> dict:
+            with self._processes.bind():
+                try:
+                    self._processes.check_cancelled()
+                    report = self.preflight()
+                    return self.scene_agent(report).run(from_phase)
+                finally:
+                    self._processes.terminate_all()
+
+        return self.dashboard.run(execute, self._processes.terminate_all)
 
     def analytics(self) -> dict:
         return AnalyticsReport(self.state, self.layout).write()

@@ -27,6 +27,8 @@ from kitbash.interaction.terminal import TerminalUser
 from kitbash.paths import OutputLayout
 from kitbash.phases.assembly import AssemblyPhase
 from kitbash.store.state import StateDB
+from kitbash.ui.dashboard import Dashboard
+from kitbash.ui.images import ImagePresenter
 
 SCENE_FACTS = {
     "missing_assets": 0, "unexpected_assets": 0,
@@ -298,7 +300,7 @@ def test_interrupted_rebuild_does_not_leave_a_previous_pass(assembly_env, monkey
 def test_terminal_requires_explicit_degraded_publication(monkeypatch, answer, expected):
     monkeypatch.setattr(sys, "stdin", StringIO(answer))
     console = Console(file=StringIO(), color_system=None)
-    user = TerminalUser(console, SimpleNamespace(paused=lambda: nullcontext()), SimpleNamespace(show=lambda images: None))
+    user = TerminalUser(console, Dashboard(console), ImagePresenter(console, enabled=False))
     decision = user.confirm(PhaseSummary(phase=PhaseName.ASSEMBLY, headline="Final validation failed"))
     assert decision.action is expected
 

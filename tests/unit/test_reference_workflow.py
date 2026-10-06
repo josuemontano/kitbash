@@ -2,8 +2,6 @@
 
 import json
 import sys
-import threading
-from contextlib import nullcontext
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -34,6 +32,8 @@ from kitbash.pipeline.commit import BacklotCommitter
 from kitbash.pipeline.scheduler import Scheduler
 from kitbash.services.references import ReferenceChoice
 from kitbash.store.state import StateDB
+from kitbash.ui.dashboard import Dashboard
+from kitbash.ui.images import ImagePresenter
 
 S = AssetState
 
@@ -59,7 +59,7 @@ def workflow(tmp_path, sample_inventory_dict):
     config = load_config(None)
     tracker = Tracker(state.spans)
     loop = Mock()
-    dashboard = SimpleNamespace(showing=lambda view: nullcontext(), paused=lambda: nullcontext())
+    dashboard = Dashboard(Console(file=StringIO(), color_system=None))
     phase = ModellingPhase(agent, loop, Mock(), state, AutoPilot(), dashboard, tracker, config)
     board = phase._board(inventory)
     pipeline = AssetPipeline(board, inventory, agent, loop, tracker)
@@ -88,12 +88,11 @@ def test_terminal_selection_survives_retry_and_commit_with_remote_rights(workflo
     env = workflow
     asset = env.pipeline.advance(env.item.id)
     monkeypatch.setattr(sys, "stdin", StringIO("2\n"))
-    shown = []
-    user = TerminalUser(Console(file=StringIO(), color_system=None), env.dashboard, SimpleNamespace(show=shown.extend))
+    console = Console(file=StringIO(), color_system=None)
+    user = TerminalUser(console, env.dashboard, ImagePresenter(console, enabled=False))
     decision = user.provide_input(asset, env.item, asset.input_request)
     assert decision.action is ReviewAction.PROVIDE_INPUT
     assert decision.reference_index == 1 and decision.reference_path is None
-    assert shown == [tmp_path / "contact.jpg"]
     env.phase._apply(decision, asset, env.item, env.board, env.scheduler)
     assert env.board.get(asset.id).extra["reference_index"] == 1
 
@@ -254,18 +253,3 @@ def test_interrupted_reuse_rejection_rolls_back_inventory_and_checkpoint(workflo
         assert state.assets.get(env.item.id) == original
     finally:
         state.close()
-
-
-def test_input_prompts_run_on_main_thread(workflow):
-    env = workflow
-    threads = []
-
-    class User(AutoPilot):
-        def provide_input(self, asset, item, request):
-            threads.append(threading.current_thread())
-            return ReviewDecision(ReviewAction.SKIP)
-
-    env.phase._user = User()
-    env.phase.run()
-    assert threads == [threading.main_thread()]
-    assert env.state.assets.get(env.item.id).state is S.SKIPPED

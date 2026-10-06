@@ -1,21 +1,24 @@
-"""One ``rich.Live`` display for the run. Only the main thread reads input, and it pauses the display
-while it does, so prompts never interleave with the live refresh."""
+"""Thread-safe bridge between synchronous pipeline work and the Textual terminal UI."""
 
+import subprocess
+import sys
 import threading
 import time
-from collections import deque
-from collections.abc import Callable, Iterator
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 from attrs import define, field
 from rich.console import Console, Group, RenderableType
-from rich.live import Live
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
 from kitbash.critique.store import CycleResult
 from kitbash.domain.assets import AssetState
+from kitbash.infra.process import ProcessCancelled, ProcessEvent, observe_processes
 from kitbash.pipeline.board import AssetBoard
 from kitbash.pipeline.review_queue import ReviewQueue
 from kitbash.pipeline.scheduler import Scheduler
@@ -36,54 +39,167 @@ STATE_STYLES = {
 }
 
 
+@define
+class JobOutput:
+    event: ProcessEvent
+    started: float = field(factory=time.monotonic)
+    finished: float | None = None
+    status: str = "running"
+    sequence: int = 0
+    output: deque[tuple[int, str, str]] = field(factory=lambda: deque(maxlen=256))
+
+
+@define
+class Question:
+    text: str
+    choices: tuple[str, ...] | None
+    default: str | None
+    content: tuple[RenderableType, ...]
+    images: tuple[Path, ...]
+    answered: threading.Event = field(factory=threading.Event)
+    answer: str | None = None
+
+
 class Dashboard:
-    def __init__(self, console: Console, refresh_per_second: float = 4) -> None:
+    def __init__(self, console: Console, refresh_per_second: float = 4, *, show_previews: bool = True) -> None:
         self.console = console
-        self._refresh = refresh_per_second
-        self._live: Live | None = None
+        self.refresh_per_second = refresh_per_second
+        self.show_previews = show_previews
+        self.enabled = False
         self._lock = threading.RLock()
-        self._messages: deque[str] = deque(maxlen=6)
+        self._messages: deque[str] = deque(maxlen=100)
         self._view: View | None = None
+        self._jobs: OrderedDict[str, JobOutput] = OrderedDict()
+        self._question: Question | None = None
+        self._stopping = threading.Event()
+
+    def run[T](self, operation: Callable[[], T], cancel: Callable[[], None]) -> T:
+        if not self.console.is_terminal or not sys.stdin.isatty() or self.console.quiet:
+            return operation()
+        from kitbash.ui.tui import RunScreen
+
+        self.enabled = True
+        self._stopping.clear()
+        self._jobs.clear()
+        self._messages.clear()
+        self._view = None
+        screen = RunScreen(self, operation, cancel)
+        try:
+            try:
+                screen.run()
+            finally:
+                screen.join()
+            if screen.error is not None:
+                raise screen.error
+            return screen.result
+        finally:
+            self.enabled = False
+
+    @contextmanager
+    def observing(self) -> Iterator[None]:
+        with observe_processes(self.process_event):
+            yield
 
     @contextmanager
     def showing(self, view: View) -> Iterator[None]:
         with self._lock:
             self._view = view
-            # Transient: pausing for a prompt erases the live region instead of leaving copies behind.
-            self._live = Live(get_renderable=self._render, console=self.console, refresh_per_second=self._refresh, transient=True)
-            self._live.start()
         try:
             yield
         finally:
-            with self._lock:
-                if self._live is not None:
-                    self._live.stop()
-                    self.console.print(self._render())  # keep the final state on screen
-                self._live, self._view = None, None
+            if not self.enabled:
+                self.console.print(view())
 
-    @contextmanager
-    def paused(self) -> Iterator[None]:
-        """Stop refreshing while the user is prompted."""
+    def process_event(self, event: ProcessEvent) -> None:
         with self._lock:
-            live = self._live
-            if live is not None:
-                live.stop()
-        try:
-            yield
-        finally:
-            with self._lock:
-                if live is not None and self._live is live:
-                    live.vertical_overflow = "ellipsis"  # Live.stop() switches it to "visible"
-                    live.start(refresh=True)
+            if event.kind == "started":
+                self._jobs[event.job_id] = JobOutput(event)
+            elif (job := self._jobs.get(event.job_id)) is not None:
+                if event.kind == "output":
+                    job.sequence += 1
+                    job.output.append((job.sequence, event.stream, event.text))
+                elif event.kind == "finished":
+                    if event.text:
+                        job.sequence += 1
+                        job.output.append((job.sequence, "stderr", event.text))
+                    job.finished = time.monotonic()
+                    job.status = (
+                        "cancelled" if event.cancelled else "timed out" if event.timed_out
+                        else "done" if event.returncode == 0 else f"failed ({event.returncode})"
+                    )
+            if event.kind == "finished":
+                # Keep all running jobs and a bounded history of completed commands.
+                completed = [key for key, job in self._jobs.items() if job.finished is not None]
+                for key in completed[:-12]:
+                    del self._jobs[key]
+
+    def snapshot(self) -> tuple[RenderableType, list[JobOutput], tuple[str, ...], Question | None]:
+        with self._lock:
+            body = self._view() if self._view else Panel("Checking tools and models…", title="Preflight")
+            jobs = [
+                JobOutput(job.event, job.started, job.finished, job.status, job.sequence, deque(job.output))
+                for job in self._jobs.values()
+            ]
+            return body, jobs, tuple(self._messages), self._question
+
+    def ask(
+        self, question: str, *, choices: Sequence[str] | None = None, default: str | None = None,
+        content: Sequence[RenderableType] = (), images: Sequence[Path] = (),
+    ) -> str:
+        if not self.enabled:
+            for item in content:
+                self.console.print(item)
+            return Prompt.ask(question, choices=list(choices) if choices is not None else None, default=default, console=self.console)
+        pending = Question(
+            question, tuple(choices) if choices is not None else None, default, tuple(content),
+            tuple(images) if self.show_previews else (),
+        )
+        with self._lock:
+            if self._stopping.is_set():
+                raise ProcessCancelled("The run is stopping")
+            self._question = pending
+        pending.answered.wait()
+        if pending.answer is None:
+            raise ProcessCancelled("The run is stopping")
+        return pending.answer
+
+    def answer(self, value: str) -> str | None:
+        with self._lock:
+            question = self._question
+            if question is None:
+                return None
+            value = value.strip() or question.default
+            if value is None or (question.choices is not None and value not in question.choices):
+                return "Choose: " + ", ".join(question.choices) if question.choices else "Please type an answer."
+            question.answer = value
+            self._question = None
+            question.answered.set()
+        return None
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopping.set()
+            if self._question is not None:
+                self._question.answered.set()
+                self._question = None
+
+    def open_images(self, paths: Sequence[Path]) -> None:
+        if not self.show_previews:
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        for path in paths:
+            self.log(f"Preview: {path}")
+            try:
+                subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                self.log(f"Could not open preview: {exc}")
 
     def log(self, message: str) -> None:
-        self._messages.append(f"{time.strftime('%H:%M:%S')} {message}")
-
-    def _render(self) -> RenderableType:
-        body = self._view() if self._view else Text("")
-        if not self._messages:
-            return body
-        return Group(body, Panel("\n".join(self._messages), title="events", border_style="dim"))
+        if not self.enabled:
+            self.console.print(Text(message))
+            return
+        with self._lock:
+            self._messages.append(f"{time.strftime('%H:%M:%S')} {message}")
 
 
 @define
