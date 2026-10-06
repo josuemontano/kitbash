@@ -11,3 +11,4 @@ build/
 *.so
 *.pyd
 src/kitbash/retopology/triflow/geometry/_qem.cpp
+cycles_metal_*/
