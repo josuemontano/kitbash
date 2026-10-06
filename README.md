@@ -253,6 +253,9 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 - **Reuse:** identical inventory items (for example four matching chairs) are modelled once. Backlot
   matches found during the breakdown are proposed for reuse; `--no-interactive` accepts matches above
   `backlot.match_threshold`.
+  Sending a reused asset back for rework at the modelling gate clears its inventory reuse decision
+  together with the queued asset checkpoint. Resuming after a restart preserves the feedback and
+  models the asset from scratch instead of approving the rejected backlot asset again.
 
 `build` and `resume` use a full-screen [Textual](https://textual.textualize.io/) interface when stdin
 and stdout are terminals, including runs with `--no-interactive`:
