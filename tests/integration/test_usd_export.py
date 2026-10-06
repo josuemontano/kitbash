@@ -265,6 +265,102 @@ def test_materials_shared_by_several_meshes_round_trip(toolkit, tmp_path):
     kit = toolkit()
     result = check(kit, build_asset(kit, tmp_path, "pair", SHARED_WITH_CHILD), tmp_path)
     names = set(result.export["materials"])
-    assert len(names) == 2 and all("." not in n for n in names)  # one baked copy per mesh, no dotted names
+    assert len(names) == 2 and all("." not in n for n in names)  # one baked copy per object, no dotted names
     assert result.roundtrip["materials_ok"] == result.roundtrip["materials_total"] == 2
     assert result.facts()["usd_broken_materials"] == 0
+
+
+OBJECT_COLOR = """
+import bpy
+mat = kb.principled("body", roughness=0.8)
+tree = mat.node_tree
+if kb.args()["grouped"]:
+    group = bpy.data.node_groups.new("Object color", "ShaderNodeTree")
+    group.interface.new_socket(name="Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    info = group.nodes.new("ShaderNodeObjectInfo")
+    output = group.nodes.new("NodeGroupOutput")
+    group.links.new(info.outputs["Color"], output.inputs["Color"])
+    source = tree.nodes.new("ShaderNodeGroup")
+    source.node_tree = group
+else:
+    source = tree.nodes.new("ShaderNodeObjectInfo")
+tree.links.new(source.outputs["Color"], kb.principled_node(mat).inputs["Base Color"])
+"""
+
+OBJECT_COLOR_LAYOUT = """import kitbash_bpy as kb
+kb.reset_scene()
+red = kb.place_asset("colored", (-0.3, 0.0, 0.0))
+# Multiple slots using the same material must stay together on each placement.
+material = red.material_slots[0].material
+red.data.materials.append(material)
+for polygon in red.data.polygons:
+    polygon.material_index = polygon.index % 2
+blue = kb.place_asset("colored", (0.3, 0.0, 0.0))
+assert red.data == blue.data
+for obj, color in [(red, (1.0, 0.0, 0.0, 1.0)), (blue, (0.0, 0.0, 1.0, 1.0))]:
+    obj.color = color
+    if kb.args()["object_slots"]:
+        for slot in obj.material_slots:
+            slot.link = "OBJECT"
+            slot.material = material
+kb.camera((0.0, -2.0, 0.2), look_at_point=(0.0, 0.0, 0.2), focal_length_mm=60)
+kb.light("SUN", (0.0, 0.0, 5.0), energy=3.0, rotation_deg=(40.0, 0.0, 30.0))
+kb.color_world((0.5, 0.5, 0.5), 1.0)
+kb.save_scene()
+"""
+
+IMPORTED_OBJECT_COLORS = """import bpy
+import kb_files
+import kb_materials as km
+import kitbash_bpy as kb
+kb.reset_scene()
+bpy.ops.wm.usd_import(filepath=kb.args()["usd"])
+objects = sorted((o for o in bpy.context.scene.objects if o.type == "MESH"), key=lambda o: o.matrix_world.translation.x)
+colors = []
+for obj in objects:
+    paths = []
+    for index in {p.material_index for p in obj.data.polygons}:
+        material = obj.material_slots[index].material
+        color = km.principled_nodes(material)[0].inputs["Base Color"]
+        paths.append(kb_files.image_path(color.links[0].from_node.image))
+    colors.append(paths)
+kb.emit("colors", colors)
+"""
+
+
+@pytest.mark.parametrize("materialx", ["auto", "off"])
+@pytest.mark.parametrize("grouped, object_slots", [(False, False), (True, True)], ids=["direct-data-slots", "group-object-slots"])
+def test_shared_mesh_placements_keep_object_colors(toolkit, tmp_path, materialx, grouped, object_slots):
+    kit = toolkit(materialx=materialx)
+    blend = build_asset(kit, tmp_path, "colored", OBJECT_COLOR, grouped=grouped)
+    layout = tmp_path / "layout.py"
+    layout.write_text(OBJECT_COLOR_LAYOUT)
+    scene = tmp_path / "scene.blend"
+    kit.run_script(
+        layout,
+        {"output_blend": str(scene), "assets": {"colored": {"blend": str(blend), "collection": "colored"}},
+         "object_slots": object_slots},
+        tmp_path / "layout.log",
+    )
+    before = scene.read_bytes()
+    result = UsdFidelityChecker(kit).check(
+        scene, tmp_path / "scene.usd", work_dir=tmp_path / "work", roundtrip_dir=tmp_path / "rt",
+        prefix="scene", log_dir=tmp_path / "logs", scene=True,
+    )
+    probe = tmp_path / "import_colors.py"
+    probe.write_text(IMPORTED_OBJECT_COLORS)
+    imported = kit.run_script(probe, {"usd": str(result.usd_path)}, tmp_path / "import.log")["colors"]
+    assert len(imported) == 2
+    for paths, expected in zip(imported, [(255, 0, 0), (0, 0, 255)], strict=True):
+        assert paths
+        for path in paths:
+            with Image.open(path) as image:
+                # Blank UV space is allowed, but the bound texture must contain only this object's color.
+                assert tuple(high for low, high in image.convert("RGB").getextrema()) == expected
+    with Image.open(result.roundtrip["images"][0]) as image:
+        red = image.convert("RGB").getpixel((24, 48))
+        blue = image.convert("RGB").getpixel((72, 48))
+    assert red[0] > 3 * red[2] and blue[2] > 3 * blue[0]
+    assert result.facts()["usd_broken_materials"] == 0
+    assert result.score > 0.85
+    assert scene.read_bytes() == before
