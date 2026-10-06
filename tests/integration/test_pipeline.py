@@ -4,12 +4,14 @@ import json
 import time
 
 import pytest
+from PIL import Image
 from rich.console import Console
 from typer.testing import CliRunner
 
 from kitbash.app import Application, create_workspace
 from kitbash.cli import app
 from kitbash.domain.run_input import RunInput
+from kitbash.infra.blender import BlenderRunner
 from kitbash.interaction.autopilot import AutoPilot
 from kitbash.interaction.protocols import AssetReview, ReviewDecision
 from kitbash.store.state import StateDB
@@ -164,6 +166,7 @@ def test_procedural_prompt_build_critique_export_and_resume(workspace, monkeypat
         paths={"trellis": str(tmp / "no-trellis"), "triflow_weights": str(tmp / "no-weights")},
         tools={"trellis_python": str(tmp / "no-python")},
         retopology={"method": "triflow"},
+        blender={"final_resolution": [160, 120], "final_samples": 3},
     )
     output = tmp / "procedural"
     result = runner.invoke(app, [
@@ -201,6 +204,24 @@ def test_procedural_prompt_build_critique_export_and_resume(workspace, monkeypat
         assert (output / relative).is_file()
     assert not list((output / "phases/02_modelling").glob("*/trellis"))
     assert not list((output / "phases/02_modelling").glob("*/retopo"))
+    # Reopening the delivered .blend and pressing Render must use the same output contract,
+    # not Blender's startup resolution or the generated script's preview sample count.
+    render_script = tmp / "render_saved_scene.py"
+    render_script.write_text(
+        "import bpy\nimport kitbash_bpy as kb\n"
+        "scene = bpy.context.scene\n"
+        "kb.emit('settings', {'engine': scene.render.engine, 'samples': scene.cycles.samples})\n"
+        "scene.render.filepath = kb.args()['render_path']\n"
+        "bpy.ops.render.render(write_still=True)\n"
+    )
+    reopened_render = tmp / "reopened.png"
+    saved = BlenderRunner("blender", timeout_s=120).run(
+        render_script, args={"render_path": str(reopened_render)}, blend=output / "scene/scene.blend",
+        log_path=tmp / "render_saved_scene.log",
+    )
+    assert saved["settings"] == {"engine": "CYCLES", "samples": 3}
+    with Image.open(reopened_render) as image:
+        assert image.size == (160, 120)
     preserved = {path: path.read_bytes() for path in (output / "scene/assets").rglob("asset.blend")}
     assert len(preserved) == 2
     log.write_text("")

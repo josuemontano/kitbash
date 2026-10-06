@@ -25,6 +25,11 @@ class BlenderToolkit:
             "naming": self._naming.as_dict(),
             "download_dir": str(self._downloads),
             "max_faces": self._blender.max_faces,
+            "scene_render_settings": {
+                "resolution": list(self._blender.final_resolution),
+                "samples": self._blender.final_samples,
+                "device": self._blender.cycles_device,
+            },
             **extra,
         }
 

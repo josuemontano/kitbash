@@ -141,6 +141,11 @@ class LayoutSubject:
                 "guidance": self._config.style.guidance.strip(),
                 "render_engine": self._config.style.render_engine,
             },
+            "render": {
+                "resolution": self._config.blender.final_resolution,
+                "samples": self._config.blender.final_samples,
+                "device": self._config.blender.cycles_device,
+            },
         }
         text = json.dumps(dependencies, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()

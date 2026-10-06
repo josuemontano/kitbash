@@ -871,6 +871,12 @@ def ground_plane(size=20.0, material=None, name="ground"):
 
 @api
 def save_scene():
-    """Save the scene to ``args()['output_blend']`` with relative paths. Call it last."""
+    """Save to ``args()['output_blend']`` with relative paths and the configured final resolution,
+    sample count and render device. Preserve the script's engine and color management. Call it last.
+    """
+    if settings := _ARGS.get("scene_render_settings"):
+        import kb_render
+
+        kb_render.configure_render(engine=bpy.context.scene.render.engine, **settings)
     _save(_ARGS["output_blend"])
     emit("scene", {"objects": len(bpy.data.objects), "camera": bpy.context.scene.camera.name if bpy.context.scene.camera else None})

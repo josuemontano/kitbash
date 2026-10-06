@@ -148,6 +148,9 @@ Main sections:
   `quad_ratio = 0.95`, `flow_steps = 50`, `device` (`auto`, `cuda`, `mps` or `cpu`) and `fallback_on_error`.
   `--retopology` overrides `method`; `resume` reuses the method stored in the run's config snapshot.
 - `[blender]`, `[usd]`: render sizes and samples, bake resolution, round-trip threshold, MaterialX switch.
+  Saved scenes retain `blender.final_resolution`, `final_samples` and `cycles_device`, while preserving
+  the layout's engine and color management. Reopening `scene.blend` and rendering uses the same final
+  dimensions as the exported frame; preview renders do not overwrite those saved settings.
 - `[embedding]`: `sentence-transformers` (local, default), `http` (an OpenAI-compatible
   `/embeddings` endpoint such as LM Studio) or `hashing` (offline, used by the tests).
 - `[naming]`: data-block naming convention used by prompts and checks alike.
