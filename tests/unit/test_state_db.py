@@ -50,6 +50,23 @@ def test_inventory_is_persisted_indexed_and_searchable(state, sample_inventory_d
     assert hits[0][0] == "ceramic_mug"
 
 
+def test_clearing_reuse_preserves_inventory_and_search_without_embedding(state, sample_inventory_dict, monkeypatch):
+    inventory = Inventory.from_dict(sample_inventory_dict)
+    item = evolve(inventory.items[0], reuse_backlot_id="backlot-crate")
+    inventory = inventory.replace_item(item)
+    state.inventory.save(inventory)
+
+    def unavailable(texts):
+        raise RuntimeError("embedding unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state.inventory._embedder, "embed", unavailable)
+        state.inventory.clear_reuse(item.id)
+    assert state.inventory.load() == inventory.replace_item(evolve(item, reuse_backlot_id=None))
+    assert state.inventory.search("slatted pine crate", k=1)[0][0] == "wooden_crate"
+    assert state.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+
+
 def test_assets_checkpoint_and_transition_log(state):
     record = AssetRecord(id="crate", name="Crate")
     state.assets.upsert(record, 0)

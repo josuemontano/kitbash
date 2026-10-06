@@ -143,6 +143,13 @@ class InventoryRepository:
             scene = self._meta.get("scene_info", {})
         return Inventory.from_dict({"scene": scene, "items": [json.loads(r["data"]) for r in rows]})
 
+    def clear_reuse(self, item_id: str) -> None:
+        """Drop a reuse decision without changing the item's content or search embedding."""
+        self._db.execute(
+            "UPDATE inventory_items SET data = json_set(data, '$.reuse_backlot_id', NULL), updated_at = ? WHERE id = ?",
+            (time.time(), item_id),
+        )
+
     def search(self, query: str, k: int = 5) -> list[tuple[str, float]]:
         if self._index is None or self._embedder is None:
             return []
