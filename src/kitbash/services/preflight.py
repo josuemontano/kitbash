@@ -70,6 +70,38 @@ def ping_models(config: Config, omp: str, models: Mapping[str, Role], log_dir: P
     return [message for message, _ in answers], [hint for _, hint in answers if hint]
 
 
+def trellis_problems(config: Config, trellis_python: str, retopologizer: Retopologizer | None) -> tuple[list[str], list[str]]:
+    """What stops Trellis and its mandatory retopology from running: (problems, hints)."""
+    problems: list[str] = []
+    hints: list[str] = []
+    if not (config.paths.trellis / "generate.py").is_file():
+        problems.append(f"Trellis not found: {config.paths.trellis / 'generate.py'} does not exist (set paths.trellis)")
+    if shutil.which(trellis_python) is None and not Path(trellis_python).is_file():
+        problems.append(f"Trellis Python not found: {trellis_python} (set tools.trellis_python)")
+    if retopologizer is None:
+        problems.append("Trellis modelling requires a retopologizer")
+    elif retopologizer.method is RetopologyMethod.TRIFLOW:
+        try:
+            retopologizer.check()
+        except PreflightError as exc:
+            problems.append(exc.message)
+            if exc.hint:
+                hints.append(exc.hint)
+    return problems, hints
+
+
+def run_model_preflight(config: Config, retopologizer: Retopologizer) -> str:
+    """Startup checks of the Kitbash flow: Blender, Trellis and retopology only. No omp and no models are involved.
+    Returns the Python that runs Trellis."""
+    blender = resolve_executable(config.tools.blender, "Blender", "Install Blender or set tools.blender in your config.")
+    trellis_python = config.tools.resolved_trellis_python(config.paths.trellis)
+    problems, hints = trellis_problems(config, trellis_python, retopologizer)
+    BlenderRunner(blender, timeout_s=config.blender.timeout_s).version()
+    if problems:
+        raise PreflightError("Preflight failed:\n  - " + "\n  - ".join(problems), hint=" ".join(hints) or None)
+    return trellis_python
+
+
 def run_preflight(config: Config, log_dir: Path, retopologizer: Retopologizer | None) -> PreflightReport:
     problems: list[str] = []
     retopology_hints: list[str] = []
@@ -78,19 +110,7 @@ def run_preflight(config: Config, log_dir: Path, retopologizer: Retopologizer | 
     trellis_python = ""
     if config.modelling.method == "trellis":
         trellis_python = config.tools.resolved_trellis_python(config.paths.trellis)
-        if not (config.paths.trellis / "generate.py").is_file():
-            problems.append(f"Trellis not found: {config.paths.trellis / 'generate.py'} does not exist (set paths.trellis)")
-        if shutil.which(trellis_python) is None and not Path(trellis_python).is_file():
-            problems.append(f"Trellis Python not found: {trellis_python} (set tools.trellis_python)")
-        if retopologizer is None:
-            problems.append("Trellis modelling requires a retopologizer")
-        elif retopologizer.method is RetopologyMethod.TRIFLOW:
-            try:
-                retopologizer.check()
-            except PreflightError as exc:
-                problems.append(exc.message)
-                if exc.hint:
-                    retopology_hints.append(exc.hint)
+        problems, retopology_hints = trellis_problems(config, trellis_python, retopologizer)
 
     version = omp_version(omp)
     catalog = load_catalog(omp)

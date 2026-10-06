@@ -94,6 +94,7 @@ timeout_s = 60
 
 [reference]
 # Local crops first, then licensed image APIs. No model search by default or implicitly.
+# Searched images are accepted only when the object is isolated (transparent or flat neutral background).
 providers = ["input_crop", "wikimedia", "openverse"]
 max_candidates = 8
 per_provider = 6
@@ -118,8 +119,9 @@ enabled = true
 cache_ttl_s = 86400
 
 [modelling]
-# "trellis" reconstructs a reference image; "procedural" builds editable Blender geometry
-# directly from the inventory description, without reference search, Trellis or retopology.
+# "trellis" (default) reconstructs a reference image, then retopologizes the mesh. Trellis always takes precedence.
+# "procedural" builds editable Blender geometry from the inventory description without Trellis: an explicit,
+# whole-run opt-in. It is never a fallback. (Per asset, the user can also choose it when no reference is found.)
 method = "trellis"
 
 [trellis]
@@ -146,8 +148,8 @@ quad_ratio = 0.95
 flow_steps = 50
 # "auto" (CUDA, else Apple MPS), "cuda" or "mps". There is no CPU option; retopology fails without a GPU.
 device = "auto"
-# When retopology fails, keep the Trellis mesh (the decimate path) and carry on. false = fail the asset like a Trellis failure.
-fallback_on_error = true
+# Retopology always runs on a Trellis mesh. A failure never keeps the raw mesh: the asset asks you for another
+# reference image instead (like a Trellis failure).
 
 [blender]
 timeout_s = 900

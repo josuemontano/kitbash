@@ -193,3 +193,89 @@ def test_pixel_ranking_considers_candidates_beyond_display_budget(tmp_path, item
     service = finder(tmp_path, [Provider([blurry, duplicate, sharp])], config=evolve(load_config().reference, max_candidates=2))
     choice = service.find(item, tmp_path / "run")
     assert choice.provenance["provider_id"] == "44"
+
+
+# -- only isolated references: no background, or a flat neutral one ---------------------------------------------
+
+
+def scene_photo(path):
+    """The same object, in front of a busy scene: not isolated."""
+    rng = np.random.default_rng(3)
+    pixels = rng.integers(40, 220, size=(640, 640, 3), dtype=np.uint8)
+    y, x = np.indices((384, 384))
+    pixels[128:512, 128:512] = np.where((x // 4 + y // 4) % 2, 40, 160).astype(np.uint8)[..., None]
+    Image.fromarray(pixels).save(path)
+    return path
+
+
+def backdrop_photo(path, backdrop):
+    pixels = np.full((640, 640, 3), backdrop, dtype=np.uint8)
+    y, x = np.indices((384, 384))
+    pixels[128:512, 128:512] = np.where((x // 4 + y // 4) % 2, 40, 160).astype(np.uint8)[..., None]
+    Image.fromarray(pixels).save(path)
+    return path
+
+
+def cutout(path):
+    pixels = np.zeros((640, 640, 4), dtype=np.uint8)
+    y, x = np.indices((384, 384))
+    pixels[128:512, 128:512, :3] = np.where((x // 4 + y // 4) % 2, 40, 160).astype(np.uint8)[..., None]
+    pixels[128:512, 128:512, 3] = 255
+    Image.fromarray(pixels).save(path)
+    return path
+
+
+def test_is_isolated_accepts_transparent_white_grey_and_black_backdrops_only(tmp_path):
+    from kitbash.services.reference_quality import is_isolated
+
+    assert is_isolated(cutout(tmp_path / "cutout.png"))
+    for name, backdrop in {"white": (255, 255, 255), "grey": (128, 128, 128), "black": (0, 0, 0)}.items():
+        assert is_isolated(backdrop_photo(tmp_path / f"{name}.png", backdrop)), name
+    assert not is_isolated(backdrop_photo(tmp_path / "blue.png", (40, 90, 220)))
+    assert not is_isolated(scene_photo(tmp_path / "scene.png"))
+
+
+def test_a_scene_photo_is_never_selected_nor_offered_for_review(tmp_path, item):
+    service = finder(tmp_path, [Provider([licensed(scene_photo(tmp_path / "scene.png"))])])
+    directory = tmp_path / "run"
+    assert service.find(item, directory) is None
+    assert not (directory / "review.json").exists() and not (directory / "selection.json").exists()
+
+
+def test_a_flat_colored_backdrop_is_not_neutral(tmp_path, item):
+    service = finder(tmp_path, [Provider([licensed(backdrop_photo(tmp_path / "blue.png", (40, 90, 220)))])])
+    directory = tmp_path / "run"
+    assert service.find(item, directory) is None and not (directory / "review.json").exists()
+
+
+def test_a_transparent_cutout_is_selected_and_scene_photos_are_dropped_from_review(tmp_path, item):
+    good = licensed(cutout(tmp_path / "cutout.png"))
+    busy = licensed(scene_photo(tmp_path / "scene.png"), provider_id="43", url="https://images.example/scene.png")
+    choice = finder(tmp_path, [Provider([busy, good])]).find(item, tmp_path / "run")
+    assert choice is not None and choice.provenance["quality"]["isolated"] is True
+
+    blurry = licensed(photo(tmp_path / "blurry.png", blurred=True), provider_id="44", url="https://images.example/blurry.png")
+    service = finder(tmp_path / "second", [Provider([busy, blurry])])  # its own search cache
+    assert service.find(item, tmp_path / "review") is None
+    rows = json.loads((tmp_path / "review/review.json").read_text())["candidates"]
+    assert [row["provider_id"] for row in rows] == ["44"]
+
+
+def test_a_reviewed_candidate_is_rechecked_for_isolation(tmp_path, item):
+    service = finder(tmp_path, [Provider([licensed(photo(tmp_path / "blurry.png", blurred=True))])])
+    directory = tmp_path / "run"
+    assert service.find(item, directory) is None
+    manifest = json.loads((directory / "review.json").read_text())
+    row = manifest["candidates"][0]
+    row["path"] = str(scene_photo(tmp_path / "swapped.png"))
+    candidate = Candidate.from_dict({k: v for k, v in row.items() if k not in {"quality", "rights_allowed"}})
+    row["content_hash"] = service._downloader.fetch(candidate, tmp_path / "probe.png").content_hash
+    (directory / "review.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert service.select_reviewed(item, directory, 0) is None
+
+
+def test_the_user_supplied_image_is_used_as_given_even_on_a_busy_background(tmp_path, item):
+    path = scene_photo(tmp_path / "mine.png")
+    choice = finder(tmp_path, [Provider([])]).find(evolve(item, user_reference=str(path)), tmp_path / "run")
+    assert choice is not None and choice.source == "user"
+    assert choice.provenance["quality"]["isolated"] is False  # recorded, not enforced

@@ -61,7 +61,7 @@ def test_triflow_mesh_feeds_the_build_script(workspace):
         assert asset.state is AssetState.APPROVED
         retopo_mesh = app.layout.asset_retopo_dir(asset_id) / "attempt_01" / f"{asset_id}.obj"
         assert retopo_mesh.is_file() and asset.mesh_path == str(retopo_mesh)
-        assert asset.extra["retopology"]["method"] == "triflow" and asset.extra["retopology"]["fallback_reason"] is None
+        assert asset.extra["retopology"]["method"] == "triflow"
         assert asset.extra["trellis"]["runs"] == 1
         assert report["assets"][asset_id]["retopology_time_s"] >= 0.2 and report["assets"][asset_id]["trellis_time_s"] > 0
         script_args = json.loads((app.layout.cycle_dir(PhaseName.MODELLING, 1, asset_id) / "build.args.json").read_text())["args"]
@@ -75,24 +75,15 @@ def test_triflow_mesh_feeds_the_build_script(workspace):
     assert scripts and len(fake.calls) == 2
 
 
-def test_failed_retopology_falls_back_to_the_trellis_mesh(workspace):
+def test_failed_retopology_never_falls_back_to_the_raw_trellis_mesh(workspace):
     tmp, _ = workspace
     app = application(tmp, FakeTriflowRetopologizer(fail="out of memory", fail_for=("wooden_crate",)))
     run(app)
     assets = assets_of(app.layout)
     crate, mug = assets["wooden_crate"], assets["ceramic_mug"]
-    assert crate.state is AssetState.APPROVED and "/trellis/" in crate.mesh_path and "/retopo/" not in crate.mesh_path
-    assert crate.extra["retopology"]["method"] == "decimate" and crate.extra["retopology"]["fallback_reason"] == "triflow: out of memory"
+    assert crate.state is AssetState.SKIPPED and "out of memory" in crate.error
+    assert crate.mesh_path is None and "retopology" not in crate.extra
     assert mug.state is AssetState.APPROVED and "/retopo/" in mug.mesh_path and mug.extra["retopology"]["method"] == "triflow"
-
-
-def test_failed_retopology_without_fallback_fails_the_asset(workspace):
-    tmp, _ = workspace
-    app = application(tmp, FakeTriflowRetopologizer(fail="out of memory", fail_for=("wooden_crate",)), fallback_on_error=False)
-    run(app)
-    assets = assets_of(app.layout)
-    assert assets["wooden_crate"].state is AssetState.SKIPPED and "out of memory" in assets["wooden_crate"].error
-    assert assets["ceramic_mug"].state is AssetState.APPROVED
 
 
 def test_preflight_collects_the_retopology_problem(workspace):

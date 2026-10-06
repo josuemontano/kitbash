@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 
-from kitbash.app import Application, create_workspace, open_workspace
+from kitbash.app import Application, ModelApplication, create_model_workspace, create_workspace, open_workspace
 from kitbash.backlot.library import Backlot
 from kitbash.config import default_rubric_path, load_config, parse_model_overrides
 from kitbash.domain.phases import PhaseName
@@ -18,6 +18,7 @@ from kitbash.domain.run_input import RunInput
 from kitbash.errors import ConfigError, KitbashError
 from kitbash.infra.embeddings import make_embedder
 from kitbash.paths import OutputLayout
+from kitbash.pipeline.image_to_model import ModelRequest
 from kitbash.services.plan import Planner
 from kitbash.ui.summary import print_plan, print_summary
 from kitbash.ui.tables import backlot_table, search_table, simple_table
@@ -132,6 +133,42 @@ def build(
             return
         settings, layout, local_input = create_workspace(output, run_input, config, rubric, overrides)
         _run(Application(settings, layout, local_input, interactive=not no_interactive, console=console))
+
+    _guard(action)
+
+
+@app.command()
+def model(
+    image: Annotated[Path, typer.Option("--image", help="The one reference image (the object alone, on no or a plain neutral background).")],
+    output: Annotated[Path, typer.Option("--output", help="Output directory of this run.")],
+    name: Annotated[str | None, typer.Option("--name", help="Asset name (default: from the image file name).")] = None,
+    category: Annotated[str, typer.Option("--category", help="Asset category stored in the backlot.")] = "object",
+    description: Annotated[str, typer.Option("--description", help="Asset description stored in the backlot (default: the name).")] = "",
+    height: Annotated[float, typer.Option("--height", min=0.001, help="Real-world height of the model in meters.")] = 1.0,
+    retopology: Annotated[Retopology | None, typer.Option("--retopology", help="Retopology method (default: triflow).")] = None,
+    config: Annotated[Path | None, typer.Option("--config", help="Config TOML overriding the defaults.")] = None,
+) -> None:
+    """Kitbash flow: 1 reference image -> Trellis -> retopology -> USD/Blender model -> backlot.
+
+    Validates the image-to-model pipeline end to end. No critics, evaluation loops, LLM calls or programmatic fallback."""
+
+    def action() -> None:
+        if not image.is_file():
+            raise ConfigError(f"Input image not found: {image}")
+        overrides = {"retopology.method": retopology.value} if retopology else {}
+        settings, layout = create_model_workspace(output, config, overrides)
+        asset_name = name or image.stem.replace("_", " ").replace("-", " ").strip() or "model"
+        request = ModelRequest(image=image.expanduser().resolve(), name=asset_name, category=category, description=description, height_m=height)
+        application = ModelApplication(settings, layout)
+        try:
+            result = application.run(request)
+        finally:
+            application.close()
+        console.print(
+            f"\n[bold green]Done.[/bold green] Added to the backlot as {result.entry.id}\n"
+            f"Blender: {result.blend}\nUSD: {result.usd}\nPreview: {result.preview}\nReport: {result.report}\n"
+            + "Timings: " + ", ".join(f"{step} {seconds:.0f}s" for step, seconds in result.timings_s.items())
+        )
 
     _guard(action)
 

@@ -80,8 +80,7 @@ class Planner:
         r = self._config.retopology
         if r.method_enum is RetopologyMethod.DECIMATE:
             return "decimate: none (the build script collapses/voxel-remeshes the Trellis mesh in Blender)"
-        fallback = "falls back to the Trellis mesh on error" if r.fallback_on_error else "fails the asset on error"
-        return f"triflow: 1 run, {r.face_count} faces, {r.flow_steps} flow steps, device {r.device}; {fallback}"
+        return f"triflow: 1 run, {r.face_count} faces, {r.flow_steps} flow steps, device {r.device}; a failure asks for another reference"
 
     def _retopology_paths(self) -> list[tuple[str, str, str]]:
         cfg = self._config

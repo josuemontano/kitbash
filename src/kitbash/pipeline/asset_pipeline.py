@@ -17,6 +17,9 @@ from kitbash.pipeline.board import AssetBoard
 S = AssetState
 type Step = Callable[[AssetRecord, InventoryItem], AssetRecord]
 
+# Programmatic modelling is only ever offered to the user, never taken instead of Trellis on its own.
+PROCEDURAL_OFFER = "explicitly choose programmatic (procedural) modelling instead of Trellis"
+
 
 class AssetProgress:
     """Loop observer that mirrors critic-loop progress into the asset's state and board fields."""
@@ -81,7 +84,7 @@ class AssetPipeline:
             return self._board.transition(asset_id, S.AWAITING_REVIEW, "failed", error=message)
         return self._board.transition(
             asset_id, S.INPUT_NEEDED, "failed", error=message,
-            input_request=f"{message}\nGive another item name to search for, or a reference image path.",
+            input_request=f"{message}\nProvide a reference image path (preferred), give another item name to search for, or {PROCEDURAL_OFFER}.",
         )
 
     # -- steps -------------------------------------------------------------------------------------
@@ -101,12 +104,12 @@ class AssetPipeline:
         if choice is None:
             review = self._agent.reference_review(item)
             request = (
-                f"Reference candidates for '{item.name}' need your review; deterministic quality and rights checks "
+                f"Isolated reference candidates for '{item.name}' need your review; deterministic quality and rights checks "
                 "could not select one automatically. Choose a numbered candidate, give another item name, "
-                "or provide a reference image path."
+                f"provide a reference image path, or {PROCEDURAL_OFFER}."
                 if review else
-                f"No usable reference image was found for '{item.name}'. "
-                "Give an item name to search for, or the path to a reference image."
+                f"No usable reference image of '{item.name}' on an isolated background (none or a plain neutral one) was found. "
+                f"Provide the path to a reference image (preferred), give another item name to search for, or {PROCEDURAL_OFFER}."
             )
             return self._board.transition(
                 asset.id, S.INPUT_NEEDED, "reference needs input", input_request=request,
@@ -124,7 +127,7 @@ class AssetPipeline:
             return self._board.transition(
                 asset.id, S.INPUT_NEEDED, "trellis failed", error=str(exc),
                 input_request=f"Trellis could not reconstruct '{item.name}' from its reference image. "
-                "Give another item name to search for, or the path to a better reference image.",
+                f"Provide the path to a better, isolated reference image, give another item name to search for, or {PROCEDURAL_OFFER}.",
             )
         trellis = asset.extra.get("trellis", {})
         trellis_extra = {
@@ -138,8 +141,8 @@ class AssetPipeline:
             return self._board.transition(
                 asset.id, S.INPUT_NEEDED, "retopology failed", error=str(exc),
                 extra={**asset.extra, "trellis": trellis_extra},
-                input_request=f"Retopology of the mesh for '{item.name}' failed. "
-                "Give another item name to search for, or the path to a better reference image.",
+                input_request=f"Retopology of the Trellis mesh for '{item.name}' failed, so it cannot be used as is. "
+                f"Provide the path to a better, isolated reference image, give another item name to search for, or {PROCEDURAL_OFFER}.",
             )
         return self._board.transition(
             asset.id, S.BUILDING, "mesh ready", mesh_path=str(retopology.mesh_path),
@@ -167,6 +170,12 @@ class AssetPipeline:
         )
 
     def _rework(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
+        if asset.modelling_method == "procedural" and asset.extra.get("procedural_choice") and asset.rework_entry is ReworkEntry.REFERENCE:
+            # The user chose procedural only for lack of a reference; a new reference means Trellis again.
+            return self._board.transition(
+                asset.id, S.REFERENCING, "new reference", attempt=asset.attempt + 1, modelling_method="trellis",
+                extra={**asset.extra, "fresh_script": True, "procedural_choice": None},
+            )
         if asset.modelling_method == "procedural" and asset.rework_entry in (ReworkEntry.REGENERATE, ReworkEntry.REFERENCE):
             return self._board.transition(
                 asset.id, S.BUILDING, "rebuild procedural geometry", attempt=asset.attempt + 1,

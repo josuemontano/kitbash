@@ -20,12 +20,11 @@ class RetopologyResult:
     faces_out: int | None
     duration_s: float
     device: str | None = None
-    fallback_reason: str | None = None  # set when the requested method failed and the input mesh was kept
 
     def to_extra(self) -> dict:
         return {
             "method": self.method.value, "faces_in": self.faces_in, "faces_out": self.faces_out,
-            "duration_s": round(self.duration_s, 2), "device": self.device, "fallback_reason": self.fallback_reason,
+            "duration_s": round(self.duration_s, 2), "device": self.device,
         }
 
 

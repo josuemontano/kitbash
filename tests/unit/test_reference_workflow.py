@@ -18,7 +18,7 @@ from kitbash.critique.history import DiffStatus
 from kitbash.critique.loop import LoopOutcome, LoopReason
 from kitbash.critique.store import CycleResult, CycleStore
 from kitbash.critique.subject import Evaluation
-from kitbash.domain.assets import AssetState
+from kitbash.domain.assets import AssetState, ReworkEntry
 from kitbash.domain.critique import CardEntry, ScoreCard
 from kitbash.domain.inventory import Inventory
 from kitbash.domain.phases import PhaseName
@@ -253,3 +253,52 @@ def test_interrupted_reuse_rejection_rolls_back_inventory_and_checkpoint(workflo
         assert state.assets.get(env.item.id) == original
     finally:
         state.close()
+
+
+# -- Trellis always takes precedence; procedural modelling is only ever the user's explicit choice --------------
+
+
+def test_no_isolated_reference_asks_for_an_image_or_offers_procedural_and_never_falls_back(workflow):
+    env = workflow
+    env.agent.reference_review.return_value = None
+    asset = env.pipeline.advance(env.item.id)
+    assert asset.state is S.INPUT_NEEDED and asset.modelling_method == "trellis"
+    for wording in ("isolated background", "reference image", "procedural"):
+        assert wording in asset.input_request
+    env.phase.run()  # --no-interactive: the answer is "skip", never a silent procedural build
+    skipped = env.state.assets.get(env.item.id)
+    assert skipped.state is S.SKIPPED and skipped.modelling_method == "trellis"
+    env.agent.write_script.assert_not_called()
+    env.loop.run.assert_not_called()
+    env.agent.generate_mesh.assert_not_called()
+
+
+def test_terminal_offers_procedural_modelling_as_an_explicit_choice(workflow, monkeypatch):
+    env = workflow
+    asset = env.pipeline.advance(env.item.id)
+    monkeypatch.setattr(sys, "stdin", StringIO("m\n"))
+    console = Console(file=StringIO(), color_system=None)
+    user = TerminalUser(console, env.dashboard, ImagePresenter(console, enabled=False))
+    decision = user.provide_input(asset, env.item, asset.input_request)
+    assert decision == ReviewDecision(ReviewAction.PROVIDE_INPUT, procedural=True)
+
+
+def test_explicit_procedural_choice_builds_programmatically_without_trellis_and_can_return_to_it(workflow):
+    env = workflow
+    asset = env.pipeline.advance(env.item.id)
+    env.phase._apply(ReviewDecision(ReviewAction.PROVIDE_INPUT, procedural=True), asset, env.item, env.board, env.scheduler)
+    queued = env.board.get(asset.id)
+    assert queued.state is S.QUEUED and queued.modelling_method == "procedural"
+    assert queued.extra["procedural_choice"] == "user" and queued.reference_path is None and queued.mesh_path is None
+    env.loop.run.side_effect = RuntimeError("stop at the build")
+    env.agent.find_reference.reset_mock()
+    with pytest.raises(RuntimeError, match="stop at the build"):
+        env.pipeline.advance(asset.id)
+    env.agent.find_reference.assert_not_called()
+    env.agent.generate_mesh.assert_not_called()
+    env.agent.retopologize.assert_not_called()
+
+    # Asking for a new reference later switches the asset back to Trellis.
+    env.board.reset(evolve(env.board.get(asset.id), state=S.NEEDS_REWORK, rework_entry=ReworkEntry.REFERENCE))
+    reworked = env.pipeline._rework(env.board.get(asset.id), env.item)
+    assert reworked.state is S.REFERENCING and reworked.modelling_method == "trellis" and not reworked.extra["procedural_choice"]

@@ -97,10 +97,11 @@ class TerminalUser:
                 for index, candidate in enumerate(candidates)
             )
             content.append(simple_table("Reference candidates (heuristic scores)", ("#", "title", "rights", "creator", "score"), rows))
-        choices = [str(index + 1) for index in range(len(candidates))] + ["n", "p", "s"]
+        choices = [str(index + 1) for index in range(len(candidates))] + ["n", "p", "m", "s"]
         label = "Candidate number, " if candidates else ""
         answer = self._ask(
-            label + "n: name to search for, p: path to a reference image, s: skip",
+            label + "n: name to search for, p: path to a reference image (preferred), "
+            "m: model it programmatically instead of with Trellis, s: skip",
             choices=choices, default="n", content=content, images=images,
         )
         if answer.isdecimal():
@@ -110,6 +111,8 @@ class TerminalUser:
                 return ReviewDecision(ReviewAction.PROVIDE_INPUT, search_name=self._text("Item name to search for"))
             case "p":
                 return ReviewDecision(ReviewAction.PROVIDE_INPUT, reference_path=str(self._existing_file("Reference image path")))
+            case "m":
+                return ReviewDecision(ReviewAction.PROVIDE_INPUT, procedural=True)
         return ReviewDecision(ReviewAction.SKIP)
 
     # -- phase gates -------------------------------------------------------------------------------
