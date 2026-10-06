@@ -202,8 +202,13 @@ non-passing cycles, regardless of score. `passed` always describes the cycle act
 If no eligible result exists, the loop reports an error instead of returning a broken build.
 
 Resume recognizes a checkpointed pass even if interruption happened before the session was marked
-complete or after the final allowed cycle. It does not patch or re-evaluate that pass. Required files
-are checked again when selecting a saved result; a cached success cannot mask missing artifacts.
+complete or after the final allowed cycle. It does not patch or re-evaluate that pass. Before critic
+review, Kitbash seals the evaluated script, artifacts, preview images and complete build tree with
+SHA-256 hashes and workspace/phase/subject/cycle ownership. Selection and resume check that evidence
+again; changed, missing, empty required, foreign-owned or symlinked artifacts are not eligible.
+Legacy checkpoints without this evidence require a new evaluation, not an inferred approval; start
+a new build workspace if an old completed session cannot resume. Moving a workspace also invalidates
+its ownership evidence. Published backlots remain relocatable.
 
 The loop never repeats itself:
 
@@ -418,6 +423,11 @@ default to quitting. Only an explicit `p` choice can **publish degraded**; ordin
 override. Both `.blend` and USD outputs must be nonempty, as must any rendered final frame. A scene
 without a usable camera can only be published without a render by this explicit degraded override.
 
+Assembly seals the staged file tree before any human acceptance gate and checks it again immediately
+before publication. Even an explicit degraded override cannot approve bytes changed after inspection.
+`assembly.json` records the canonical workspace owner and final payload hashes, including trusted
+report-path rewrites; the journal itself is excluded from its content manifest.
+
 The current attempt's state metadata and analytics record `acceptance.status` (`pending`, `passed`,
 `failed` or `overridden`), `automatic_pass`, `published` and failure details. A human override records
 `status = "overridden"`, `automatic_pass = false` and the still-failing scorecard; terminal output also
@@ -442,13 +452,23 @@ The backlot is a SQLite database with sqlite-vec for embeddings, stored in `path
 inside a scene directory. Each asset folder holds the `.blend`, its `textures/`, the `usd/` tree, a
 preview and `metadata.json`.
 
-New bundles are copied into hidden `.staging/` directories first. Asset metadata and vectors commit
-together with a pending publication status; only a complete bundle renamed into `assets/` becomes
-available to get/list/search. Required blend, USD and preview files must be nonempty and contained in
-the bundle. Opening the library reconciles committed pending bundles, validates migrated legacy
-entries, and removes incomplete publications, abandoned staging and directories left by interrupted
-deletions. Publication and recovery share an OS-owned lock so recovery cannot remove a live writer's
-files.
+Only an asset awaiting review can be committed, and its item identity, workspace, subject and selected
+cycle must match the evaluated result. Approval cannot silently switch to an older eligible cycle.
+New bundles carry evaluation-time SHA-256 hashes for the complete build tree and a separate preview.
+The source and staged copy must match these hashes; symlinks, escaped paths and collisions with the
+publisher's `metadata.json` or normalized `preview.<suffix>` are rejected.
+
+Bundles are copied into hidden `.staging/` directories first. Asset metadata, vectors and a complete
+publication manifest commit together with a pending status. The SQLite manifest binds the asset ID,
+relative publication directory and every payload file, including generated metadata. Only a verified
+bundle renamed into `assets/` becomes available to get/list/search. Opening the library verifies the
+same evidence before completing an interrupted publication; changed or incomplete pending entries
+are removed along with their vectors and files. Existing explicitly ready legacy entries remain
+available, but legacy pending entries without hash evidence are discarded, not promoted. Publication
+and recovery share an OS-owned lock so recovery cannot remove a live writer's files.
+
+These checks prevent stale, misrouted or corrupted publication. They do not sandbox generated Python,
+authenticate against a process able to rewrite both files and state, or continuously audit ready assets.
 
 Vector reuse requires the same embedding model identity **and** dimensions. After changing the
 backlot's model, run `kitbash library reindex`; the old index remains intact if rebuilding fails.
@@ -488,9 +508,12 @@ explicitly rather than silently dropping frames/tiles. Packed images remain pack
 
 Assembly builds in `.scene-staging/`. Only a validated or explicitly accepted degraded result is
 renamed into `scene/`; failed or interrupted rebuilds leave the previous published scene unchanged.
-Resume removes incomplete staging, recovers `.scene-previous/` if replacement stopped between
-renames, and reconciles published SQLite metadata from `scene/assembly.json`, including a first
-publication interrupted before the SQLite write. Blender library/texture paths stay relative, and
+Resume removes incomplete staging and recovers `.scene-previous/` if replacement stopped between
+renames. A candidate's journal must have matching workspace ownership, acceptance and payload hashes
+before recovery can restore published SQLite metadata or discard the prior scene. An invalid candidate
+is rolled back to the prior directory intact. Legacy scene directories without integrity evidence are
+preserved during replacement but cannot restore verified publication metadata; reassemble them in a
+workspace with sealed evaluation checkpoints. Blender library/texture paths stay relative, and
 generated JSON reports point to their final or rejected location rather than staging paths.
 
 Recovery covers process interruption and crashes; it is not a power-loss durability guarantee.

@@ -2,7 +2,6 @@
 
 import fcntl
 import json
-import shutil
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,12 +135,13 @@ def test_reopen_reconciles_interrupted_rename_and_database_update(assembly, rena
     layout.scene_dir.rename(previous)
     if renamed_new:
         # A validated replacement was renamed, but SQLite still describes the old generation.
-        shutil.copytree(previous, layout.scene_dir)
-        layout.scene_blend.write_bytes(b"new validated scene")
-        report_path = layout.scene_dir / "assembly.json"
-        report = json.loads(report_path.read_text())
-        report["usd"]["roundtrip_score"] = 0.91
-        report_path.write_text(json.dumps(report))
+        staged = layout.root / ".scene-staging"
+        staged.mkdir()
+        writer.content = b"new validated scene"
+        writer.score = 0.91
+        report = phase._assemble(staged)
+        phase._relocate_reports(staged, layout.scene_dir, report)
+        staged.rename(layout.scene_dir)
     stale = layout.root / ".scene-staging"
     stale.mkdir()
     (stale / "partial.blend").write_bytes(b"partial")
@@ -287,3 +287,131 @@ def test_failure_between_directory_renames_restores_previous_scene(assembly, mon
     assert layout.scene_blend.read_bytes() == b"first scene"
     assert state.meta.get("assembly")["acceptance"]["status"] == "pending"
     assert not (layout.root / ".scene-previous").exists()
+
+
+def damage_publication(scene, damage, foreign_owner):
+    journal = scene / "assembly.json"
+    if damage == "changed":
+        (scene / "scene.blend").write_bytes(b"uninspected scene")
+    elif damage == "missing":
+        (scene / "scene.usd").unlink()
+    elif damage == "added":
+        (scene / "uninspected.txt").write_text("new output")
+    elif damage == "symlink":
+        (scene / "scene.usd").unlink()
+        (scene / "scene.usd").symlink_to(scene / "scene.blend")
+    elif damage == "missing_journal":
+        journal.unlink()
+    elif damage == "malformed_journal":
+        journal.write_text("not a journal")
+    else:
+        report = json.loads(journal.read_text())
+        if damage == "foreign_owner":
+            report["integrity"]["owner"] = str(foreign_owner)
+        elif damage == "legacy":
+            report.pop("integrity")
+        elif damage == "missing_manifest":
+            report["integrity"].pop("manifest")
+        elif damage == "rejected":
+            report["acceptance"]["published"] = False
+        elif damage == "invalid_override":
+            report["acceptance"].update(status="overridden", automatic_pass=False, override="approve")
+            report["scorecard"]["passed"] = False
+        journal.write_text(json.dumps(report))
+
+
+@pytest.mark.parametrize("damage", [
+    "changed", "missing", "added", "symlink", "missing_journal", "malformed_journal",
+    "foreign_owner", "legacy", "missing_manifest", "rejected", "invalid_override",
+])
+def test_invalid_interrupted_candidate_restores_intact_previous_scene(assembly, damage):
+    phase, writer, state, layout = assembly
+    phase.run()
+    original = {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()}
+    published = state.meta.get("published_assembly")
+    previous = layout.root / ".scene-previous"
+    layout.scene_dir.rename(previous)
+    staged = layout.root / ".scene-staging"
+    staged.mkdir()
+    writer.content = b"replacement scene"
+    writer.score = 0.91
+    report = phase._assemble(staged)
+    phase._relocate_reports(staged, layout.scene_dir, report)
+    staged.rename(layout.scene_dir)
+    damage_publication(layout.scene_dir, damage, layout.root / "another-workspace")
+
+    writer.interrupt = True
+    with pytest.raises(KeyboardInterrupt):
+        phase.run()
+
+    assert {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()} == original
+    assert state.meta.get("published_assembly") == published
+    assert not state.meta.get("assembly")["acceptance"]["published"]
+    assert not previous.exists()
+    assert not staged.exists()
+
+
+@pytest.mark.parametrize("damage", ["changed", "missing", "foreign_owner", "legacy", "missing_manifest", "missing_journal"])
+def test_unverified_existing_scene_is_preserved_but_not_reported_as_published(assembly, damage):
+    phase, writer, state, layout = assembly
+    phase.run()
+    damage_publication(layout.scene_dir, damage, layout.root / "another-workspace")
+    original = {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()}
+    writer.interrupt = True
+
+    with pytest.raises(KeyboardInterrupt):
+        phase.run()
+
+    assert {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()} == original
+    assert state.meta.get("published_assembly") is None
+    assert not state.meta.get("assembly")["acceptance"]["published"]
+    assert not (layout.root / ".scene-previous").exists()
+    assert not (layout.root / ".scene-staging").exists()
+
+
+def test_legacy_previous_directory_survives_failed_replacement(assembly, monkeypatch):
+    phase, writer, state, layout = assembly
+    phase.run()
+    damage_publication(layout.scene_dir, "legacy", layout.root)
+    original = {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()}
+    rename = Path.rename
+
+    def fail_publish(path, target):
+        if path.name == ".scene-staging":
+            raise OSError("rename interrupted")
+        return rename(path, target)
+
+    writer.content = b"replacement scene"
+    monkeypatch.setattr(Path, "rename", fail_publish)
+    with pytest.raises(OSError):
+        phase.run()
+
+    assert {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()} == original
+    assert state.meta.get("published_assembly") is None
+    assert not state.meta.get("assembly")["acceptance"]["published"]
+    assert not (layout.root / ".scene-previous").exists()
+
+
+@pytest.mark.parametrize("damage", ["changed", "missing", "foreign_owner", "missing_manifest", "rejected"])
+def test_change_after_report_relocation_cannot_replace_published_scene(assembly, monkeypatch, damage):
+    phase, writer, state, layout = assembly
+    phase.run()
+    original = {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()}
+    published = state.meta.get("published_assembly")
+    relocate = phase._relocate_reports
+
+    def change_after_relocation(scene, destination, report):
+        result = relocate(scene, destination, report)
+        damage_publication(scene, damage, layout.root / "another-workspace")
+        return result
+
+    writer.content = b"replacement scene"
+    monkeypatch.setattr(phase, "_relocate_reports", change_after_relocation)
+    with pytest.raises(StateError):
+        phase.run()
+
+    assert {path.relative_to(layout.scene_dir): path.read_bytes() for path in layout.scene_dir.rglob("*") if path.is_file()} == original
+    assert state.meta.get("published_assembly") == published
+    assert not state.meta.get("assembly")["acceptance"]["published"]
+    assert not (layout.root / ".scene-previous").exists()
+    assert not (layout.root / ".scene-staging").exists()

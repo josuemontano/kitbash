@@ -385,6 +385,7 @@ def test_required_artifact_cannot_be_omitted(env, phase, missing):
 
     subject = Subject()
     subject.phase = phase
+    subject.subject_id = "crate" if phase is PhaseName.MODELLING else ""
     rubric = Rubric.parse("| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n| Quality | 1 | good enough | all |")
     loop = make_loop(env, ScriptedPatchWriter([]), rubric=rubric)
     with pytest.raises(KitbashError, match="No eligible critic result"):
@@ -497,3 +498,89 @@ def test_last_critic_cancellation_leaves_cycle_pending_and_next_run_is_fresh(env
     assert pending.status == "pending" and pending.passed is None
     fresh = make_loop(env, ScriptedPatchWriter([]))
     assert fresh.run(FakeSubject(), initial_script=lambda: script(0.9)).reason is LoopReason.PASSED
+
+
+@pytest.mark.parametrize("artifact", ["script", "blend", "usd", "preview"])
+def test_changed_reviewed_bytes_cannot_resume_as_passed(env, artifact):
+    subject = FakeSubject()
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([])), LoopSessions(env[0].meta))
+    result = loop.run(subject, request="build", initial_script=lambda: script(0.9)).best
+    path = result.script_path if artifact == "script" else Path(result.evaluation.artifacts[artifact])
+    original = path.read_bytes()
+    path.write_bytes(b"x" * len(original))
+    assert not result.eligible
+    with pytest.raises(StateError, match="no eligible result"):
+        loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote a reviewed build"))
+
+
+def test_mutation_during_independent_review_cannot_be_sealed_as_a_pass(env):
+    class MutatingCritic(FakeCritic):
+        def review(self, request):
+            Path(request.evaluation.artifacts["blend"]).write_bytes(b"not the inspected build")
+            return super().review(request)
+
+    loop = make_loop(env, ScriptedPatchWriter([]), critics=(MutatingCritic(CriticKind.VISUAL),))
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9), max_cycles=1)
+    assert loop.best(FakeSubject()) is None
+
+
+@pytest.mark.parametrize("damage", ["legacy", "workspace", "subject", "cycle"])
+def test_saved_evidence_must_belong_to_the_requested_cycle(env, damage):
+    subject = FakeSubject()
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    result = loop.run(subject, initial_script=lambda: script(0.9)).best
+    checkpoint = result.script_path.parent / "critique.json"
+    data = json.loads(checkpoint.read_text())
+    if damage == "legacy":
+        del data["evidence"]
+    else:
+        data["evidence"][damage] = 2 if damage == "cycle" else "another-owner"
+    checkpoint.write_text(json.dumps(data))
+    assert loop.best(subject) is None
+
+
+@pytest.mark.parametrize("damage", ["foreign", "symlink", "empty"])
+def test_evaluation_rejects_unowned_or_empty_files(env, tmp_path, damage):
+    foreign = tmp_path / "foreign.blend"
+    foreign.write_bytes(b"foreign")
+
+    class Subject(FakeSubject):
+        def evaluate(self, path, cycle_dir, cycle):
+            evaluation = super().evaluate(path, cycle_dir, cycle)
+            blend = Path(evaluation.artifacts["blend"])
+            if damage == "foreign":
+                return evolve(evaluation, artifacts={**evaluation.artifacts, "blend": str(foreign)})
+            blend.unlink()
+            if damage == "symlink":
+                blend.symlink_to(foreign)
+            else:
+                blend.touch()
+            return evaluation
+
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(Subject(), initial_script=lambda: script(0.9), max_cycles=1)
+
+
+@pytest.mark.parametrize("change", ["added", "changed", "deleted"])
+def test_entire_evaluated_bundle_is_bound_including_textures(env, change):
+    class Subject(FakeSubject):
+        def evaluate(self, path, cycle_dir, cycle):
+            evaluation = super().evaluate(path, cycle_dir, cycle)
+            build = cycle_dir / "build"
+            build.mkdir()
+            (build / "texture.png").write_bytes(b"texture")
+            return evolve(evaluation, artifacts={**evaluation.artifacts, "build_dir": str(build)})
+
+    subject = Subject()
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    result = loop.run(subject, initial_script=lambda: script(0.9)).best
+    build = Path(result.evaluation.artifacts["build_dir"])
+    if change == "added":
+        (build / "unexpected.png").write_bytes(b"new")
+    elif change == "changed":
+        (build / "texture.png").write_bytes(b"changed")
+    else:
+        (build / "texture.png").unlink()
+    assert loop.best(subject) is None

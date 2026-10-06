@@ -3,14 +3,15 @@
 import json
 from pathlib import Path
 
-from kitbash.agents.modelling import ModellingAgent
+from kitbash.agents.modelling import BUILD_DIR, ModellingAgent
 from kitbash.analytics.tracker import EventKind, Tracker
 from kitbash.backlot.library import AssetBundle, Backlot, BacklotDraft, BacklotEntry
 from kitbash.config import Config
 from kitbash.critique.sessions import ResumableLoop
 from kitbash.critique.store import CycleResult
-from kitbash.domain.assets import AssetRecord
+from kitbash.domain.assets import AssetRecord, AssetState
 from kitbash.domain.inventory import InventoryItem
+from kitbash.domain.phases import PhaseName
 from kitbash.errors import BacklotError
 from kitbash.paths import OutputLayout
 
@@ -25,17 +26,30 @@ class BacklotCommitter:
         self._tracker = tracker
 
     def best(self, asset: AssetRecord, item: InventoryItem) -> CycleResult | None:
-        return self._loop.best(self._agent.subject(item, asset)) if asset.has_build else None
+        if not asset.has_build or asset.id != item.id:
+            return None
+        result = self._loop.best(self._agent.subject(item, asset))
+        if result is None or result.cycle != asset.best_cycle or result.evidence is None:
+            return None
+        evidence = result.evidence
+        if evidence.workspace != self._layout.root or evidence.subject_id != asset.id or evidence.phase is not PhaseName.MODELLING:
+            return None
+        return result
 
     def committable(self, result: CycleResult | None) -> bool:
-        artifacts = result.evaluation.artifacts if result else {}
-        return all(artifacts.get(k) and Path(artifacts[k]).is_file() for k in ("blend", "usd", "preview"))
+        return result is not None and result.eligible and result.evaluation.artifacts.get("build_dir") == str(result.script_path.parent / BUILD_DIR)
 
     def commit(self, asset: AssetRecord, item: InventoryItem) -> BacklotEntry:
+        if asset.state is not AssetState.AWAITING_REVIEW:
+            raise BacklotError(f"{asset.id} is not awaiting approval")
         best = self.best(asset, item)
         if not self.committable(best):
-            raise BacklotError(f"{asset.id} has no complete build (.blend, .usd and preview) to save")
+            raise BacklotError(f"{asset.id} has no unchanged, owned, evaluated build (.blend, .usd and preview) to save")
         artifacts, facts = best.evaluation.artifacts, best.scorecard.facts
+        evidence = best.evidence
+        build = Path(artifacts["build_dir"])
+        prefix = build.relative_to(evidence.root).as_posix() + "/"
+        hashes = {key.removeprefix(prefix): value for key, value in evidence.hashes.items() if key.startswith(prefix)}
         entry = self._backlot.add(
             BacklotDraft(
                 name=item.name,
@@ -53,6 +67,7 @@ class BacklotCommitter:
                     "cycle": best.cycle,
                     "score": round(best.score, 4),
                     "scorecard": best.scorecard.to_dict(),
+                    "evidence": evidence.to_dict(),
                     "reference": asset.extra.get("reference"),
                     "trellis": asset.extra.get("trellis"),
                     "retopology": asset.extra.get("retopology"),
@@ -60,10 +75,12 @@ class BacklotCommitter:
                 },
             ),
             AssetBundle(
-                root=Path(artifacts["build_dir"]),
+                root=build,
                 blend=Path(artifacts["blend"]),
                 usd=Path(artifacts["usd"]),
                 preview=Path(artifacts["preview"]),
+                hashes=hashes,
+                preview_hash=evidence.hashes[Path(artifacts["preview"]).relative_to(evidence.root).as_posix()],
             ),
         )
         self._tracker.event(EventKind.BACKLOT, "commit", asset=asset.id, backlot_id=entry.id, version=entry.version)
