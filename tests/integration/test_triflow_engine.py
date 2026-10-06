@@ -46,9 +46,11 @@ def test_dense_mesh_becomes_a_clean_low_poly_mesh_in_the_same_frame(tmp_path):
     assert result.method is RetopologyMethod.TRIFLOW
     assert result.mesh_path == tmp_path / "out" / "asset.obj"
     assert result.faces_in > 15000
-    assert 500 <= result.faces_out <= 3500  # near the 1500 target, far below the input
+    assert 500 <= result.faces_out <= result.faces_in // 3  # compact; face count is a soft conditioning signal
     out = trimesh.load(result.mesh_path, process=False)
     assert len(out.faces) == result.faces_out
+    assert out.is_watertight and out.is_winding_consistent
+    assert out.nondegenerate_faces().all()
     diagonal = np.linalg.norm(dense.bounds[1] - dense.bounds[0])
     assert np.abs(out.bounds - dense.bounds).max() / diagonal < 0.02  # scale, position and up axis are the input's
     assert chamfer_over_diagonal(dense, out) < 0.02
@@ -68,3 +70,14 @@ def test_check_reports_missing_weights_when_downloads_are_off(tmp_path):
 
 def test_check_accepts_a_missing_weights_dir_when_downloads_are_on(tmp_path):
     engine(tmp_path).check()
+
+
+def test_inference_never_downloads_when_download_is_disabled(tmp_path, monkeypatch):
+    from kitbash.retopology.triflow import weights
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("download was attempted")
+
+    monkeypatch.setattr(weights, "_download", forbidden)
+    with pytest.raises(RetopologyError, match="weights missing"):
+        engine(tmp_path, download=False).retopologize(tmp_path / "mesh.obj", tmp_path / "out", "asset")

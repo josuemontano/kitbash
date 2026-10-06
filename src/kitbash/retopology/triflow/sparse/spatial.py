@@ -1,7 +1,9 @@
 # Vendored from TRELLIS (microsoft/TRELLIS, Copyright (c) Microsoft Corporation, MIT License) and Direct3D-S2
 # (DreamTechAI/Direct3D-S2, Copyright (c) 2025 DreamTechAI, MIT License); the two `modules/sparse` packages are unified.
 # Modified for kitbash: pooling accumulates in float32 (upstream: float64, which MPS does not have; float32 is already safe
-# against the fp16 overflow it guarded against), voxel codes are int64, and SparseSubdivide tracks a proper tuple scale.
+# against the fp16 overflow it guarded against). Pooling maps belong to their coordinate set; scale tracks voxel spacing.
+
+from fractions import Fraction
 
 import torch
 import torch.nn as nn
@@ -28,41 +30,57 @@ class SparseDownsample(nn.Module):
         factor = self.factor if isinstance(self.factor, tuple) else (self.factor,) * DIM
         assert len(factor) == DIM, "Input coordinates must have the same dimension as the downsample factor."
 
-        coord = list(input.coords.long().unbind(dim=-1))
-        for i, f in enumerate(factor):
-            coord[i + 1] = coord[i + 1] // f
+        # Reduction mode only affects features, so all modes share this coordinate-only map.
+        key = ("downsample", factor)
+        cached = input._coord_cache.get(key)
+        if cached is None:
+            coord = list(input.coords.long().unbind(dim=-1))
+            for i, f in enumerate(factor):
+                coord[i + 1] = coord[i + 1] // f
 
-        MAX = [int(coord[i + 1].max().item()) + 1 for i in range(DIM)]
-        OFFSET = [*torch.cumprod(torch.tensor(MAX[::-1]), 0).tolist()[::-1], 1]
-        code = sum(c * o for c, o in zip(coord, OFFSET, strict=True))
-        code, idx = code.unique(return_inverse=True)
+            MAX = [int(coord[i + 1].max().item()) + 1 for i in range(DIM)]
+            OFFSET = [*torch.cumprod(torch.tensor(MAX[::-1]), 0).tolist()[::-1], 1]
+            code = sum(c * o for c, o in zip(coord, OFFSET, strict=True))
+            code, idx = code.unique(return_inverse=True)
+            new_coords = torch.stack(
+                [code // OFFSET[0], *[(code // OFFSET[i + 1]) % MAX[i] for i in range(DIM)]],
+                dim=-1,
+            ).to(input.coords.dtype)
+            new_layout = SparseTensor._cal_layout(new_coords, input.shape[0])
+            # The pyramid owns source caches; children store only an opaque key.
+            # A direct back-reference would retain GPU maps until cyclic GC runs.
+            source_key = ("pool_source", id(input.coords))
+            input._spatial_cache[source_key] = input._coord_cache
+            new_cache = {
+                ("upsample", factor): (input.coords, input.layout, idx, source_key, input._scale),
+            }
+            cached = (new_coords, new_layout, idx, new_cache)
+            input._coord_cache[key] = cached
+        new_coords, new_layout, idx, new_cache = cached
 
         dtype = input.feats.dtype
         acc_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-        # NOTE: scatter_reduce defaults to include_self=True, so with the zero-initialised buffer "mean" is sum / (count + 1).
+        # With include_self=True, the zero-initialised buffer makes "mean" sum / (count + 1).
         # That is what the pretrained networks were trained with, so it is kept as is.
         new_feats = torch.scatter_reduce(
-            torch.zeros(code.shape[0], input.feats.shape[1], device=input.feats.device, dtype=acc_dtype),
+            torch.zeros(new_coords.shape[0], input.feats.shape[1], device=input.feats.device, dtype=acc_dtype),
             dim=0,
             index=idx.unsqueeze(1).expand(-1, input.feats.shape[1]),
             src=input.feats.to(acc_dtype),
             reduce=self.mode,
+            include_self=True,
         )
         new_feats = new_feats.to(dtype)
 
-        new_coords = torch.stack(
-            [code // OFFSET[0], *[(code // OFFSET[i + 1]) % MAX[i] for i in range(DIM)]],
-            dim=-1,
-        ).to(input.coords.dtype)
-        out = SparseTensor(new_feats, new_coords, input.shape)
-        out._scale = tuple(s // f for s, f in zip(input._scale, factor, strict=True))
-        out._spatial_cache = input._spatial_cache
-
-        out.register_spatial_cache(f"upsample_{factor}_coords", input.coords)
-        out.register_spatial_cache(f"upsample_{factor}_layout", input.layout)
-        out.register_spatial_cache(f"upsample_{factor}_idx", idx)
-
-        return out
+        return SparseTensor(
+            new_feats,
+            new_coords,
+            input.shape,
+            new_layout,
+            scale=tuple(s * f for s, f in zip(input._scale, factor, strict=True)),
+            spatial_cache=input._spatial_cache,
+            coord_cache=new_cache,
+        )
 
 
 class SparseUpsample(nn.Module):
@@ -77,16 +95,20 @@ class SparseUpsample(nn.Module):
         factor = self.factor if isinstance(self.factor, tuple) else (self.factor,) * DIM
         assert len(factor) == DIM, "Input coordinates must have the same dimension as the upsample factor."
 
-        new_coords = input.get_spatial_cache(f"upsample_{factor}_coords")
-        new_layout = input.get_spatial_cache(f"upsample_{factor}_layout")
-        idx = input.get_spatial_cache(f"upsample_{factor}_idx")
-        if any(x is None for x in [new_coords, new_layout, idx]):
+        cached = input._coord_cache.get(("upsample", factor))
+        if cached is None:
             raise ValueError("Upsample cache not found. SparseUpsample must be paired with SparseDownsample.")
-        new_feats = input.feats[idx]
-        out = SparseTensor(new_feats, new_coords, input.shape, new_layout)
-        out._scale = tuple(s * f for s, f in zip(input._scale, factor, strict=True))
-        out._spatial_cache = input._spatial_cache
-        return out
+        new_coords, new_layout, idx, source_key, new_scale = cached
+        new_cache = input._spatial_cache[source_key]
+        return SparseTensor(
+            input.feats[idx],
+            new_coords,
+            input.shape,
+            new_layout,
+            scale=new_scale,
+            spatial_cache=input._spatial_cache,
+            coord_cache=new_cache,
+        )
 
 
 class SparseSubdivide(nn.Module):
@@ -109,6 +131,6 @@ class SparseSubdivide(nn.Module):
 
         new_feats = input.feats.unsqueeze(1).expand(input.feats.shape[0], factor, *input.feats.shape[1:])
         out = SparseTensor(new_feats.flatten(0, 1), new_coords.flatten(0, 1), input.shape)
-        out._scale = tuple(s * 2 for s in input._scale)
+        out._scale = tuple(Fraction(s, 2) for s in input._scale)
         out._spatial_cache = input._spatial_cache
         return out

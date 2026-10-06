@@ -91,6 +91,14 @@ def test_geometry_to_input_frame_requires_metadata():
         to_input_frame(mesh, {"scale_factor": 1.0})
 
 
+def test_geometry_inference_preparation_omits_source_nvv():
+    results, _, _, metadata = process_one_mesh(trimesh.creation.box(), **{**FAST, "compute_source_field": False})
+    assert "occ_fine" not in results and "nvv_fine" not in results
+    assert "num_occ_fine" not in metadata
+    assert len(results["occ_coarse"]) > 0
+    assert results["sdf_coarse2fine"].shape[0] == len(results["occ_coarse"])
+
+
 def test_geometry_process_one_mesh_rejects_augmentation():
     with pytest.raises(NotImplementedError):
         process_one_mesh(trimesh.creation.box(), **{**FAST, "augment": True})

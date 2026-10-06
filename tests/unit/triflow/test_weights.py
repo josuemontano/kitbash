@@ -73,3 +73,18 @@ def test_concurrent_download_is_refused(tmp_path, fake_hub):
 def test_stale_partial_file_is_never_resumed(tmp_path, fake_hub):
     (tmp_path / "only.safetensors.part").write_bytes(b"garbage from an earlier crash")
     assert weights.ensure(tmp_path)["only"].read_bytes() == PAYLOAD
+
+
+def test_corrupted_cached_checkpoint_is_rejected_without_download(tmp_path, fake_hub):
+    path = tmp_path / "only.safetensors"
+    path.write_bytes(b"wrong but already cached")
+    with pytest.raises(RetopologyError, match="Checksum mismatch for cached"):
+        weights.ensure(tmp_path)
+    assert path.read_bytes() == b"wrong but already cached"
+    assert fake_hub == []
+
+
+def test_disallow_download_at_the_loading_boundary(tmp_path, fake_hub):
+    with pytest.raises(RetopologyError, match="weights missing"):
+        weights.ensure(tmp_path, allow_download=False)
+    assert fake_hub == []

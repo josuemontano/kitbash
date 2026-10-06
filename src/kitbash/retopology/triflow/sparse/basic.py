@@ -3,6 +3,7 @@
 # Modified for kitbash: the torchsparse / spconv tensor backends are gone. ``SparseTensor`` is a plain (feats, coords)
 # pair; neighbour maps used by the convolutions live in a cache that is bound to the coordinate set.
 
+from fractions import Fraction
 from typing import Any
 
 import torch
@@ -16,6 +17,28 @@ __all__ = [
 ]
 
 
+def _cache_to_device(value: Any, device: torch.device, memo: dict[int, Any]) -> Any:
+    """Move coordinate bookkeeping once, retaining shared pyramid caches."""
+    if id(value) in memo:
+        return memo[id(value)]
+    if isinstance(value, torch.Tensor):
+        moved = value.to(device=device)
+    elif isinstance(value, dict):
+        moved = {}
+        memo[id(value)] = moved
+        moved.update((key, _cache_to_device(item, device, memo)) for key, item in value.items())
+    elif isinstance(value, list):
+        moved = []
+        memo[id(value)] = moved
+        moved.extend(_cache_to_device(item, device, memo) for item in value)
+    elif isinstance(value, tuple):
+        moved = tuple(_cache_to_device(item, device, memo) for item in value)
+    else:
+        return value
+    memo[id(value)] = moved
+    return moved
+
+
 class SparseTensor:
     """Sparse tensor: ``feats`` (N, ...) at integer ``coords`` (N, 1 + D) with the batch index in column 0.
 
@@ -24,6 +47,7 @@ class SparseTensor:
     - coords: Coordinates of the sparse tensor.
     - shape: ``(B, *feat_shape)``. Derived from the data when omitted.
     - layout: One ``slice`` per batch element. Derived from ``coords`` when omitted.
+    - scale: Voxel spacing relative to the original grid; subdivision may use exact fractional spacing.
 
     NOTE: the data of one batch element must be contiguous (sorted by batch index).
     """
@@ -35,7 +59,7 @@ class SparseTensor:
         shape: torch.Size | None = None,
         layout: list[slice] | None = None,
         *,
-        scale: tuple[int, ...] = (1, 1, 1),
+        scale: tuple[int | Fraction, ...] = (1, 1, 1),
         spatial_cache: dict | None = None,
         coord_cache: dict | None = None,
     ):
@@ -48,9 +72,9 @@ class SparseTensor:
         self._shape = shape
         self._layout = layout
         self._scale = scale
-        # Caches shared between tensors of the same pyramid level (up/down-sampling bookkeeping).
+        # Bookkeeping shared by the convolution pyramid.
         self._spatial_cache = {} if spatial_cache is None else spatial_cache
-        # Caches that are only valid for exactly this coordinate set (neighbour maps, window partitions).
+        # Only valid for this coordinate set: neighbour maps, window partitions and pooling maps.
         self._coord_cache = {} if coord_cache is None else coord_cache
 
     @staticmethod
@@ -103,13 +127,24 @@ class SparseTensor:
 
         new_feats = self.feats.to(device=device, dtype=dtype)
         new_coords = self.coords.to(device=device)
-        return self.replace(new_feats, new_coords)
+        if new_coords is self.coords:
+            return self.replace(new_feats)
+        memo = {id(self.coords): new_coords}
+        return SparseTensor(
+            new_feats,
+            new_coords,
+            torch.Size([self.shape[0], *new_feats.shape[1:]]),
+            self.layout,
+            scale=self._scale,
+            spatial_cache=_cache_to_device(self._spatial_cache, new_coords.device, memo),
+            coord_cache=_cache_to_device(self._coord_cache, new_coords.device, memo),
+        )
 
     def type(self, dtype) -> SparseTensor:
         return self.replace(self.feats.type(dtype))
 
     def cpu(self) -> SparseTensor:
-        return self.replace(self.feats.cpu(), self.coords.cpu())
+        return self.to(device="cpu")
 
     def half(self) -> SparseTensor:
         return self.replace(self.feats.half())
@@ -118,7 +153,7 @@ class SparseTensor:
         return self.replace(self.feats.float())
 
     def detach(self) -> SparseTensor:
-        return self.replace(self.feats.detach(), self.coords.detach())
+        return self.replace(self.feats.detach())
 
     def dense(self) -> torch.Tensor:
         """Scatter into a dense ``(B, C, X, Y, Z)`` grid sized by the largest coordinate."""
@@ -135,16 +170,17 @@ class SparseTensor:
         return sparse_unbind(self, dim)
 
     def replace(self, feats: torch.Tensor, coords: torch.Tensor | None = None) -> SparseTensor:
-        """New tensor with other features (and optionally other coords) but the same layout and caches."""
+        """Replace features, sharing bookkeeping only when the coordinate tensor is unchanged."""
+        same_coords = coords is None or coords is self.coords
         new_shape = torch.Size([self.shape[0], *feats.shape[1:]])
         return SparseTensor(
             feats,
             self.coords if coords is None else coords,
             new_shape,
-            self.layout,
+            self.layout if same_coords else None,
             scale=self._scale,
-            spatial_cache=self._spatial_cache,
-            coord_cache=self._coord_cache if coords is None else None,
+            spatial_cache=self._spatial_cache if same_coords else None,
+            coord_cache=self._coord_cache if same_coords else None,
         )
 
     @staticmethod
@@ -160,18 +196,6 @@ class SparseTensor:
         feats = torch.full((coords.shape[0], C), value, dtype=dtype, device=device)
         return SparseTensor(feats, coords)
 
-    def __merge_sparse_cache(self, other: SparseTensor) -> dict:
-        new_cache: dict[str, Any] = {}
-        for k in set(self._spatial_cache) | set(other._spatial_cache):
-            if k in self._spatial_cache:
-                new_cache[k] = self._spatial_cache[k]
-            if k in other._spatial_cache:
-                if k not in new_cache:
-                    new_cache[k] = other._spatial_cache[k]
-                else:
-                    new_cache[k].update(other._spatial_cache[k])
-        return new_cache
-
     def __neg__(self) -> SparseTensor:
         return self.replace(-self.feats)
 
@@ -183,14 +207,8 @@ class SparseTensor:
             except Exception:
                 pass
         if isinstance(other, SparseTensor):
-            other_cache = other
             other = other.feats
-        else:
-            other_cache = None
-        new_tensor = self.replace(op(self.feats, other))
-        if other_cache is not None:
-            new_tensor._spatial_cache = self.__merge_sparse_cache(other_cache)
-        return new_tensor
+        return self.replace(op(self.feats, other))
 
     def __add__(self, other):
         return self.__elemwise__(other, torch.add)
@@ -241,14 +259,14 @@ class SparseTensor:
 
     def register_spatial_cache(self, key, value) -> None:
         """Register a cache entry for the current scale (kept across the tensors of one pyramid level)."""
-        scale_key = str(self._scale)
+        scale_key = self._scale
         if scale_key not in self._spatial_cache:
             self._spatial_cache[scale_key] = {}
         self._spatial_cache[scale_key][key] = value
 
     def get_spatial_cache(self, key=None):
         """Get a cache entry (or all entries) registered for the current scale."""
-        cur_scale_cache = self._spatial_cache.get(str(self._scale), {})
+        cur_scale_cache = self._spatial_cache.get(self._scale, {})
         if key is None:
             return cur_scale_cache
         return cur_scale_cache.get(key, None)

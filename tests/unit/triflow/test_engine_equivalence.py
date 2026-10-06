@@ -30,7 +30,8 @@ def test_latent_coords_equal_the_nvv_encoder_output(tmp_path):
     data = _batch(results, 4000, 0.95, device)
 
     # upstream PreProcess.__call__
-    coords, feats = data["occ_fine"], data["nvv_fine"].float()
+    coords = data["occ_fine"]
+    feats = torch.as_tensor(results["nvv_fine"], dtype=torch.float32, device=device)
     coords, dirnorm = geometry.vector2dirnorm(coords, feats)
     _, target_pos = geometry.vector2pos(coords, feats, data["res_fine"])
     _, coords_pos = geometry.coords2pos(coords, feats, data["res_fine"])

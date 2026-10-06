@@ -13,6 +13,7 @@
 # materialising all 8 children first (same result, 8x less memory); Direct3ds2SparseVAE builds only the encoder / decoder
 # it uses instead of building the stock ones and replacing them.
 
+from fractions import Fraction
 from typing import Literal
 
 import torch
@@ -58,7 +59,7 @@ class SparseReferencedSubdivide(nn.Module):
                 children whose coord appears in this set are kept.
 
         Returns:
-            A SparseTensor at 2× the input's spatial scale.
+            A SparseTensor at half the input's voxel spacing.
         """
         if reference_coords is None:
             return SparseSubdivide()(input)
@@ -69,7 +70,7 @@ class SparseReferencedSubdivide(nn.Module):
         indices = find_coords_indices(parent_coords, input.coords)
         assert (indices >= 0).all(), "Some reference coords have no parent among the input coords."
         out = SparseTensor(input.feats[indices], reference_coords.to(input.coords.dtype), input.shape)
-        out._scale = tuple(sc * 2 for sc in input._scale)
+        out._scale = tuple(Fraction(sc, 2) for sc in input._scale)
         out._spatial_cache = input._spatial_cache
         return out
 
@@ -550,7 +551,7 @@ class Direct3ds2SparseVAE(SparseSDFVAE):
         If ``sample_posterior`` is ``True``, the returned sparse tensor
         wraps a sampled latent; otherwise it wraps the posterior mode.
         """
-        feats, coords = batch["feats"].clone(), batch["coords"].clone()
+        feats, coords = batch["feats"], batch["coords"]
         if feats.ndim == 1:
             feats = feats.unsqueeze(-1)
         coords = coords.int()

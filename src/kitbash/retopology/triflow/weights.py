@@ -39,8 +39,23 @@ def missing(weights_dir: Path) -> list[Checkpoint]:
     return [c for c in CHECKPOINTS if not checkpoint_path(weights_dir, c.name).is_file()]
 
 
+def _verify_cached(weights_dir: Path) -> None:
+    for checkpoint in CHECKPOINTS:
+        path = checkpoint_path(weights_dir, checkpoint.name)
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        if digest != checkpoint.sha256:
+            raise RetopologyError(
+                f"Checksum mismatch for cached {checkpoint.filename} in {weights_dir}",
+                hint="Remove the corrupt checkpoint and download the pinned version again.",
+            )
+
+
 def check(weights_dir: Path, *, allow_download: bool) -> None:
     """Preflight: weights present, or downloadable."""
+    _verify_cached(weights_dir)
     absent = missing(weights_dir)
     if absent and not allow_download:
         names = ", ".join(c.filename for c in absent)
@@ -50,10 +65,14 @@ def check(weights_dir: Path, *, allow_download: bool) -> None:
         )
 
 
-def ensure(weights_dir: Path, *, timeout_s: float = 60.0) -> dict[str, Path]:
-    """Return the checkpoint paths, downloading (resumably, verified) whatever is missing."""
+def ensure(weights_dir: Path, *, timeout_s: float = 60.0, allow_download: bool = True) -> dict[str, Path]:
+    """Return SHA-256-verified checkpoint paths; download only when permitted."""
     weights_dir.mkdir(parents=True, exist_ok=True)
-    for checkpoint in missing(weights_dir):
+    _verify_cached(weights_dir)
+    absent = missing(weights_dir)
+    if absent and not allow_download:
+        raise RetopologyError(f"TriFlow weights missing in {weights_dir}: {', '.join(c.filename for c in absent)}")
+    for checkpoint in absent:
         _download(checkpoint, weights_dir, timeout_s)
     return {c.name: checkpoint_path(weights_dir, c.name) for c in CHECKPOINTS}
 

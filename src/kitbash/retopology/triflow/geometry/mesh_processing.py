@@ -794,15 +794,15 @@ def process_one_mesh(
     cast=True,
     get_metadata=True,
     verbose=True,
+    compute_source_field=True,
 ):
     """End-to-end preprocessing of a single mesh file for training or inference.
 
     Loads a mesh, scales and discretizes it into a fine voxel grid, and
     computes the sparse payload used throughout the codebase:
 
-    * ``occ_fine`` — fine-resolution occupancy mask.
-    * ``nvv_fine`` — voxelized nearest-vertex vectors at each occupied fine
-      voxel.
+    * ``occ_fine`` / ``nvv_fine`` — source occupancy and vectors, included only
+      when ``compute_source_field`` is true (inference generates its own NVF).
     * ``occ_coarse`` — coarse-resolution occupancy mask.
     * ``sdf_coarse2fine`` — per coarse voxel, ``r^3`` SDF values at its
       fine children (packed into one row).
@@ -839,6 +839,8 @@ def process_one_mesh(
         get_metadata: If ``True``, populate the metadata dict with chamfer,
             max-distance, face-sampling, and remesh statistics.
         verbose: Print per-stage progress.
+        compute_source_field: Include source fine occupancy and NVV. Disable for
+            inference, which voxelizes its SDF proxy and generates the field.
 
     Returns:
         ``(results, trimesh_mesh, augmented_mesh, metadata)``:
@@ -931,20 +933,13 @@ def process_one_mesh(
     augmented_mrmesh = mesh
 
     # --- Fine-resolution occupancy + NVV ---
-    occ_fine, dir_fine, dir_metadata = _compute_fine_nvv(
-        mesh,
-        augmented_mrmesh,
-        res_fine,
-        False,
-        None,
-        augmented_mesh,
-        get_metadata,
-        verbose,
-    )
-    metadata.update(dir_metadata)
-
-    results["occ_fine"] = occ_fine
-    results["nvv_fine"] = dir_fine
+    if compute_source_field:
+        occ_fine, dir_fine, dir_metadata = _compute_fine_nvv(
+            mesh, augmented_mrmesh, res_fine, False, None, augmented_mesh, get_metadata, verbose,
+        )
+        metadata.update(dir_metadata)
+        results["occ_fine"] = occ_fine
+        results["nvv_fine"] = dir_fine
     results["res_fine"] = res_fine
 
     # --- Coarse-resolution occupancy + packed SDF payload ---
@@ -957,7 +952,8 @@ def process_one_mesh(
     results["res_coarse"] = res_coarse
 
     if cast:
-        results["nvv_fine"] = results["nvv_fine"].astype(np.float16)
+        if compute_source_field:
+            results["nvv_fine"] = results["nvv_fine"].astype(np.float16)
         results["sdf_coarse2fine"] = results["sdf_coarse2fine"].astype(np.float16)
 
         if res_coarse <= 2**8:
@@ -967,15 +963,17 @@ def process_one_mesh(
         else:
             results["occ_coarse"] = results["occ_coarse"].astype(np.uint32)
 
-        if res_fine <= 2**8:
-            results["occ_fine"] = results["occ_fine"].astype(np.uint8)
-        elif res_fine <= 2**16:
-            results["occ_fine"] = results["occ_fine"].astype(np.uint16)
-        else:
-            results["occ_fine"] = results["occ_fine"].astype(np.uint32)
+        if compute_source_field:
+            if res_fine <= 2**8:
+                results["occ_fine"] = results["occ_fine"].astype(np.uint8)
+            elif res_fine <= 2**16:
+                results["occ_fine"] = results["occ_fine"].astype(np.uint16)
+            else:
+                results["occ_fine"] = results["occ_fine"].astype(np.uint32)
 
     metadata["num_occ_coarse"] = len(results["occ_coarse"])
-    metadata["num_occ_fine"] = len(results["occ_fine"])
+    if compute_source_field:
+        metadata["num_occ_fine"] = len(results["occ_fine"])
 
     # Modified for kitbash: meshiki is optional. Without it ``metadata["quad_ratio"]`` is ``None`` and callers must pass an
     # explicit quad_ratio (inference.py's default does).

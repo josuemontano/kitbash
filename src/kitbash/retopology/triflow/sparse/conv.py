@@ -6,6 +6,7 @@
 # ``(kx*ky*kz, in, out)`` (``(in, out)`` for 1x1x1); it is converted while loading.
 
 import math
+from fractions import Fraction
 
 import torch
 import torch.nn as nn
@@ -131,6 +132,6 @@ class SparseInverseConv3d(nn.Module):
         inv = km.invert_kmap(kmap, coords.shape[0])
         feats = km.apply_kmap(x.feats, inv, self.conv.kernel(), self.conv.bias)
         out = SparseTensor(feats, coords, torch.Size([x.shape[0], self.conv.out_channels]), layout)
-        out._scale = tuple(sc // st for sc, st in zip(x._scale, self.stride, strict=True))
+        out._scale = tuple(Fraction(sc, st) for sc, st in zip(x._scale, self.stride, strict=True))
         out._spatial_cache = x._spatial_cache
         return out

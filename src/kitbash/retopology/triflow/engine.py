@@ -109,21 +109,38 @@ class TriflowRetopologizer:
     def _load(self) -> _Runtime:
         if self._runtime is not None:
             return self._runtime
-        from safetensors.torch import load_file
+        import torch
+        from safetensors import safe_open
 
         from kitbash.retopology.triflow.models import build_flow_model, build_nvv_vae, build_sdf_vae
-
         device = resolve_device(self._device_name)
-        if weight_files.missing(self._weights_dir):
+
+        if weight_files.missing(self._weights_dir) and self._download:
             with self._span("triflow.download_weights", directory=str(self._weights_dir)):
-                log.info("Downloading TriFlow weights into %s (about 1.3 GB, once)", self._weights_dir)
-                weight_files.ensure(self._weights_dir)
-        paths = weight_files.ensure(self._weights_dir)
+                paths = weight_files.ensure(self._weights_dir, allow_download=True)
+        else:
+            paths = weight_files.ensure(self._weights_dir, allow_download=self._download)
         with self._span("triflow.load_models", device=str(device)):
             models = {}
             for name, build in (("sdf_vae", build_sdf_vae), ("nvv_vae", build_nvv_vae), ("flow_model", build_flow_model)):
-                model = build()
-                model.load_state_dict(load_file(paths[name], device="cpu"), strict=True)
+                # Build shapes without allocating or initializing weights that
+                # inference never uses. Strict-load only the retained modules.
+                with torch.device("meta"):
+                    model = build()
+                unused = {"sdf_vae": "decoder", "nvv_vae": "encoder"}.get(name)
+                if unused is not None:
+                    delattr(model, unused)
+                with safe_open(paths[name], framework="pt", device="cpu") as checkpoint:
+                    checkpoint_keys = checkpoint.keys()
+                    state = {
+                        key: checkpoint.get_tensor(key) for key in checkpoint_keys
+                        if unused is None or not key.startswith(unused + ".")
+                    }
+                model.load_state_dict(state, strict=True, assign=True)
+                for module in model.modules():
+                    if hasattr(module, "freq_dim") and hasattr(module, "freqs") and module.freqs.device.type == "meta":
+                        frequencies = torch.arange(module.freq_dim, dtype=torch.float32, device=device) / module.freq_dim
+                        module.freqs = 1.0 / (10000**frequencies)
                 models[name] = model.eval().to(device)
         self._runtime = _Runtime(device=device, **models)
         log.info("TriFlow models loaded on %s", device)
@@ -137,11 +154,12 @@ class TriflowRetopologizer:
 
         device = rt.device
         with self._span("triflow.prepare_mesh"):
-            results, source, _, metadata = geometry.process_one_mesh(
+            results, _, _, metadata = geometry.process_one_mesh(
                 mesh_path, res_fine=RES_FINE, pad=1.5, round_verts=False, decimate_length=0.0, vertex_merge_threshold=0.0,
                 augment=False, augment_strength=1.0, augment_density=False, cast=False, get_metadata=False,
+                compute_source_field=False,
             )
-            faces_in = len(source.faces)
+            faces_in = int(metadata["original_num_faces"])
             proxy = geometry.sdf_proxy_mesh(
                 results["occ_coarse"], results["sdf_coarse2fine"], results["res_fine"], results["res_coarse"],
             )
@@ -151,15 +169,19 @@ class TriflowRetopologizer:
             proxy_native = mrmeshnumpy.meshFromFacesVerts(proxy.faces, proxy.vertices)
             results["occ_fine"] = geometry.get_precise_occupancy(proxy_native, RES_FINE, verbose=False)
             data = _batch(results, self._face_count, self._quad_ratio, device)
+            del results, proxy_native
 
         with self._span("triflow.encode_sdf"):
             condition = _condition(rt, data)
+        del data["sdf_coords"], data["sdf_features"]
         noise = _noise(data, rt, self._seed, device)
 
         with self._span("triflow.sample", steps=self._steps):
             with torch.no_grad(), autocast(device):
-                sample = euler_sample(rt.flow_model, noise, condition, steps=self._steps)
+                encoded_condition = rt.flow_model.get_condition(noise, **condition)
+                sample = euler_sample(rt.flow_model.flow_model, noise, encoded_condition, steps=self._steps)
             recon = _decode(rt, data, sample, device)
+            del sample, noise, encoded_condition, condition
 
         with self._span("triflow.extract_mesh"):
             mesh = geometry.topology_flow2mesh_QEM(
@@ -189,6 +211,8 @@ class _Runtime:
 def _batch(results: dict, face_count: int, quad_ratio: float, device) -> dict:
     import torch
 
+    from kitbash.retopology.triflow.geometry import get_coords_coarse2fine
+
     def tensor(value):
         out = torch.as_tensor(value)
         if out.dtype == torch.float64:
@@ -197,14 +221,19 @@ def _batch(results: dict, face_count: int, quad_ratio: float, device) -> dict:
 
     def with_batch_index(coords):
         coords = tensor(coords)
-        return torch.cat([torch.zeros((coords.shape[0], 1), dtype=coords.dtype), coords], dim=1)
+        return torch.cat([torch.zeros((coords.shape[0], 1), dtype=coords.dtype), coords], dim=1).int()
 
     float_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    # Prune on CPU before transfer instead of materializing the expanded SDF
+    # coordinates, masks and discarded samples on the accelerator.
+    ratio = results["res_fine"] // results["res_coarse"]
+    sdf = tensor(results["sdf_coarse2fine"]).to(float_dtype).reshape(-1, 1) * SDF_SCALE
+    keep = sdf[:, 0].abs() <= 1.0
+    sdf_coords = torch.as_tensor(get_coords_coarse2fine(results["occ_coarse"], ratio))[keep]
     return {
         "occ_fine": with_batch_index(results["occ_fine"]).to(device),
-        "nvv_fine": tensor(results["nvv_fine"]).to(device, float_dtype),
-        "occ_coarse": with_batch_index(results["occ_coarse"]).to(device),
-        "sdf_coarse2fine": tensor(results["sdf_coarse2fine"]).to(device, float_dtype),
+        "sdf_coords": with_batch_index(sdf_coords).to(device),
+        "sdf_features": sdf[keep].to(device),
         "res_fine": int(results["res_fine"]),
         "res_coarse": int(results["res_coarse"]),
         "face_count": torch.tensor([[float(face_count)]], device=device),
@@ -216,15 +245,10 @@ def _condition(rt: _Runtime, data: dict) -> dict:
     """Port of ``GetCondition``: encode the narrow-band SDF into the latent the flow model is conditioned on."""
     import torch
 
-    from kitbash.retopology.triflow import geometry
     from kitbash.retopology.triflow.sparse import sparse2sparse_tensor
 
-    ratio = data["res_fine"] // data["res_coarse"]
-    coords_fine = geometry.get_coords_coarse2fine(data["occ_coarse"], ratio)
-    feats = data["sdf_coarse2fine"].clone().reshape(-1, 1) * SDF_SCALE
-    keep = feats[:, 0].abs() <= 1.0
     with torch.no_grad(), autocast(rt.device):
-        latent, _ = rt.sdf_vae.encode({"feats": feats[keep], "coords": coords_fine[keep]}, sample_posterior=False)
+        latent, _ = rt.sdf_vae.encode({"feats": data["sdf_features"], "coords": data["sdf_coords"]}, sample_posterior=False)
     return {
         "sdf_latent": sparse2sparse_tensor(latent.coords, latent.feats),
         "face_count": data["face_count"],
@@ -239,12 +263,9 @@ def _latent_coords(occ_fine, res_fine: int, res_coarse: int):
     are replaced by noise); only the pooled coordinates survive. Pooling is a pure coordinate operation, so it is
     done directly: floor-divide, deduplicate, order by (batch, x, y, z) exactly as the sparse downsampler does.
     """
-    import torch
+    from kitbash.retopology.triflow.models.voxel import fine_coords2coarse_coords
 
-    ratio = res_fine // res_coarse
-    pooled = occ_fine.clone()
-    pooled[:, 1:] = torch.div(pooled[:, 1:], ratio, rounding_mode="floor")
-    return torch.unique(pooled, dim=0)
+    return fine_coords2coarse_coords(occ_fine, res_fine // res_coarse)
 
 
 def _noise(data: dict, rt: _Runtime, seed: int, device):
@@ -269,8 +290,8 @@ def _decode(rt: _Runtime, data: dict, sample, device) -> dict:
     fine_coords = data["occ_fine"]
     with torch.no_grad(), autocast(device):
         decoded = rt.nvv_vae.decoder(latent, fine_coords=fine_coords)
-    feats = decoded.feats.clone().to(torch.float32)
-    feats = feats[geometry.find_coords_indices(fine_coords, decoded.coords)]
+    # Referenced subdivision emits exactly fine_coords in their supplied order.
+    feats = decoded.feats.to(torch.float32)
     feats[:, -1].pow_(2)  # undo the sqrt applied to the magnitude during training
     coords, vectors = geometry.dirnorm2vector(fine_coords, feats)
     return {

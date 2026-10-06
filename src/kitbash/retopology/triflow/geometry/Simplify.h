@@ -442,6 +442,8 @@ namespace Simplify
     // main iteration loop
     int deleted_triangles=0;
     std::vector<int> deleted0,deleted1;
+    std::vector<int> group_neighbors, parent, v0_neighbors, anchor_vertices;
+    std::vector<unsigned char> is_safe;
     int triangle_count=triangles.size();
     int previous_deleted_triangles = deleted_triangles;
     //int iteration = 0;
@@ -519,8 +521,8 @@ namespace Simplify
               int target_tid = v1.tid;
               int max_neighbors = v1.tcount * 2;
               
-              int* group_neighbors = new int[max_neighbors];
-              int* parent = new int[max_neighbors]; 
+              group_neighbors.resize(max_neighbors);
+              parent.resize(max_neighbors);
               int group_neighbor_count = 0;
 
               auto get_or_create_local_id = [&](int global_id) {
@@ -573,8 +575,6 @@ namespace Simplify
                   }
               }
 
-              delete[] group_neighbors;
-              delete[] parent;
 
               if (split_detected) {
                   continue;
@@ -590,8 +590,8 @@ namespace Simplify
           // flagged safe.
           if (true) {
               int max_v0_neighbors = v0.tcount * 2;
-              int* v0_neighbors = new int[max_v0_neighbors];
-              bool* is_safe = new bool[max_v0_neighbors];
+              v0_neighbors.resize(max_v0_neighbors);
+              is_safe.resize(max_v0_neighbors);
               int v0_n_count = 0;
 
               // Helper: Finds the local index of a vertex
@@ -651,8 +651,6 @@ namespace Simplify
                   if (pinch_detected) break;
               }
 
-              delete[] v0_neighbors;
-              delete[] is_safe;
 
               if (pinch_detected) {
                   continue;
@@ -722,7 +720,7 @@ namespace Simplify
           if (was_v1_border) v0.border = true;
           if (!was_v0_border && was_v1_border) {
             int max_triangles = v1.tcount * 2;
-            int* anchor_vertices = new int[max_triangles];
+            anchor_vertices.resize(max_triangles);
             int anchor_count = 0;
 
             for (int k = 0; k < v1.tcount; k++) {

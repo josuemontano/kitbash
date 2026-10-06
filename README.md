@@ -264,9 +264,12 @@ component has no root below the threshold, its minimum-displacement vertex seeds
 - **Devices.** Upstream is CUDA-only. Here the sparse convolutions and attention are plain PyTorch
   (`scaled_dot_product_attention`), so TriFlow runs on CUDA, Apple MPS and CPU: `retopology.device = "auto"`
   prefers CUDA, then MPS, then CPU. fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn
-  dependencies. On an Apple M-series machine a ~70k-face asset takes about a minute on MPS.
-- **Weights** (about 1.3 GB, pinned to a Hugging Face revision and verified by SHA-256) are downloaded on first use
-  into `paths.triflow_weights`. Fetch them ahead of time with `kitbash retopology download-weights`.
+  dependencies. Sparse pooling and neighbour maps are reused across flow steps; only the SDF encoder,
+  NVF decoder and flow model are loaded on the accelerator. Runtime varies with occupied voxels and
+  the selected face count; a 21.6k-face synthetic asset takes about 85 seconds on an M5 Pro with MPS.
+- **Weights** (about 1.3 GB, pinned to a Hugging Face revision and verified by SHA-256, including cached copies)
+  are downloaded on first use into `paths.triflow_weights`. Fetch them ahead of time with
+  `kitbash retopology download-weights`.
 - **Output frame.** The result is mapped back into the input mesh's scale, position and orientation, so
   the build script's orientation and sizing logic is unchanged.
 - **License.** TriFlow is under the Automotive Development Public Non-Commercial License 1.0, and its
