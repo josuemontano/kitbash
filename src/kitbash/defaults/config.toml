@@ -144,7 +144,7 @@ face_count = 4000
 qem_threshold = 12.0
 quad_ratio = 0.95
 flow_steps = 50
-# "auto", "cuda", "mps" or "cpu".
+# "auto" (CUDA, else Apple MPS), "cuda" or "mps". There is no CPU option; retopology fails without a GPU.
 device = "auto"
 # When retopology fails, keep the Trellis mesh (the decimate path) and carry on. false = fail the asset like a Trellis failure.
 fallback_on_error = true
@@ -153,7 +153,8 @@ fallback_on_error = true
 timeout_s = 900
 bake_timeout_s = 1800
 render_engine = "CYCLES"
-cycles_device = "CPU"
+# Cycles renders on the GPU only; CPU rendering is not supported.
+cycles_device = "GPU"
 preview_resolution = [768, 768]
 preview_samples = 32
 preview_views = ["front_3q", "side", "back_3q"]

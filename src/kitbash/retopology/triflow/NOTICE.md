@@ -2,7 +2,7 @@
 
 This directory vendors and adapts **TriFlow** ("TriFlow: Generating Artist-Like 3D Mesh Topology via Nearest-Vertex
 Vector Fields", Li et al., ECCV 2026; <https://github.com/DerKleineLi/triflow>) so kitbash can retopologize
-generated meshes in-process, on CUDA, Apple MPS or CPU.
+generated meshes in-process, on CUDA or Apple MPS (never the CPU).
 
 | component | upstream | license | file |
 |---|---|---|---|
@@ -25,9 +25,9 @@ generated meshes in-process, on CUDA, Apple MPS or CPU.
 ## Changes relative to upstream
 
 * One pure-PyTorch sparse backend (`sparse/`) replaces spconv / torchsparse / flash-attn / xformers: the sparse
-  convolutions, windowed and cross attention run on CUDA, MPS and CPU. Upstream's Triton spatial-sparse-attention kernels
+  convolutions, windowed and cross attention run on CUDA and MPS. Upstream's Triton spatial-sparse-attention kernels
   (Direct3D-S2) are not used by the TriFlow networks and are not vendored (see `sparse/README` notes if present).
-* No hard-coded `.cuda()`; float32 on MPS/CPU, fp16 autocast only on CUDA (`device.py`).
+* No hard-coded `.cuda()`; float32 on MPS, fp16 autocast only on CUDA (`device.py`).
 * No hydra / omegaconf / accelerate / wandb: hyper-parameters are Python constants (`models/`).
 * `open3d` (voxelization) is replaced by a numba implementation; `PyMCubes` by scikit-image.
 * The constrained QEM is built in-package through a small Cython binding. Flip/degeneracy rejection is enabled;

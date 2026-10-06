@@ -4,7 +4,7 @@ import kb_render
 import kitbash_bpy as kb
 
 options = kb.args()
-kb_render.configure_render(options["engine"], options["samples"], options.get("device", "CPU"), options["resolution"])
+kb_render.configure_render(options["engine"], options["samples"], options.get("device", "GPU"), options["resolution"])
 meshes = kb_render.scene_meshes()
 if not meshes:
     raise RuntimeError("The file has no mesh objects to render")

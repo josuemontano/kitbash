@@ -78,7 +78,7 @@ class TriflowRetopologizer:
         try:
             resolve_device(self._device_name)
         except ValueError as exc:
-            raise PreflightError(str(exc), hint="Set retopology.device = \"auto\" (or \"cpu\").") from exc
+            raise PreflightError(str(exc), hint="TriFlow needs a CUDA or Apple MPS GPU; choose `--retopology decimate` otherwise.") from exc
         weight_files.check(self._weights_dir, allow_download=self._download)
 
     # -- API -----------------------------------------------------------------------------------------

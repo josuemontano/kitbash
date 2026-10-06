@@ -145,10 +145,10 @@ Main sections:
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
 - `[retopology]`: `method` (`triflow` or `decimate`), `face_count = 4000`, `qem_threshold = 12.0`,
-  `quad_ratio = 0.95`, `flow_steps = 50`, `device` (`auto`, `cuda`, `mps` or `cpu`) and `fallback_on_error`.
+  `quad_ratio = 0.95`, `flow_steps = 50`, `device` (`auto`, `cuda` or `mps`) and `fallback_on_error`.
   `--retopology` overrides `method`; `resume` reuses the method stored in the run's config snapshot.
 - `[blender]`, `[usd]`: render sizes and samples, bake resolution, round-trip threshold, MaterialX switch.
-  Saved scenes retain `blender.final_resolution`, `final_samples` and `cycles_device`, while preserving
+  Saved scenes retain `blender.final_resolution`, `final_samples` and `cycles_device` (always `GPU`; CPU rendering is not supported), while preserving
   the layout's engine and color management. Reopening `scene.blend` and rendering uses the same final
   dimensions as the exported frame; preview renders do not overwrite those saved settings.
 - `[embedding]`: `sentence-transformers` (local, default), `http` (an OpenAI-compatible
@@ -366,8 +366,8 @@ component has no root below the threshold, its minimum-displacement vertex seeds
 (ties use vertex order). No component is assigned an invalid root or a fabricated origin target.
 
 - **Devices.** Upstream is CUDA-only. Here the sparse convolutions and attention are plain PyTorch
-  (`scaled_dot_product_attention`), so TriFlow runs on CUDA, Apple MPS and CPU: `retopology.device = "auto"`
-  prefers CUDA, then MPS, then CPU. fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn
+  (`scaled_dot_product_attention`), so TriFlow runs on CUDA and Apple MPS: `retopology.device = "auto"`
+  prefers CUDA, then MPS, and fails without a GPU (there is no CPU path). fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn
   dependencies. Sparse pooling and neighbour maps are reused across flow steps; only the SDF encoder,
   NVF decoder and flow model are loaded on the accelerator. Runtime varies with occupied voxels and
   the selected face count; a 21.6k-face synthetic asset takes about 85 seconds on an M5 Pro with MPS.

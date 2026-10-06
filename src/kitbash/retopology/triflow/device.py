@@ -1,18 +1,18 @@
 """Device selection and numeric policy for the TriFlow networks.
 
 Upstream hard-codes ``.cuda()`` and fp16 autocast; here the device is chosen at run time and half precision is only
-used on CUDA, where it is known to be safe. MPS and CPU run in float32.
+used on CUDA, where it is known to be safe. MPS runs in float32. There is no CPU device: the networks only run on a GPU.
 """
 
 import contextlib
 
 import torch
 
-DEVICES = ("auto", "cuda", "mps", "cpu")
+DEVICES = ("auto", "cuda", "mps")
 
 
 def resolve_device(name: str = "auto") -> torch.device:
-    """``auto`` prefers CUDA, then Apple MPS, then CPU. An explicit device that is unavailable raises ValueError."""
+    """``auto`` prefers CUDA, then Apple MPS. An unavailable device (or no GPU at all) raises ValueError; never the CPU."""
     if name not in DEVICES:
         raise ValueError(f"Unknown device {name!r}; use one of {', '.join(DEVICES)}")
     if name == "auto":
@@ -20,7 +20,7 @@ def resolve_device(name: str = "auto") -> torch.device:
             return torch.device("cuda")
         if torch.backends.mps.is_available():
             return torch.device("mps")
-        return torch.device("cpu")
+        raise ValueError("no GPU available: neither CUDA nor MPS; TriFlow does not run on the CPU")
     if name == "cuda" and not torch.cuda.is_available():
         raise ValueError("device 'cuda' requested but CUDA is not available")
     if name == "mps" and not torch.backends.mps.is_available():

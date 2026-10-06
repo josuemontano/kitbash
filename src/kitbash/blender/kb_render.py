@@ -22,7 +22,10 @@ VIEWS = {
 RIG_PREFIX = "kb_studio"
 
 
-def configure_render(engine="CYCLES", samples=32, device="CPU", resolution=(768, 768)):
+def configure_render(engine="CYCLES", samples=32, device="GPU", resolution=(768, 768)):
+    """Render on the GPU only: Cycles gets a GPU backend (never the CPU), EEVEE and Workbench are GPU engines."""
+    if device != "GPU":
+        raise RuntimeError(f"Rendering is GPU-only; device {device!r} is not supported")
     scene = bpy.context.scene
     scene.render.engine = engine
     scene.render.resolution_x, scene.render.resolution_y = int(resolution[0]), int(resolution[1])
@@ -32,14 +35,16 @@ def configure_render(engine="CYCLES", samples=32, device="CPU", resolution=(768,
     if engine == "CYCLES":
         scene.cycles.samples = int(samples)
         scene.cycles.use_denoising = True
-        scene.cycles.device = _cycles_device(device)
+        scene.cycles.device = "GPU"
+        _enable_gpu_only()
+        if hasattr(scene.cycles, "denoising_use_gpu"):
+            scene.cycles.denoising_use_gpu = True
     else:
         scene.eevee.taa_render_samples = int(samples)
 
 
-def _cycles_device(device):
-    if device != "GPU":
-        return "CPU"
+def _enable_gpu_only():
+    """Select the first available GPU backend and enable only its GPU devices, so no CPU device renders."""
     preferences = bpy.context.preferences.addons["cycles"].preferences
     for backend in ("METAL", "OPTIX", "CUDA", "HIP", "ONEAPI"):
         try:
@@ -47,11 +52,12 @@ def _cycles_device(device):
         except TypeError:
             continue
         preferences.get_devices()
-        if any(d.type == backend for d in preferences.devices):
+        gpus = [d for d in preferences.devices if d.type != "CPU"]
+        if gpus:
             for d in preferences.devices:
-                d.use = True
-            return "GPU"
-    return "CPU"
+                d.use = d.type != "CPU"
+            return backend
+    raise RuntimeError("No GPU compute device is available for Cycles (tried METAL, OPTIX, CUDA, HIP, ONEAPI); CPU rendering is disabled")
 
 
 def render_to(path):

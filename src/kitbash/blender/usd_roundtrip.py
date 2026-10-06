@@ -95,7 +95,7 @@ for image in bpy.data.images:
     if not os.path.isfile(path):
         missing.add(image.filepath)
 
-kb_render.configure_render(options["engine"], options["samples"], options.get("device", "CPU"), options["resolution"])
+kb_render.configure_render(options["engine"], options["samples"], options.get("device", "GPU"), options["resolution"])
 if options["mode"] == "scene":
     if bpy.context.scene.camera is None and scene_expectations is None:
         raise RuntimeError("The exported USD has no camera")

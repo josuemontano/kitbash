@@ -12,5 +12,5 @@ if scene.camera is None:
         raise RuntimeError("The scene has no camera")
     scene.camera = cameras[0]
 engine = options.get("engine") or scene.render.engine
-kb_render.configure_render(engine, options["samples"], options.get("device", "CPU"), options["resolution"])
+kb_render.configure_render(engine, options["samples"], options.get("device", "GPU"), options["resolution"])
 kb.emit("images", [kb_render.render_to(options["output_path"])])

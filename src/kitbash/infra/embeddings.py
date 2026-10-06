@@ -68,12 +68,22 @@ class SentenceTransformerEmbedder:
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("TQDM_DISABLE", "1")
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise KitbashError(
                 "sentence-transformers is not installed", hint="Run `poetry install` or set embedding.backend."
             ) from exc
-        return SentenceTransformer(self._model_name)
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            raise KitbashError(
+                "No GPU (CUDA or MPS) is available for the local embedding model; CPU inference is disabled",
+                hint="Use a machine with a GPU, or set embedding.backend to http or hashing.",
+            )
+        return SentenceTransformer(self._model_name, device=device)
 
 
 class HttpEmbedder:

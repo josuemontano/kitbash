@@ -21,7 +21,7 @@ from kitbash.retopology.base import RetopologyMethod
 
 DEFAULTS_PACKAGE = "kitbash.defaults"
 FREE_FORM_TABLES = frozenset({"models.phases", "styles"})
-RETOPOLOGY_DEVICES = ("auto", "cuda", "mps", "cpu")
+RETOPOLOGY_DEVICES = ("auto", "cuda", "mps")
 
 
 @frozen
@@ -388,6 +388,10 @@ def _validate(config: Config) -> None:
         raise ConfigError(f"Unknown retopology method {config.retopology.method!r}", hint=f"Methods: {', '.join(methods)}.")
     if config.retopology.device not in RETOPOLOGY_DEVICES:
         raise ConfigError(f"Unknown retopology.device {config.retopology.device!r}", hint=f"Devices: {', '.join(RETOPOLOGY_DEVICES)}.")
+    if config.blender.cycles_device != "GPU":
+        raise ConfigError(
+            f"blender.cycles_device must be \"GPU\", got {config.blender.cycles_device!r}", hint="CPU rendering is not supported."
+        )
     if config.retopology.face_count < 1 or config.retopology.flow_steps < 1:
         raise ConfigError("retopology.face_count and retopology.flow_steps must be at least 1")
     if config.retopology.qem_threshold < 0 or not 0.0 <= config.retopology.quad_ratio <= 1.0:

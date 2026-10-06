@@ -258,7 +258,7 @@ def bake_channel(channel, targets):
 # -- 4. bake in the temporary copy ------------------------------------------------------------------
 if any(info["bake_channels"] for info in analysis.values()):
     split_shared_materials()
-    kb_render.configure_render("CYCLES", options.get("bake_samples", 16), options.get("device", "CPU"), (64, 64))
+    kb_render.configure_render("CYCLES", options.get("bake_samples", 16), options.get("device", "GPU"), (64, 64))
     channels = sorted({c for info in analysis.values() for c in info["bake_channels"]})
     for channel in channels:
         targets = {name for name, info in analysis.items() if channel in info["bake_channels"]}

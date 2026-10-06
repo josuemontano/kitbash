@@ -4,17 +4,19 @@ import torch
 from kitbash.retopology.triflow.device import autocast, resolve_device
 
 
-def test_cpu_is_always_available():
-    assert resolve_device("cpu").type == "cpu"
+def test_cpu_is_rejected():
+    with pytest.raises(ValueError, match="Unknown device"):
+        resolve_device("cpu")
 
 
 def test_auto_picks_an_available_device():
-    device = resolve_device("auto")
-    assert device.type in {"cuda", "mps", "cpu"}
     if torch.cuda.is_available():
-        assert device.type == "cuda"
+        assert resolve_device("auto").type == "cuda"
     elif torch.backends.mps.is_available():
-        assert device.type == "mps"
+        assert resolve_device("auto").type == "mps"
+    else:
+        with pytest.raises(ValueError, match="no GPU"):
+            resolve_device("auto")
 
 
 def test_unknown_device_is_rejected():

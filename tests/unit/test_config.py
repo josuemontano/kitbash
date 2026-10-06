@@ -52,6 +52,8 @@ def test_snapshot_round_trips(tmp_path, method):
         ('[models.phases.nowhere]\ncode = "x"\n', "Unknown phase"),
         ('[usd]\nmaterialx = "sometimes"\n', "materialx"),
         ('[modelling]\nmethod = "fallback"\n', "modelling.method"),
+        ('[blender]\ncycles_device = "CPU"\n', "cycles_device"),
+        ('[retopology]\ndevice = "cpu"\n', "Unknown retopology.device"),
         ("[pipeline\n", "Invalid TOML"),
     ],
 )

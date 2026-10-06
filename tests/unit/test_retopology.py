@@ -148,11 +148,11 @@ def test_factory_builds_the_engine_lazily_with_the_configured_settings(monkeypat
     engine.TriflowRetopologizer = Engine
     monkeypatch.setitem(sys.modules, "kitbash.retopology.triflow", package)
     monkeypatch.setitem(sys.modules, "kitbash.retopology.triflow.engine", engine)
-    config = load_config(None, {"retopology.face_count": 1234, "retopology.device": "cpu"})
+    config = load_config(None, {"retopology.face_count": 1234, "retopology.device": "mps"})
     recorder = NullRecorder()
     assert isinstance(make_retopologizer(config, recorder), Engine)
     assert captured == {
-        "face_count": 1234, "qem_threshold": 12.0, "quad_ratio": 0.95, "flow_steps": 50, "device": "cpu",
+        "face_count": 1234, "qem_threshold": 12.0, "quad_ratio": 0.95, "flow_steps": 50, "device": "mps",
         "weights_dir": config.paths.triflow_weights, "recorder": recorder, "seed": config.trellis.seed,
     }
 

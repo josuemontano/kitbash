@@ -1,6 +1,7 @@
 """Headless Blender: run a script with JSON arguments and read back a JSON result."""
 
 import json
+import logging
 import re
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -13,7 +14,10 @@ from attrs import frozen
 from kitbash.errors import BlenderScriptError, PreflightError
 from kitbash.infra.process import run_process
 
+log = logging.getLogger(__name__)
+
 RUNNER = "kb_runner.py"
+NATIVE_CRASH_ATTEMPTS = 3
 
 
 def blender_scripts_dir() -> Path:
@@ -90,10 +94,16 @@ class BlenderRunner:
         command += ["--python-exit-code", "3", "-P", str(blender_script(RUNNER)), "--", str(args_path)]
         timeout = timeout_s or self._timeout_s
         with self._span(script, log_path, blend) as span:
-            process = run_process(command, timeout_s=timeout, cwd=script.parent, log_path=log_path)
+            # GPU-only rendering leans on Cycles' Metal/CUDA kernel compiler, which now and then aborts the whole
+            # process on a native error. A crash by signal before the script reported anything is retried.
+            for attempt in range(1, NATIVE_CRASH_ATTEMPTS + 1):
+                process = run_process(command, timeout_s=timeout, cwd=script.parent, log_path=log_path)
+                outcome = _read_result(result_path)
+                if outcome is not None or process.timed_out or process.returncode >= 0:
+                    break
+                log.warning("Blender crashed (signal %d) running %s, attempt %d", -process.returncode, script.name, attempt)
             if span is not None:
-                span.meta.update(exit_code=process.returncode, timed_out=process.timed_out, log=str(log_path))
-        outcome = _read_result(result_path)
+                span.meta.update(exit_code=process.returncode, timed_out=process.timed_out, log=str(log_path), attempts=attempt)
         if process.timed_out:
             raise BlenderScriptError(f"Blender timed out after {timeout:.0f}s running {script.name}", log_path=log_path)
         if outcome is None:
