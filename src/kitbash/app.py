@@ -2,7 +2,7 @@
 
 import logging
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,7 @@ from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import ConfigError, StateError
-from kitbash.infra.blender import BlenderRunner
+from kitbash.infra.blender import BlenderRunner, SpanRecorder
 from kitbash.infra.embeddings import Embedder, make_embedder
 from kitbash.infra.image_search import (
     CandidateProvider,
@@ -52,6 +52,8 @@ from kitbash.phases.layout import LayoutPhase
 from kitbash.phases.modelling import ModellingPhase
 from kitbash.phases.scene_assets import SceneCast
 from kitbash.pipeline.commit import BacklotCommitter
+from kitbash.retopology import make_retopologizer
+from kitbash.retopology.base import Retopologizer
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.preflight import PreflightReport, run_preflight
 from kitbash.services.references import ReferenceFinder
@@ -142,7 +144,16 @@ def configure_logging(layout: OutputLayout) -> None:
 class Application:
     """Everything one run needs, built once. Every dependency is injected here and nowhere else."""
 
-    def __init__(self, config: Config, layout: OutputLayout, run_input: RunInput, *, interactive: bool, console: Console) -> None:
+    def __init__(
+        self,
+        config: Config,
+        layout: OutputLayout,
+        run_input: RunInput,
+        *,
+        interactive: bool,
+        console: Console,
+        retopology_factory: Callable[[Config, SpanRecorder], Retopologizer] = make_retopologizer,
+    ) -> None:
         configure_logging(layout)
         self.config, self.layout, self.run_input, self.console = config, layout, run_input, console
         self.embedder: Embedder = make_embedder(config.embedding)
@@ -155,9 +166,10 @@ class Application:
         self.user: UserChannel = TerminalUser(console, self.dashboard, images) if interactive else AutoPilot()
         self.backlot = Backlot(config.paths.backlot, self.embedder)
         self._http = make_http_client(config.reference.timeout_s)
+        self.retopologizer = retopology_factory(config, self.tracker)
 
     def preflight(self) -> PreflightReport:
-        report = run_preflight(self.config, self.layout.logs_dir)
+        report = run_preflight(self.config, self.layout.logs_dir, self.retopologizer)
         meta = self.state.meta
         meta.set("style", self.config.pipeline.style)
         meta.set("versions", {**report.versions(), "kitbash": __version__})
@@ -219,7 +231,7 @@ class Application:
             recorder=tracker,
         )
         breakdown = BreakdownAgent(llm, prompts, toolkit, config, layout, self.run_input)
-        modelling = ModellingAgent(llm, toolkit, fidelity, finder, trellis, catalog, config, layout)
+        modelling = ModellingAgent(llm, toolkit, fidelity, finder, trellis, self.retopologizer, catalog, config, layout, tracker)
         layout_agent = LayoutAgent(llm, toolkit, catalog, config, layout, self.run_input)
         cast = SceneCast(state, self.backlot, config.naming)
         committer = BacklotCommitter(self.backlot, loop, modelling, config, layout, tracker)

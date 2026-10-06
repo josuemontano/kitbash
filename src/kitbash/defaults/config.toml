@@ -8,6 +8,8 @@ backlot = "~/.local/share/backlot"
 trellis = "/Volumes/Vault/Projects/bethel/trellis-mac"
 # Persistent cache for downloaded references, reference searches, HDRIs and textures.
 downloads = "~/.cache/kitbash/downloads"
+# TriFlow model weights (only used by retopology.method = "triflow").
+triflow_weights = "~/.cache/kitbash/triflow"
 
 [tools]
 omp = "omp"
@@ -128,6 +130,20 @@ seed = 42
 # Up axis of the vertices Trellis writes with --no-texture (raw, Z-up even inside its .glb).
 mesh_up_axis = "Z"
 
+[retopology]
+# "triflow" = learned retopology of the Trellis mesh before the build script (default);
+# "decimate" = the original behaviour: the build script collapses/voxel-remeshes the raw Trellis mesh (kb.decimate).
+method = "triflow"
+# Target face count of the retopologized mesh.
+face_count = 4000
+qem_threshold = 12.0
+quad_ratio = 0.95
+flow_steps = 50
+# "auto", "cuda", "mps" or "cpu".
+device = "auto"
+# When retopology fails, keep the Trellis mesh (the decimate path) and carry on. false = fail the asset like a Trellis failure.
+fallback_on_error = true
+
 [blender]
 timeout_s = 900
 bake_timeout_s = 1800
@@ -144,8 +160,8 @@ max_faces = 150000
 [usd]
 # "auto" = MaterialX when the installed Blender supports it, "off" = always UsdPreviewSurface.
 materialx = "auto"
-# Also bake textures for the UsdPreviewSurface fallback of MaterialX materials, so
-# consumers that only read UsdPreviewSurface (including Blender's importer) match the .blend.
+# Also bake supported inputs for the UsdPreviewSurface fallback of MaterialX materials.
+# Known lost preview channels fail fidelity validation even if MaterialX preserves them.
 bake_preview_fallback = true
 bake_resolution = 1024
 bake_samples = 16

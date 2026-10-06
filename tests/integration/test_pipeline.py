@@ -52,6 +52,9 @@ def test_full_pipeline_then_reuse_from_the_backlot(workspace):
         assert (output / relative).exists(), relative
     assert list((output / "phases/02_modelling/wooden_crate/trellis").rglob("wooden_crate.obj"))
     assert list((output / "phases/02_modelling/wooden_crate/previews").glob("*.png"))
+    assert not (output / "phases/02_modelling/wooden_crate/retopo").exists()  # retopology.method = "decimate": the old path
+    build_args = json.loads((output / "phases/02_modelling/wooden_crate/cycles/01/build.args.json").read_text())["args"]
+    assert build_args["retopology_method"] == "decimate" and "/trellis/" in build_args["mesh_path"]
     assert list((output / "phases/02_modelling/wooden_crate/usd_roundtrip").glob("*_report.json"))
     assert (output / "scene/assets/wooden_crate/asset.blend").is_file()
 

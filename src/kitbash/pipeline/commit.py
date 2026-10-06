@@ -55,6 +55,7 @@ class BacklotCommitter:
                     "scorecard": best.scorecard.to_dict(),
                     "reference": asset.extra.get("reference"),
                     "trellis": asset.extra.get("trellis"),
+                    "retopology": asset.extra.get("retopology"),
                     "usd": best.evaluation.report.get("usd", {}),
                 },
             ),

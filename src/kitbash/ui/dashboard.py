@@ -124,17 +124,19 @@ class ModellingView:
 
     def __call__(self) -> RenderableType:
         table = Table(title="Modelling", expand=True, show_lines=False)
-        for column in ("asset", "state", "cycle", "score", "trellis", "in state", "note"):
+        for column in ("asset", "state", "cycle", "score", "trellis", "retopo", "in state", "note"):
             table.add_column(column, overflow="fold")
         now = time.time()
         for asset in self._board.all():
             trellis = asset.extra.get("trellis", {})
+            retopology = asset.extra.get("retopology") or {}
             table.add_row(
                 asset.id,
                 Text(asset.state.value, style=STATE_STYLES[asset.state]),
                 str(asset.extra.get("cycle", "")),
                 f"{asset.score:.2f}" if asset.score is not None else str(asset.extra.get("last_score", "")),
                 f"{trellis['duration_s']:.0f}s" if trellis.get("duration_s") else "",
+                f"{retopology['duration_s']:.0f}s" if retopology.get("duration_s") else "",
                 f"{now - self._since.get(asset.id, now):.0f}s",
                 "reused from backlot" if asset.reused else (asset.error or "")[:60],
             )

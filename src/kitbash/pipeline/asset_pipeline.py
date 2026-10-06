@@ -11,7 +11,7 @@ from kitbash.critique.sessions import ResumableLoop
 from kitbash.critique.store import CycleResult
 from kitbash.domain.assets import TRANSITIONS, AssetRecord, AssetState, ReworkEntry
 from kitbash.domain.inventory import Inventory, InventoryItem
-from kitbash.errors import TrellisError
+from kitbash.errors import RetopologyError, TrellisError
 from kitbash.pipeline.board import AssetBoard
 
 S = AssetState
@@ -125,13 +125,23 @@ class AssetPipeline:
                 "Give another item name to search for, or the path to a better reference image.",
             )
         trellis = asset.extra.get("trellis", {})
+        trellis_extra = {
+            "duration_s": round(trellis.get("duration_s", 0.0) + result.duration_s, 2),
+            "retries": trellis.get("retries", 0) + result.retries,
+            "runs": trellis.get("runs", 0) + 1,
+        }
+        try:
+            retopology = self._agent.retopologize(asset, result.mesh_path)
+        except RetopologyError as exc:
+            return self._board.transition(
+                asset.id, S.INPUT_NEEDED, "retopology failed", error=str(exc),
+                extra={**asset.extra, "trellis": trellis_extra},
+                input_request=f"Retopology of the mesh for '{item.name}' failed. "
+                "Give another item name to search for, or the path to a better reference image.",
+            )
         return self._board.transition(
-            asset.id, S.BUILDING, "mesh ready", mesh_path=str(result.mesh_path),
-            extra={**asset.extra, "trellis": {
-                "duration_s": round(trellis.get("duration_s", 0.0) + result.duration_s, 2),
-                "retries": trellis.get("retries", 0) + result.retries,
-                "runs": trellis.get("runs", 0) + 1,
-            }},
+            asset.id, S.BUILDING, "mesh ready", mesh_path=str(retopology.mesh_path),
+            extra={**asset.extra, "trellis": trellis_extra, "retopology": retopology.to_extra()},
         )
 
     def _build(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
@@ -148,8 +158,10 @@ class AssetPipeline:
         return self._board.transition(
             asset.id, S.AWAITING_REVIEW, outcome.reason.value, best_cycle=outcome.best.cycle,
             score=round(outcome.best.score, 4), error=outcome.best.evaluation.error,
-            extra={**self._board.get(asset.id).extra, "loop_reason": outcome.reason.value, "loop_message": outcome.message,
-                   "pending_feedback": None, "fresh_script": False},
+            extra={
+                **self._board.get(asset.id).extra,
+                "loop_reason": outcome.reason.value, "loop_message": outcome.message, "pending_feedback": None, "fresh_script": False,
+            },
         )
 
     def _rework(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:

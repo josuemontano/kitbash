@@ -8,6 +8,7 @@ from typing import Any
 
 from attrs import frozen
 
+from kitbash.errors import BlenderScriptError
 from kitbash.infra.imaging import ImageComparison, compare_images, side_by_side
 from kitbash.services.blender_toolkit import BlenderToolkit
 
@@ -30,6 +31,15 @@ class UsdCheck:
 
     def facts(self) -> dict[str, Any]:
         broken = int(self.roundtrip.get("materials_total", 0)) - int(self.roundtrip.get("materials_ok", 0))
+        lost = {
+            info.get("usd_prim") or name
+            for name, info in self.export.get("materials", {}).items()
+            if info.get("lost_in_preview")
+        }
+        broken_materials = {
+            name for name, info in self.roundtrip.get("materials", {}).items()
+            if not info.get("found") or not info.get("principled") or info.get("missing_channels")
+        }
         scene_facts = {f"usd_{key}": value for key, value in self.roundtrip.get("scene_facts", {}).items()}
         scene_missing = self.roundtrip.get("scene_report", {}).get("missing_textures", [])
         imported_missing = set(self.roundtrip.get("missing_textures", [])) | set(scene_missing)
@@ -37,7 +47,7 @@ class UsdCheck:
             **scene_facts,
             "usd_roundtrip_score": round(self.score, 4),
             "usd_missing_textures": len(self.export.get("missing_textures", [])) + len(imported_missing),
-            "usd_broken_materials": broken,
+            "usd_broken_materials": max(broken, len(broken_materials | lost)),
             "usd_absolute_texture_paths": len(self.export.get("absolute_texture_paths", [])),
             "usd_material_mode": self.mode,
         }
@@ -85,6 +95,18 @@ class UsdFidelityChecker:
         toolkit = self._toolkit
         export = toolkit.export_usd(blend, usd_path, work_dir, log_dir, f"{prefix}_usd_export", scene=scene)
         shutil.rmtree(work_dir, ignore_errors=True)
+        lost = {
+            name: info["lost_in_preview"]
+            for name, info in export["materials"].items()
+            if info.get("lost_in_preview")
+        }
+        if lost:
+            details = "; ".join(f"{name}: {', '.join(channels)}" for name, channels in lost.items())
+            raise BlenderScriptError(
+                f"USD preview loses material channels: {details}",
+                hint="Use supported UsdPreviewSurface inputs. Blender round-trip validation imports the preview "
+                "surface even when MaterialX preserves the full graph.",
+            )
         expected = {info.get("usd_prim") or name: info.get("expected_preview_channels", []) for name, info in export["materials"].items()}
         roundtrip = toolkit.usd_roundtrip(
             usd_path, expected, mode="scene" if scene else "asset", output_dir=roundtrip_dir,

@@ -48,6 +48,7 @@ def write_test_config(tmp: Path, **sections: dict) -> Path:
         "reference": {"providers": ["input_crop"]},
         "polyhaven": {"enabled": False},
         "trellis": {"timeout_s": 60, "retries": 2},
+        "retopology": {"method": "decimate"},
         "critic": {"max_cycles": 2},
         "blender": {
             "timeout_s": 300, "preview_resolution": [128, 128], "preview_samples": 4, "preview_views": ["front_3q"],

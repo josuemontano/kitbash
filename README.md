@@ -15,7 +15,7 @@ image or prompt
 1 Breakdown ── inventory + blockout render ── critic loop ── backlot lookup ── user gate
    │
    ▼
-2 Modelling ── per asset, pipelined:  reference → Trellis → build script → critic loop → review queue
+2 Modelling ── per asset, pipelined:  reference → Trellis → retopology → build script → critic loop → review queue
    │           (workers keep generating while you review; nothing enters the backlot until approved)
    ▼
 3 Layout ───── placement, camera, lights, world for --style ── critic loop ── user gate
@@ -77,6 +77,7 @@ finishes.
 | `--threads N` | 2 | parallel modelling workers (and Trellis jobs) |
 | `--review-buffer N` | 6 | max assets waiting for your review (backpressure) |
 | `--max-cycles N` | 4 | critic cycles per phase and per asset (and per round of feedback) |
+| `--retopology` | `triflow` | retopology method for the Trellis mesh: `triflow` or `decimate` (see below) |
 | `--rubric PATH` | packaged `rubric.md` | rubric the critics score against |
 | `--config PATH` | packaged `config.toml` | config overriding the defaults |
 | `--model.<role>=<name>` | from config | model for a role in every phase |
@@ -113,7 +114,8 @@ Main sections:
 - `[models]`: model per role. `[models.phases.<phase>]` overrides roles for one phase.
   `[models.thinking]` sets the omp thinking level per role. `[models.capabilities].image_roles` lists
   the roles whose models must accept images (checked at startup).
-- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (reference and Poly Haven caches).
+- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (reference and Poly Haven caches),
+  `triflow_weights` (default `~/.cache/kitbash/triflow`).
 - `[tools]`: executables for `omp`, `blender`, and the Python that runs Trellis.
 - `[critic]`: cycles, pass threshold, stall detection, revert tolerance, patch attempts.
 - `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
@@ -121,6 +123,9 @@ Main sections:
   Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
+- `[retopology]`: `method` (`triflow` or `decimate`), `face_count = 4000`, `qem_threshold = 12.0`,
+  `quad_ratio = 0.95`, `flow_steps = 50`, `device` (`auto`, `cuda`, `mps` or `cpu`) and `fallback_on_error`.
+  `--retopology` overrides `method`; `resume` reuses the method stored in the run's config snapshot.
 - `[blender]`, `[usd]`: render sizes and samples, bake resolution, round-trip threshold, MaterialX switch.
 - `[embedding]`: `sentence-transformers` (local, default), `http` (an OpenAI-compatible
   `/embeddings` endpoint such as LM Studio) or `hashing` (offline, used by the tests).
@@ -229,7 +234,7 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 
 - **Producers:** `--threads` workers take assets through reference search, Trellis
   (`python generate.py <ref> --output <asset> --steps 64 --no-texture --pipeline-type 1024`, with up to 2
-  retries), the build script and the critic loop. A worker never waits on you: a finished asset goes
+  retries), retopology, the build script and the critic loop. A worker never waits on you: a finished asset goes
   onto the review queue and the worker picks up the next one.
 - **Consumer:** one review loop shows finished assets in completion order, while generation continues.
   For each asset you can approve it, give feedback, regenerate it (new Trellis seed and a new script)
@@ -246,6 +251,70 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 The terminal shows a single `rich.Live` display: a progress table for every asset and a pinned review
 panel. The display pauses while you answer a prompt. Previews appear inline in kitty, Ghostty, iTerm2
 and WezTerm. Elsewhere kitbash prints the path and opens the file.
+
+### Retopology
+
+After Trellis, each asset's mesh goes through the configured retopology method before the build script
+imports it. Both methods hand the build script a Z-up mesh, so `trellis.mesh_up_axis` applies unchanged.
+
+- `triflow` (default): learned retopology that produces a low-poly triangle mesh of about
+  `retopology.face_count` faces. Output goes to `phases/02_modelling/<asset>/retopo/attempt_NN/`. The
+  preflight checks that it can run (dependencies, weights in `paths.triflow_weights`, device) and the
+  `--dry-run` plan shows the weights status.
+- `decimate`: the original behaviour. There is no retopology step, and the build script reduces the raw
+  Trellis mesh in Blender with `kb.decimate` (collapse decimation, voxel remesh when needed).
+
+For TriFlow output, `kb.decimate` leaves the mesh unchanged even if Blender's face budget is lower.
+`kb.clean_mesh` updates normals and shading without welding vertices or removing small components.
+The decimate path, including fallback after a TriFlow failure, retains ordinary cleanup and reduction.
+
+#### TriFlow
+
+[TriFlow](https://github.com/DerKleineLi/triflow) (Li et al., ECCV 2026) turns a mesh into one with
+artist-like topology: a latent flow-matching model, conditioned on the input's SDF, a face count and a quad
+ratio, predicts a nearest-vertex vector field. Watershed clustering plus a constrained quadric-error
+simplification then extract the mesh. kitbash vendors and adapts the code (`src/kitbash/retopology/triflow/`),
+so it runs in-process and no separate checkout is needed.
+
+The encoder's SDF samples include a halo around surface cells to cover the full narrow band. Marching
+cubes extracts the proxy from that same SDF, preserving signed cavities; NVF support is voxelized from
+the proxy rather than the original triangulation. Inputs must define a closed signed surface inside
+the padded grid: an unbounded or open extracted surface raises a retopology error instead of being
+silently replaced by adaptive remeshing.
+
+Face count and quad ratio are conditioning signals, not hard guarantees. Output remains triangular;
+quad ratio encourages regular triangle pairings, not native quad faces. Topology and geometry guards
+take precedence over reaching the requested count.
+
+The constrained QEM is compiled from the vendored C++ source during `poetry install` (a C++17 compiler is
+required; on macOS install Xcode Command Line Tools). It rejects inverted or degenerate contractions,
+using safe endpoint/midpoint candidates when the quadric minimizer would invalidate the current face fan;
+the final mesh is not welded or stripped of faces after simplification, which would bypass topology checks.
+
+Watershed roots use the transferred displacement at mesh vertices (paper Eq. 6). If a connected
+component has no root below the threshold, its minimum-displacement vertex seeds that component
+(ties use vertex order). No component is assigned an invalid root or a fabricated origin target.
+
+- **Devices.** Upstream is CUDA-only. Here the sparse convolutions and attention are plain PyTorch
+  (`scaled_dot_product_attention`), so TriFlow runs on CUDA, Apple MPS and CPU: `retopology.device = "auto"`
+  prefers CUDA, then MPS, then CPU. fp16 is used on CUDA only. There are no Triton or spconv/torchsparse/flash-attn
+  dependencies. Sparse pooling and neighbour maps are reused across flow steps; only the SDF encoder,
+  NVF decoder and flow model are loaded on the accelerator. Runtime varies with occupied voxels and
+  the selected face count; a 21.6k-face synthetic asset takes about 85 seconds on an M5 Pro with MPS.
+- **Weights** (about 1.3 GB, pinned to a Hugging Face revision and verified by SHA-256, including cached copies)
+  are downloaded on first use into `paths.triflow_weights`. Fetch them ahead of time with
+  `kitbash retopology download-weights`.
+- **Output frame.** The result is mapped back into the input mesh's scale, position and orientation, so
+  the build script's orientation and sizing logic is unchanged.
+- **License.** TriFlow is under the Automotive Development Public Non-Commercial License 1.0, and its
+  dependency MeshLib is not open source. See `src/kitbash/retopology/triflow/NOTICE.md`. Use
+  `--retopology decimate` to avoid both.
+
+With `retopology.fallback_on_error = true` (the default), a failed `triflow` run logs a warning, keeps the
+Trellis mesh and continues on the `decimate` path. The reason is stored as `fallback_reason` in the
+asset's `retopology` record. With `false`, a retopology failure is handled like a Trellis failure: the
+asset asks you for another item name or reference image. The analytics report retopology time next to
+Trellis time.
 
 ### Reference acquisition: deterministic first
 
@@ -301,14 +370,21 @@ and the final scene also get a `.usd`, exported per material with this ladder:
 
 1. **MaterialX**: used when the installed Blender can export it *and* a probe export shows every linked
    Principled input still connected in the MaterialX network.
-2. **UsdPreviewSurface, baked**: otherwise, every input UsdPreviewSurface cannot express (noise,
-   voronoi, ramps, math and so on) is baked to image textures next to the `.usd`, referenced by
-   relative path.
+2. **UsdPreviewSurface, baked**: otherwise, procedural graphs (noise, voronoi, ramps, math and so on)
+   feeding supported preview inputs are baked to image textures next to the `.usd`, referenced by
+   relative path. Baking cannot add channels that UsdPreviewSurface cannot represent.
 
 Baking happens in a temporary copy, so the original `.blend` is never modified. Blender's own USD
 importer only reads UsdPreviewSurface, so by default (`usd.bake_preview_fallback = true`) MaterialX
-materials also get a baked preview-surface fallback. That keeps UsdPreviewSurface-only consumers
-consistent with the `.blend`.
+materials also get a baked preview-surface fallback for supported channels.
+
+**Known preview loss is a failure**, not a successful round trip. Before importing or comparing renders,
+the fidelity checker rejects any material with `lost_in_preview` channels, naming the material and
+inputs in the error. This includes unsupported linked inputs such as transmission or subsurface,
+whether driven by procedural nodes or a direct image, and applies even when MaterialX preserves them.
+Asset evaluation reports the error to the critic; final assembly stops. Low-level export reports retain
+the loss diagnostics, but those exports are not accepted by the fidelity checker. This guard does not
+certify arbitrary shader graphs or every unlinked Principled value; the render comparison remains required.
 
 **Round-trip validation** is part of the critic loop:
 
@@ -383,7 +459,16 @@ concurrent publication or reindexing. Scene inventory rows, scene metadata and v
 in one transaction; failed or interrupted embedding/index writes preserve the previous inventory.
 
 Scenes copy the asset folders they use into `scene/assets/`, so the export is self-contained and every
-texture path stays relative and valid. External files such as HDRIs are copied into `scene/textures/`.
+texture path stays relative and valid. Linked image paths resolve against their owning library, not
+`scene.blend`; localization leaves those library-owned paths unchanged. External linked libraries must
+already be bundled with their textures by assembly; localization does not copy arbitrary library trees.
+
+Asset image copies, external scene images (including HDRIs), and temporary USD source-image copies use
+full SHA-256 content names plus the file extension. Different files named `albedo.png` cannot overwrite
+or reuse each other's images; identical content can share a copy. USD staging also protects existing
+libraries whose texture filenames are not hashed. External local image sequences/UDIMs that require
+multi-file copying are not renamed as single textures: localization reports unresolved paths or fails
+explicitly rather than silently dropping frames/tiles. Packed images remain packed.
 
 ## Output directory
 
@@ -393,7 +478,7 @@ texture path stays relative and valid. External files such as HDRIs are copied i
   input/                                   reference image or prompt.txt
   phases/
     01_breakdown/  inventory.json  cycles/NN/{script.py, diff.patch, critique.json, report.json}  renders/
-    02_modelling/<asset_id>/  reference/  trellis/  script.py  cycles/NN/...  previews/  usd_roundtrip/
+    02_modelling/<asset_id>/  reference/  trellis/  retopo/  script.py  cycles/NN/...  previews/  usd_roundtrip/
     03_layout/     script.py  cycles/NN/...  renders/
     04_assembly/   rejected/ (last rejected scene and its assembly.json, if any)
   scene/  scene.blend  scene.usd  textures/  assets/  renders/  assembly.json
@@ -413,7 +498,7 @@ Recovery covers process interruption and crashes; it is not a power-loss durabil
 ## Analytics
 
 `analytics/analytics.json` and `analytics/analytics.md` report wall time, LLM calls, tokens, cost (from
-omp), critic cycles, retries, user interventions, Trellis time and the USD material mode. They break
+omp), critic cycles, retries, user interventions, Trellis and retopology time and the USD material mode. They break
 these down per step, agent, model, role, asset and phase. They also report:
 
 - **user time apart from compute time**, and how long each asset waited in the review queue;
@@ -440,6 +525,8 @@ headless Blender. They cover:
 - resume;
 - the MaterialX and baked-fallback export paths;
 - relative texture paths after an asset is copied into a scene;
+- distinct same-basename textures across asset, scene, and USD copies, including relocated linked libraries;
+- rejection of known lost preview channels before round-trip validation;
 - scene and USD instance/placeholder counts, grounding, textures and active-camera preservation.
 
 ### Code map
@@ -454,6 +541,8 @@ src/kitbash/
   pipeline/                 asset board, scheduler (backpressure), review queue, workers, per-asset steps
   critique/                 critic loop, resumable sessions, critics, patch writer, diff history
   llm/                      provider-neutral client types, prompt library, typed calls, parsing
+  retopology/               retopology methods behind one protocol: decimate (pass-through) and triflow
+                            (vendored TriFlow: sparse/ pure-torch backend, models/, geometry/, engine, weights)
   infra/                    omp, Blender runner, Trellis, image search, Poly Haven, imaging, patching, embeddings
   services/                 Blender toolkit, USD fidelity checker, reference finder, preflight, dry-run plan
   store/, backlot/          scene state DB, sqlite-vec index, asset library

@@ -11,6 +11,7 @@ that turns it into a finished, reusable asset.
 - target dimensions (width, depth, height in meters): $dimensions
 - materials hint: $materials
 - target style of the shot: $style
+- mesh topology: $retopology
 - user feedback to honour: $feedback
 
 ## Naming convention

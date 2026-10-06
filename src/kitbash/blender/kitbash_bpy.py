@@ -14,6 +14,7 @@ import urllib.request
 import bmesh
 import bpy
 import numpy as np
+from kb_files import copy_texture
 from mathutils import Euler, Matrix, Vector
 
 API = []
@@ -237,7 +238,10 @@ def _collapse(obj, limit):
 def decimate(obj, max_faces=None, voxel_resolution=384):
     """Reduce ``obj`` to at most ``max_faces`` faces (default ``args()['max_faces']``) with collapse decimation.
     Non-manifold meshes that collapse cannot reduce enough are first voxel-remeshed (watertight) at
-    ``voxel_resolution`` voxels across their largest side. Returns the face count."""
+    ``voxel_resolution`` voxels across their largest side. TriFlow meshes are left unchanged, even
+    with an explicit face limit. Returns the face count."""
+    if _ARGS.get("retopology_method") == "triflow":
+        return len(obj.data.polygons)
     limit = int(max_faces or _ARGS.get("max_faces", 150000))
     if len(obj.data.polygons) <= limit:
         return len(obj.data.polygons)
@@ -256,16 +260,17 @@ def decimate(obj, max_faces=None, voxel_resolution=384):
 
 @api
 def clean_mesh(obj, merge_distance=0.0001, smooth_angle=40.0, min_island_ratio=0.002):
-    """Merge duplicate vertices, drop loose geometry and tiny floating islands (smaller than
-    ``min_island_ratio`` of all faces), recalculate normals outward and shade smooth by angle."""
+    """Merge duplicates, drop loose geometry/tiny islands and update normals and smooth shading.
+    For TriFlow meshes, preserve connectivity and update only normals and shading."""
     mesh = obj.data
     work = bmesh.new()
     work.from_mesh(mesh)
-    bmesh.ops.remove_doubles(work, verts=work.verts, dist=merge_distance)
-    loose = [v for v in work.verts if not v.link_faces]
-    if loose:
-        bmesh.ops.delete(work, geom=loose, context="VERTS")
-    _remove_small_islands(work, min_island_ratio)
+    if _ARGS.get("retopology_method") != "triflow":
+        bmesh.ops.remove_doubles(work, verts=work.verts, dist=merge_distance)
+        loose = [v for v in work.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(work, geom=loose, context="VERTS")
+        _remove_small_islands(work, min_island_ratio)
     bmesh.ops.recalc_face_normals(work, faces=work.faces)
     work.to_mesh(mesh)
     work.free()
@@ -444,13 +449,10 @@ def _texture_coordinates(material, projection, scale):
 
 @api
 def image_texture(material, path, non_color=False, projection="BOX", scale=1.0, part=None):
-    """Image Texture node for ``path``. The file is copied into the asset's textures folder (saved with a
-    relative path). projection 'BOX' uses object coordinates (no UVs needed); 'UV' needs ensure_uv(obj)."""
+    """Image Texture node for ``path``. The file is content-hashed into the asset's textures folder
+    (saved with a relative path). projection 'BOX' uses object coordinates; 'UV' needs ensure_uv(obj)."""
     textures_dir = _ARGS.get("textures_dir") or os.path.join(os.path.dirname(_ARGS["output_blend"]), "textures")
-    os.makedirs(textures_dir, exist_ok=True)
-    destination = os.path.join(textures_dir, os.path.basename(path))
-    if os.path.abspath(path) != os.path.abspath(destination):
-        shutil.copy2(path, destination)
+    destination = copy_texture(path, textures_dir)
     image = bpy.data.images.load(destination, check_existing=True)
     image.name = naming("image", part or os.path.splitext(os.path.basename(path))[0])
     if non_color:

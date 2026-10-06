@@ -101,6 +101,7 @@ class AnalyticsReport:
                 "retries": sum(1 for e in events if e["kind"] == EventKind.RETRY) + self._trellis_retries(spans),
                 "user_interventions": sum(1 for e in events if e["kind"] == EventKind.USER_INTERVENTION),
                 "trellis_time_s": _r(sum(_duration(s) for s in spans if s["name"] == "trellis")),
+                "retopology_time_s": _r(sum(_duration(s) for s in spans if s["name"] == "retopology")),
                 "worker_idle_backpressure_s": _r(sum(_duration(s) for s in spans if s["kind"] == SpanKind.IDLE_BACKPRESSURE)),
                 "worker_idle_s": _r(sum(_duration(s) for s in spans if s["kind"] == SpanKind.IDLE)),
             },
@@ -160,6 +161,7 @@ class AnalyticsReport:
             timeline = self._timeline(by_asset.get(asset_id, []), now)
             facts = self._best_facts(asset_id, record.best_cycle, cycles)
             trellis = [s for s in own if s["name"] == "trellis"]
+            retopology = [s for s in own if s["name"] == "retopology"]
             result[asset_id] = {
                 "name": record.name,
                 "state": record.state.value,
@@ -172,6 +174,8 @@ class AnalyticsReport:
                 "user_time_s": _r(sum(_duration(s) for s in own if s["kind"] in USER_KINDS)),
                 "critic_cycles": sum(1 for c in cycles if c.subject == asset_id and c.status != "pending"),
                 "trellis_time_s": _r(sum(_duration(s) for s in trellis)),
+                "retopology_time_s": _r(sum(_duration(s) for s in retopology)),
+                "retopology": record.extra.get("retopology"),
                 "trellis_retries": sum(1 for s in trellis if (s["meta"].get("attempt") or 1) > 1),
                 "retries": sum(1 for e in events if e["asset_id"] == asset_id and e["kind"] == EventKind.RETRY),
                 "user_interventions": sum(1 for e in events if e["asset_id"] == asset_id and e["kind"] == EventKind.USER_INTERVENTION),
@@ -308,6 +312,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             ("retries", totals["retries"]),
             ("user interventions", totals["user_interventions"]),
             ("Trellis time (s)", totals["trellis_time_s"]),
+            ("retopology time (s)", totals["retopology_time_s"]),
             ("worker idle from backpressure (s)", totals["worker_idle_backpressure_s"]),
             ("worker idle, no work (s)", totals["worker_idle_s"]),
         ]),
@@ -322,11 +327,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         ),
         "## Assets",
         _md_table(
-            ("asset", "state", "wall (s)", "compute (s)", "queue wait (s)", "user (s)", "cycles", "Trellis (s)", "LLM calls",
-             "cost", "USD materials", "round trip"),
+            ("asset", "state", "wall (s)", "compute (s)", "queue wait (s)", "user (s)", "cycles", "Trellis (s)", "retopology (s)",
+             "LLM calls", "cost", "USD materials", "round trip"),
             [
                 (asset_id, a["state"] + (" (reused)" if a["reused"] else ""), a["wall_time_s"], a["compute_time_s"],
-                 a["review_queue_wait_s"], a["user_time_s"], a["critic_cycles"], a["trellis_time_s"], int(a.get("llm_calls", 0)),
+                 a["review_queue_wait_s"], a["user_time_s"], a["critic_cycles"], a["trellis_time_s"],
+                 a["retopology_time_s"], int(a.get("llm_calls", 0)),
                  _money(a.get("cost_usd")), a.get("usd_material_mode") or "-", a.get("usd_roundtrip_score") or "-")
                 for asset_id, a in report["assets"].items()
             ],

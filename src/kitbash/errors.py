@@ -75,3 +75,7 @@ class ReferenceNotFoundError(KitbashError):
 
 class UserAbort(KitbashError):
     """The user stopped the run at a gate."""
+
+
+class RetopologyError(KitbashError):
+    """Retopology of a generated mesh failed."""
