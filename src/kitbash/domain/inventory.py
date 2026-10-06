@@ -209,11 +209,17 @@ class Inventory:
         return tuple(item for item in self.items if item.same_as is None)
 
     def with_duplicates_linked(self) -> Inventory:
-        """Mark items with the same name and description as copies of the first one."""
-        first: dict[tuple[str, str], str] = {}
+        """Link copies with matching text, category, materials and exact dimensions."""
+        first: dict[tuple[str, str, str, frozenset[str], Dimensions], str] = {}
         items = []
         for item in self.items:
-            key = (item.name.strip().lower(), item.description.strip().lower())
+            key = (
+                item.name.strip().lower(),
+                item.description.strip().lower(),
+                item.category.strip().lower(),
+                frozenset(material.strip().lower() for material in item.materials_hint),
+                item.dimensions,
+            )
             original = first.setdefault(key, item.id)
             items.append(evolve(item, same_as=None if original == item.id else original))
         return evolve(self, items=tuple(items))
@@ -253,15 +259,16 @@ def _parse_item(raw: Mapping[str, Any], taken: set[str]) -> InventoryItem:
 
 
 def _resolve_targets(items: Sequence[InventoryItem]) -> Iterable[InventoryItem]:
-    """Point relationships at item ids (the model may use names) and drop unknown targets."""
-    by_key: dict[str, str] = {}
+    """Prefer exact ids, then unambiguous names; drop unknown and ambiguous targets."""
+    ids = {item.id for item in items}
+    by_name: dict[str, str | None] = {}
     for item in items:
-        by_key[item.id] = item.id
-        by_key[item.name.lower()] = item.id
+        name = item.name.lower()
+        by_name[name] = None if name in by_name else item.id
     for item in items:
         relationships = []
         for rel in item.relationships:
-            target = by_key.get(rel.target) or by_key.get(rel.target.lower())
+            target = rel.target if rel.target in ids else by_name.get(rel.target.lower())
             if target and target != item.id:
                 relationships.append(evolve(rel, target=target))
         yield evolve(item, relationships=tuple(relationships))

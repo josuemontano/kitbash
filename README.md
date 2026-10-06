@@ -265,9 +265,15 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
   buffer is full, workers finish their current asset and then idle. The idle time is reported.
 - **Barrier:** layout starts when every asset is approved or skipped. Skipped assets become labelled
   placeholder boxes.
-- **Reuse:** identical inventory items (for example four matching chairs) are modelled once. Backlot
-  matches found during the breakdown are proposed for reuse; `--no-interactive` accepts matches above
-  `backlot.match_threshold`.
+- **Relationships:** exact inventory IDs take precedence over item names. Name fallback is
+  case-insensitive and requires a unique match; ambiguous names, unknown targets and self-links
+  are omitted from the inventory passed to layout.
+- **Reuse:** identical inventory items (for example four matching chairs) are modelled once.
+  Automatic linking requires matching name, description, category, material hints and exact dimensions.
+  Text ignores case and surrounding whitespace; material hints also ignore order and repetition.
+  Placement may differ, but material, category and size variants retain separate asset keys.
+  Backlot matches found during the breakdown are proposed for reuse; `--no-interactive` accepts
+  matches above `backlot.match_threshold`.
   Sending a reused asset back for rework at the modelling gate clears its inventory reuse decision
   together with the queued asset checkpoint. Resuming after a restart preserves the feedback and
   models the asset from scratch instead of approving the rejected backlot asset again.
