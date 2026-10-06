@@ -37,14 +37,20 @@ class Database:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Serialize writes; nested repositories participate through a savepoint."""
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            nested = self._conn.in_transaction
+            self._conn.execute("SAVEPOINT kitbash_nested" if nested else "BEGIN IMMEDIATE")
             try:
                 yield self._conn
+                self._conn.execute("RELEASE kitbash_nested" if nested else "COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                if nested:
+                    self._conn.execute("ROLLBACK TO kitbash_nested")
+                    self._conn.execute("RELEASE kitbash_nested")
+                elif self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
                 raise
-            self._conn.execute("COMMIT")
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
         with self._lock:

@@ -1,7 +1,10 @@
 """Critic loop behaviour with a fake subject, fake critics and a scripted patch writer."""
 
 import json
+import os
 import re
+import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,10 +21,12 @@ from kitbash.critique.subject import CriticBrief, Evaluation
 from kitbash.domain.critique import CriterionScore, CriticKind, Critique, Edit
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
-from kitbash.errors import BlenderScriptError, KitbashError, StateError
+from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, StateError
 from kitbash.infra.patching import make_diff
+from kitbash.infra.process import run_process
 from kitbash.paths import OutputLayout
 from kitbash.store.state import StateDB
+from tests.helpers import process_gone, wait_for
 
 RUBRIC = Rubric.parse("| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n| Quality | 1 | good enough | modelling |")
 SCORE = re.compile(r"^SCORE = ([0-9.]+)$", re.MULTILINE)
@@ -441,3 +446,32 @@ def test_cached_pass_cannot_transfer_to_a_nonpassing_cycle(env):
     assert loop.best(subject).cycle == 1  # the only surviving candidate failed the rubric
     with pytest.raises(StateError, match="not eligible for a passed outcome"):
         loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
+    pid_path = tmp_path / "critic-pid"
+    original = LLMAccessError("provider budget exhausted")
+
+    class RunningCritic(FakeCritic):
+        def review(self, request):
+            run_process([
+                sys.executable, "-c",
+                f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)",
+            ], timeout_s=90)
+            raise AssertionError("cancelled critic continued")
+
+    class FatalCritic(FakeCritic):
+        def review(self, request):
+            wait_for(lambda: pid_path.exists() and pid_path.stat().st_size)
+            raise original
+
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    loop._critics = (RunningCritic(CriticKind.VISUAL), FatalCritic(CriticKind.TECHNICAL))
+    try:
+        with pytest.raises(LLMAccessError) as caught:
+            loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+        assert caught.value is original
+        assert process_gone(int(pid_path.read_text()))
+        pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+        assert pending.status == "pending" and pending.passed is None
+    finally:
+        if pid_path.exists() and not process_gone(int(pid_path.read_text())):
+            os.killpg(int(pid_path.read_text()), signal.SIGKILL)

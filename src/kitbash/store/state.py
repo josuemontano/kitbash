@@ -306,13 +306,17 @@ class StateDB:
 
     def __init__(self, path: Path, embedder: Embedder | None = None) -> None:
         self.db = Database(path)
-        self.db.executescript(SCHEMA)
-        self.meta = RunMetaRepository(self.db)
-        self.phases = PhaseRepository(self.db)
-        self.inventory = InventoryRepository(self.db, self.meta, embedder)
-        self.assets = AssetRepository(self.db)
-        self.cycles = CycleRepository(self.db)
-        self.spans = SpanRepository(self.db)
+        try:
+            self.db.executescript(SCHEMA)
+            self.meta = RunMetaRepository(self.db)
+            self.phases = PhaseRepository(self.db)
+            self.inventory = InventoryRepository(self.db, self.meta, embedder)
+            self.assets = AssetRepository(self.db)
+            self.cycles = CycleRepository(self.db)
+            self.spans = SpanRepository(self.db)
+        except BaseException:
+            self.db.close()
+            raise
 
     def close(self) -> None:
         self.db.close()

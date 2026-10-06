@@ -87,3 +87,23 @@ def test_vector_dimension_mismatch_is_reported(tmp_path):
     StateDB(tmp_path / "state.db", HashingEmbedder(32)).close()
     with pytest.raises(StateError, match="dimensions"):
         StateDB(tmp_path / "state.db", HashingEmbedder(48))
+
+
+def test_inventory_rejects_different_model_at_same_dimensions(tmp_path, sample_inventory_dict):
+    class OtherModel(HashingEmbedder):
+        @property
+        def name(self):
+            return "other-model"
+
+    path = tmp_path / "state.db"
+    state = StateDB(path, HashingEmbedder(64))
+    state.inventory.save(Inventory.from_dict(sample_inventory_dict))
+    state.close()
+    with pytest.raises(StateError):
+        StateDB(path, OtherModel(64))
+    reopened = StateDB(path, HashingEmbedder(64))
+    try:
+        assert reopened.inventory.load() == Inventory.from_dict(sample_inventory_dict)
+        assert reopened.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+    finally:
+        reopened.close()

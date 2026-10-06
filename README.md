@@ -62,6 +62,11 @@ poetry run kitbash resume --output out/
 poetry run kitbash resume --output out/ --from-phase layout
 ```
 
+Ctrl+C and fatal model-access errors stop subprocess groups and wait for modelling workers to unwind
+before closing HTTP or SQLite. Interrupted assets keep their checkpoints; cancellation does not turn
+them into failed assets or start tool retries. A second Ctrl+C during teardown is deferred until cleanup
+finishes.
+
 ### `build` options
 
 | option | default | meaning |
@@ -357,6 +362,16 @@ The backlot is a SQLite database with sqlite-vec for embeddings, stored in `path
 inside a scene directory. Each asset folder holds the `.blend`, its `textures/`, the `usd/` tree, a
 preview and `metadata.json`.
 
+New bundles are copied into hidden `.staging/` directories first. Asset metadata and vectors commit
+together with a pending publication status; only a complete bundle renamed into `assets/` becomes
+available to get/list/search. Opening the library reconciles committed pending bundles and removes
+abandoned staging. Publication and recovery share an OS-owned lock so recovery cannot remove a live
+writer's files.
+
+Vector reuse requires the same embedding model identity **and** dimensions. After changing the
+backlot's model, run `kitbash library reindex`; the old index remains intact if rebuilding fails.
+Existing scene state also requires its original embedding backend (or a new output directory).
+
 Scenes copy the asset folders they use into `scene/assets/`, so the export is self-contained and every
 texture path stays relative and valid. External files such as HDRIs are copied into `scene/textures/`.
 
@@ -374,6 +389,13 @@ texture path stays relative and valid. External files such as HDRIs are copied i
   analytics/  analytics.json  analytics.md
   logs/  kitbash.log  llm/ (every prompt and answer)  *.log (every subprocess)
 ```
+
+`scene/` is published only after assembly, round-trip validation, and the assembly rubric pass, with
+nonempty blend, USD and render files. Assembly builds in `.scene-staging/` and renames the validated
+directory into place; a failed rebuild leaves the previous published scene unchanged. Resume removes
+interrupted staging, recovers `.scene-previous/` if replacement stopped between renames, and reconciles
+SQLite assembly metadata from the published `assembly.json`. Blender library/texture paths stay
+relative, and generated JSON reports use final paths rather than staging paths.
 
 ## Analytics
 

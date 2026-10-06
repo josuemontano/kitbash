@@ -6,7 +6,7 @@ those edits into a unified diff against the latest kept script. Everything is ch
 """
 
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import StrEnum
 from typing import Protocol
 
@@ -23,6 +23,7 @@ from kitbash.domain.critique import Critique, Edit
 from kitbash.domain.rubric import Rubric
 from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, LLMError, PatchError, StateError
 from kitbash.infra.patching import apply_diff, make_diff
+from kitbash.infra.process import current_registry, defer_interrupts
 from kitbash.llm.parsing import check_python
 
 
@@ -292,8 +293,19 @@ class CriticLoop:
                 self._tracker.event(EventKind.WARNING, "critic_failed", critic=critic.kind.value, error=str(exc)[:500])
                 return Critique(critic=critic.kind.value, summary=f"Critic failed: {exc}")
 
-        with ThreadPoolExecutor(max_workers=max(1, len(self._critics))) as pool:
-            return tuple(pool.map(context.propagate(run), self._critics))
+        registry = current_registry()
+        with registry.bind(), ThreadPoolExecutor(max_workers=max(1, len(self._critics))) as pool:
+            try:
+                futures = [pool.submit(context.propagate(run), critic) for critic in self._critics]
+                # Observe a fatal result even when an earlier critic is still inside a subprocess.
+                for future in as_completed(futures):
+                    future.result()
+                return tuple(future.result() for future in futures)
+            except BaseException:
+                with defer_interrupts():
+                    registry.terminate_all()
+                    pool.shutdown(wait=True, cancel_futures=True)
+                raise
 
     def _outcome(self, state: LoopState, session: _Session, reason: LoopReason, message: str) -> LoopOutcome:
         best = session.best(state)

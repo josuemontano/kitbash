@@ -17,6 +17,7 @@ from kitbash.domain.assets import AssetRecord, AssetState, ReworkEntry
 from kitbash.domain.inventory import Inventory, InventoryItem
 from kitbash.domain.phases import PhaseName
 from kitbash.errors import KitbashError, StateError
+from kitbash.infra.process import defer_interrupts
 from kitbash.interaction.protocols import AssetReview, GateAction, PhaseSummary, ReviewAction, ReviewDecision, UserChannel
 from kitbash.phases.base import ask_user, run_gate
 from kitbash.pipeline.asset_pipeline import AssetPipeline
@@ -123,8 +124,8 @@ class ModellingPhase:
             self._config.pipeline.threads, scheduler, pipeline.advance, failed,
             lambda record: self._route(record, scheduler, queue), self._tracker, self.name.value,
         )
-        pool.start()
         try:
+            pool.start()
             with self._dashboard.showing(ModellingView(board, scheduler, queue, self._since)):
                 while not board.all_resolved():
                     if pool.fatal is not None:
@@ -138,8 +139,11 @@ class ModellingPhase:
                     finally:
                         queue.done()
         finally:
-            pool.stop()
-            pool.join(timeout=5)
+            with defer_interrupts():
+                pool.stop()
+                pool.join()
+        if pool.fatal is not None:
+            raise pool.fatal
 
     def _route(self, record: AssetRecord, scheduler: Scheduler, queue: ReviewQueue, *, initial: bool = False) -> None:
         match record.state:

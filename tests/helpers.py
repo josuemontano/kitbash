@@ -1,9 +1,12 @@
 """Test helpers: fake tool wiring and synthetic reference images."""
 
 import json
+import os
 import shutil
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -64,3 +67,21 @@ def omp_calls(log: Path) -> list[dict]:
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+def wait_for(predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("Timed out waiting for child lifecycle")
+        time.sleep(0.01)
+
+
+def process_gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    # Orphaned grandchildren can remain zombies until the host's init reaps them.
+    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False).stdout.strip()
+    return not status or status.startswith("Z")
