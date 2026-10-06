@@ -29,6 +29,7 @@ class ReviewDecision:
     reference_path: str | None = None
     search_name: str | None = None
     reference_index: int | None = None
+    procedural: bool = False  # the user explicitly chose programmatic modelling for this asset instead of Trellis
 
 
 @frozen

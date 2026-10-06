@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from kitbash.agents.modelling import ModellingAgent, retopology_method
+from kitbash.agents.modelling import AssetSubject, ModellingAgent, retopology_method
 from kitbash.analytics.report import AnalyticsReport
-from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
+from kitbash.analytics.tracker import SpanKind, Tracker
 from kitbash.app import create_workspace, open_workspace
 from kitbash.cli import Retopology, _overrides, app
 from kitbash.config import load_config
@@ -15,7 +15,7 @@ from kitbash.domain.assets import AssetRecord, AssetState
 from kitbash.domain.inventory import Inventory
 from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import RunInput
-from kitbash.errors import ConfigError, PreflightError, RetopologyError
+from kitbash.errors import ConfigError, KitbashError, PreflightError, RetopologyError
 from kitbash.paths import OutputLayout
 from kitbash.pipeline.asset_pipeline import AssetPipeline
 from kitbash.pipeline.board import AssetBoard
@@ -38,15 +38,23 @@ def test_defaults_select_triflow():
     r = config.retopology
     assert r.method == "triflow" and r.method_enum is RetopologyMethod.TRIFLOW
     assert (r.face_count, r.qem_threshold, r.quad_ratio, r.flow_steps, r.device) == (4000, 12.0, 0.95, 50, "auto")
-    assert r.fallback_on_error is True
     assert config.paths.triflow_weights == Path("~/.cache/kitbash/triflow").expanduser()
+
+
+def test_removed_fallback_key_still_loads_but_changes_nothing(tmp_path):
+    """Old configs and run snapshots set ``fallback_on_error``; resuming them must not break, nor re-enable the fallback."""
+    user = tmp_path / "old.toml"
+    user.write_text("[retopology]\nfallback_on_error = true\n")
+    config = load_config(user)
+    assert not hasattr(config.retopology, "fallback_on_error")
+    assert "fallback_on_error" not in config.snapshot_toml()
 
 
 def test_user_file_and_override_set_the_method(tmp_path):
     user = tmp_path / "mine.toml"
-    user.write_text('[retopology]\nmethod = "decimate"\nface_count = 2000\nfallback_on_error = false\n')
+    user.write_text('[retopology]\nmethod = "decimate"\nface_count = 2000\n')
     config = load_config(user)
-    assert config.retopology.method == "decimate" and config.retopology.face_count == 2000 and not config.retopology.fallback_on_error
+    assert config.retopology.method == "decimate" and config.retopology.face_count == 2000
     assert load_config(user, {"retopology.method": "triflow"}).retopology.method == "triflow"
 
 
@@ -130,7 +138,7 @@ def test_factory_returns_the_decimate_pass_through(tmp_path):
     mesh = tmp_path / "a.obj"
     result = retopologizer.retopologize(mesh, tmp_path / "retopo", "a")
     assert result.mesh_path == mesh and result.faces_in is None and result.faces_out is None and result.device is None
-    assert result.fallback_reason is None and "kitbash.retopology.triflow.engine" not in sys.modules
+    assert "kitbash.retopology.triflow.engine" not in sys.modules
 
 
 def test_factory_builds_the_engine_lazily_with_the_configured_settings(monkeypatch):
@@ -164,7 +172,7 @@ def test_missing_engine_is_a_preflight_error(monkeypatch):
     assert "--retopology decimate" in raised.value.hint
 
 
-# -- agent: fallback ---------------------------------------------------------------------------------
+# -- agent: retopology is mandatory ---------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -197,23 +205,30 @@ def test_agent_uses_the_retopology_result_and_records_a_span(tmp_path, state):
     assert [(s["kind"], s["name"]) for s in state.spans.spans()] == [(SpanKind.SUBPROCESS, "retopology")]
 
 
-def test_agent_falls_back_to_the_trellis_mesh(tmp_path, state):
-    agent = make_agent(tmp_path, state, FakeTriflowRetopologizer(fail="CUDA out of memory"))
-    mesh = trellis_mesh(tmp_path)
-    result = agent.retopologize(AssetRecord(id="chair", name="Chair"), mesh)
-    assert result.mesh_path == mesh and result.method is RetopologyMethod.DECIMATE
-    assert result.fallback_reason == "triflow: CUDA out of memory"
-    assert result.to_extra()["fallback_reason"] == "triflow: CUDA out of memory"
-    (event,) = state.spans.events()
-    assert event["kind"] == EventKind.WARNING and event["name"] == "retopology_fallback"
+@pytest.mark.parametrize("legacy", [{}, {"retopology.face_count": 2000}])
+def test_agent_never_keeps_the_raw_trellis_mesh_when_retopology_fails(tmp_path, state, legacy):
+    agent = make_agent(tmp_path, state, FakeTriflowRetopologizer(fail="CUDA out of memory"), **legacy)
+    with pytest.raises(RetopologyError, match="CUDA out of memory"):
+        agent.retopologize(AssetRecord(id="chair", name="Chair"), trellis_mesh(tmp_path))
+    assert [e for e in state.spans.events() if e["name"] == "retopology_fallback"] == []
     (span,) = state.spans.spans()
     assert span["name"] == "retopology" and "CUDA out of memory" in span["meta"]["error"]
 
 
-def test_agent_raises_without_fallback(tmp_path, state):
-    agent = make_agent(tmp_path, state, FakeTriflowRetopologizer(fail="boom"), **{"retopology.fallback_on_error": False})
-    with pytest.raises(RetopologyError, match="boom"):
+def test_agent_without_a_retopologizer_refuses_to_continue(tmp_path, state):
+    agent = make_agent(tmp_path, state, None)
+    with pytest.raises(KitbashError, match="Retopology is unavailable"):
         agent.retopologize(AssetRecord(id="chair", name="Chair"), trellis_mesh(tmp_path))
+
+
+def test_a_trellis_asset_is_never_built_without_its_retopology_record(tmp_path):
+    config = load_config()
+    item = Inventory.from_dict({"scene": {}, "items": [{"id": "chair", "name": "Chair", "description": "d", "category": "c",
+                                                       "dimensions": [1, 1, 1]}]}).items[0]
+    asset = AssetRecord(id="chair", name="Chair", mesh_path=str(tmp_path / "chair.obj"))
+    subject = AssetSubject(item, asset, None, None, config, OutputLayout.at(tmp_path / "out"))
+    with pytest.raises(KitbashError, match="never retopologized"):
+        subject.evaluate(tmp_path / "script.py", tmp_path / "cycle", 1)
 
 
 def test_decimate_agent_is_a_silent_pass_through(tmp_path, state):
@@ -276,23 +291,9 @@ def test_pipeline_builds_from_the_retopology_result(tmp_path, generating):
     assert after.extra["trellis"] == {"duration_s": 3.0, "retries": 1, "runs": 1}
     assert after.extra["reference"] == asset.extra["reference"]
     assert after.extra["retopology"] == {
-        "method": "triflow", "faces_in": 900, "faces_out": 400, "duration_s": 1.5, "device": "cpu", "fallback_reason": None,
+        "method": "triflow", "faces_in": 900, "faces_out": 400, "duration_s": 1.5, "device": "cpu",
     }
     assert retopology_method(after) == "triflow"
-
-
-def test_pipeline_keeps_the_trellis_mesh_after_a_fallback(tmp_path, generating):
-    board, build = generating
-
-    def retopologize(asset, mesh_path):
-        return RetopologyResult(RetopologyMethod.DECIMATE, mesh_path, None, None, 0.2, fallback_reason="triflow: no GPU")
-
-    pipeline, _ = build(retopologize)
-    asset = board.get("wooden_crate")
-    after = pipeline._generate(asset, pipeline.item_for(asset))
-    assert after.state is S.BUILDING and after.mesh_path == str(tmp_path / "trellis" / "wooden_crate.obj")
-    assert after.extra["retopology"]["fallback_reason"] == "triflow: no GPU" and retopology_method(after) == "decimate"
-    assert after.extra["reference"] == asset.extra["reference"]
 
 
 def test_pipeline_fails_the_asset_like_a_trellis_failure(generating):
@@ -304,7 +305,7 @@ def test_pipeline_fails_the_asset_like_a_trellis_failure(generating):
     pipeline, _ = build(retopologize)
     asset = board.get("wooden_crate")
     after = pipeline._generate(asset, pipeline.item_for(asset))
-    assert after.state is S.INPUT_NEEDED and "degenerate mesh" in after.error and "Retopology of the mesh for 'Wooden crate'" in after.input_request
+    assert after.state is S.INPUT_NEEDED and "degenerate mesh" in after.error and "Retopology of the Trellis mesh for 'Wooden crate'" in after.input_request
     assert after.mesh_path is None and after.extra["trellis"]["runs"] == 1 and after.extra["reference"] == {"source": "x"}
 
 

@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Sequence
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -10,6 +11,10 @@ from PIL import Image
 from kitbash.domain.inventory import InventoryItem
 from kitbash.infra.image_search import Candidate
 from kitbash.infra.imaging import open_rgb
+
+# An isolated reference has a transparent or flat, neutral (white, grey, black) backdrop around the object.
+BACKGROUND_UNIFORMITY = 0.9
+NEUTRAL_SPREAD = 0.15  # max channel spread (0..1) of the border color that still counts as neutral
 
 
 def rights_allowed(candidate: Candidate, allowed: Sequence[str]) -> bool:
@@ -53,27 +58,45 @@ def _tokens(text: str) -> set[str]:
     return {t.removesuffix("s") for t in re.findall(r"[^\W_]+", text.lower()) if len(t) > 2}
 
 
-def assess(candidate: Candidate, item: InventoryItem) -> dict[str, float | bool]:
-    """Measure at bounded resolution; alpha or border color only approximates foreground."""
-    assert candidate.path is not None
-    with Image.open(candidate.path) as original:
+def _load(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """The image as RGB and alpha arrays (0..1) at bounded resolution."""
+    with Image.open(path) as original:
         rgba = original.convert("RGBA")
         rgba.thumbnail((256, 256))
         alpha = np.asarray(rgba.getchannel("A"), dtype=np.float32) / 255
-    rgb_image = open_rgb(candidate.path)
+    rgb_image = open_rgb(path)
     rgb_image.thumbnail((256, 256))
-    rgb = np.asarray(rgb_image, dtype=np.float32) / 255
+    return np.asarray(rgb_image, dtype=np.float32) / 255, alpha
+
+
+def _backdrop(rgb: np.ndarray, alpha: np.ndarray) -> tuple[np.ndarray, float, bool]:
+    """Approximate foreground mask, the share of the border that is background, and whether that backdrop is neutral."""
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
+    background_color = np.median(border, axis=0)
+    if np.any(alpha < 0.95):  # transparent: no backdrop at all
+        foreground = alpha > 0.1
+        background = float(np.mean(np.concatenate((alpha[0], alpha[-1], alpha[:, 0], alpha[:, -1])) < 0.1))
+        return foreground, background, True
+    foreground = np.max(np.abs(rgb - background_color), axis=2) > 0.12
+    background = float(np.mean(np.max(np.abs(border - background_color), axis=1) <= 0.12))
+    return foreground, background, bool(np.ptp(background_color) <= NEUTRAL_SPREAD)
+
+
+def is_isolated(path: Path) -> bool:
+    """True when the object sits on no background or on a flat neutral (white, grey, black) one."""
+    _, background, neutral = _backdrop(*_load(path))
+    return background >= BACKGROUND_UNIFORMITY and neutral
+
+
+def assess(candidate: Candidate, item: InventoryItem) -> dict[str, float | bool]:
+    """Measure at bounded resolution; alpha or border color only approximates foreground."""
+    assert candidate.path is not None
+    rgb, alpha = _load(candidate.path)
+    foreground, background, neutral = _backdrop(rgb, alpha)
+    isolated = background >= BACKGROUND_UNIFORMITY and neutral
     gray = rgb.mean(axis=2)
     laplacian = -4 * gray[1:-1, 1:-1] + gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]
     sharpness = min(1.0, float(np.var(laplacian)) / 0.012) if laplacian.size else 0.0
-    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
-    background_color = np.median(border, axis=0)
-    if np.any(alpha < 0.95):
-        foreground = alpha > 0.1
-        background = float(np.mean(np.concatenate((alpha[0], alpha[-1], alpha[:, 0], alpha[:, -1])) < 0.1))
-    else:
-        foreground = np.max(np.abs(rgb - background_color), axis=2) > 0.12
-        background = float(np.mean(np.max(np.abs(border - background_color), axis=1) <= 0.12))
     occupancy = float(np.mean(foreground))
     clipping = float(np.mean(np.concatenate((foreground[0], foreground[-1], foreground[:, 0], foreground[:, -1]))))
     native_side = min(candidate.original_width or candidate.width, candidate.original_height or candidate.height)
@@ -86,11 +109,11 @@ def assess(candidate: Candidate, item: InventoryItem) -> dict[str, float | bool]
         + 0.1 * occupancy_score + 0.05 * (1 - clipping) + 0.05 / (1 + candidate.provider_rank)
     )
     # Hard caps prevent title/rank from compensating for weak physical evidence.
-    eligible = overlap >= 0.65 and min(native_side, decoded_side) >= 384 and sharpness >= 0.2 and 0.08 <= occupancy <= 0.75 and clipping <= 0.02 and background >= 0.9
+    eligible = overlap >= 0.65 and min(native_side, decoded_side) >= 384 and sharpness >= 0.2 and 0.08 <= occupancy <= 0.75 and clipping <= 0.02 and isolated
     if not eligible:
         score = min(score, 0.79)
     return {
         "score": round(score, 6), "token_overlap": round(overlap, 4), "sharpness": round(sharpness, 4),
         "background": round(background, 4), "occupancy": round(occupancy, 4), "clipping": round(clipping, 4),
-        "detail": round(detail, 4), "automatic_eligible": eligible,
+        "detail": round(detail, 4), "isolated": isolated, "automatic_eligible": eligible,
     }

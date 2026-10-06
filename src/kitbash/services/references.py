@@ -52,7 +52,11 @@ class ReferenceFinder:
         self._cache_dir = cache_dir
 
     def find(self, item: InventoryItem, directory: Path) -> ReferenceChoice | None:
-        """Explicit input, adequate native crop, licensed APIs; uncertainty stops before Trellis."""
+        """Explicit input, adequate native crop, licensed APIs; uncertainty stops before Trellis.
+
+        Searched candidates (crops, Commons, Openverse) are accepted only when the object is isolated: a transparent
+        or flat neutral background. Anything else is dropped before ranking, so it can neither be auto-selected nor offered
+        for review. A user-supplied image is the user's own choice and is used as given."""
         directory.mkdir(parents=True, exist_ok=True)
         for name in ("review.json", "selection.json", "contact_sheet.png"):
             (directory / name).unlink(missing_ok=True)
@@ -116,6 +120,8 @@ class ReferenceFinder:
             fetched = self._downloader.fetch(candidate, directory / "reviewed.png")
             if fetched is None or fetched.content_hash != candidate.content_hash:
                 return None
+            if not assess(fetched, item)["isolated"]:
+                return None
             return self._choose(fetched, item, directory, "explicit human visual selection from ranked contact sheet")
         except (OSError, ValueError, KeyError, TypeError):
             return None
@@ -147,7 +153,7 @@ class ReferenceFinder:
             if fetched is not None and fetched.content_hash not in seen_hashes:
                 seen_hashes.add(fetched.content_hash)
                 local.append(fetched)
-        ranked = [(c, assess(c, item)) for c in local]
+        ranked = [(c, quality) for c in local if (quality := assess(c, item))["isolated"]]
         ranked.sort(key=lambda pair: (-float(pair[1]["score"]), pair[0].provider_rank, pair[0].source, pair[0].provider_id, pair[0].content_hash))
         ranked = ranked[: self._config.max_candidates]
         (directory / "candidates.json").write_text(

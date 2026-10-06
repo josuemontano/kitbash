@@ -237,11 +237,16 @@ class ModellingPhase:
                 scheduler.release(asset.id)
             case ReviewAction.PROVIDE_INPUT:
                 extra = {**asset.extra, "fresh_script": True, "reference_index": decision.reference_index}
-                if decision.reference_index is None:
+                changes: dict = {}
+                if decision.procedural:
+                    # The only way a Trellis run produces programmatic geometry: the user asked for it, for this asset.
+                    extra.update(procedural_choice="user", reference_index=None, reference_review=None)
+                    changes = {"modelling_method": "procedural", "reference_path": None, "mesh_path": None}
+                elif decision.reference_index is None:
                     extra.update(search_name=decision.search_name, user_reference=decision.reference_path, reference_review=None)
                 board.transition(
-                    asset.id, S.QUEUED, "user input", input_request=None, error=None, attempt=asset.attempt + 1,
-                    extra=extra,
+                    asset.id, S.QUEUED, "procedural modelling chosen" if decision.procedural else "user input",
+                    input_request=None, error=None, attempt=asset.attempt + 1, extra=extra, **changes,
                 )
                 scheduler.submit(asset.id)
 

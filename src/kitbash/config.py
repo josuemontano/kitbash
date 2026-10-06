@@ -22,6 +22,8 @@ from kitbash.retopology.base import RetopologyMethod
 DEFAULTS_PACKAGE = "kitbash.defaults"
 FREE_FORM_TABLES = frozenset({"models.phases", "styles"})
 RETOPOLOGY_DEVICES = ("auto", "cuda", "mps")
+# Keys removed on purpose; old config files and run snapshots that still set them keep loading.
+REMOVED_KEYS = {"retopology": {"fallback_on_error"}}
 
 
 @frozen
@@ -173,7 +175,6 @@ class RetopologyConfig:
     quad_ratio: float
     flow_steps: int
     device: str
-    fallback_on_error: bool
 
     @property
     def method_enum(self) -> RetopologyMethod:
@@ -274,7 +275,7 @@ def load_config(user_path: Path | None = None, overrides: Mapping[str, Any] | No
     if user_path is not None:
         if not user_path.is_file():
             raise ConfigError(f"Config file not found: {user_path}")
-        user = _parse_toml(user_path.read_text(encoding="utf-8"), str(user_path))
+        user = _drop_removed_keys(_parse_toml(user_path.read_text(encoding="utf-8"), str(user_path)))
         _reject_unknown_keys(user, merged, "")
         merged = deep_merge(merged, user)
     for dotted, value in (overrides or {}).items():
@@ -342,6 +343,14 @@ def _parse_toml(text: str, origin: str) -> dict[str, Any]:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML in {origin}: {exc}") from exc
+
+
+def _drop_removed_keys(user: dict[str, Any]) -> dict[str, Any]:
+    """Retopology of a Trellis mesh is mandatory, so ``retopology.fallback_on_error`` no longer exists."""
+    for table, keys in REMOVED_KEYS.items():
+        if isinstance(user.get(table), dict):
+            user[table] = {k: v for k, v in user[table].items() if k not in keys}
+    return user
 
 
 def _reject_unknown_keys(user: Mapping[str, Any], defaults: Mapping[str, Any], prefix: str) -> None:

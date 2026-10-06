@@ -3,23 +3,23 @@
 import json
 import logging
 import shutil
-import time
 from pathlib import Path
 
 from kitbash.analytics import context
-from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
+from kitbash.analytics.tracker import Tracker
 from kitbash.config import Config
 from kitbash.critique.subject import CriticBrief, Evaluation
 from kitbash.domain.assets import AssetRecord
 from kitbash.domain.inventory import InventoryItem
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.roles import Role
-from kitbash.errors import KitbashError, RetopologyError
+from kitbash.errors import KitbashError
 from kitbash.infra.polyhaven import PolyHavenCatalog
 from kitbash.infra.trellis import TrellisResult, TrellisRunner
 from kitbash.llm.service import LLMService
 from kitbash.paths import OutputLayout
 from kitbash.retopology.base import Retopologizer, RetopologyMethod, RetopologyResult
+from kitbash.retopology.step import retopologize_mesh
 from kitbash.services.api_reference import blender_api_reference
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.references import ReferenceChoice, ReferenceFinder
@@ -80,30 +80,10 @@ class ModellingAgent:
         return self._trellis.generate(reference, directory, asset.id, seed=asset.seed)
 
     def retopologize(self, asset: AssetRecord, mesh_path: Path) -> RetopologyResult:
-        """Retopologize the Trellis mesh. With ``fallback_on_error`` a failure keeps the Trellis mesh (the decimate path)."""
-        retopologizer = self._retopologizer
-        if retopologizer is None:
+        """Retopologize the Trellis mesh. Mandatory: a failure is an error, never a silent keep of the raw mesh."""
+        if self._retopologizer is None:
             raise KitbashError("Retopology is unavailable in procedural modelling mode")
-        if retopologizer.method is RetopologyMethod.DECIMATE:
-            return retopologizer.retopologize(mesh_path, mesh_path.parent, asset.id)
-        directory = self._layout.asset_retopo_dir(asset.id) / f"attempt_{asset.attempt:02d}"
-        directory.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
-        try:
-            with self._tracker.span(SpanKind.SUBPROCESS, "retopology", attempt=asset.attempt, method=retopologizer.method.value) as span:
-                result = retopologizer.retopologize(mesh_path, directory, asset.id)
-                span.meta.update(faces_in=result.faces_in, faces_out=result.faces_out, device=result.device)
-        except RetopologyError as exc:
-            if not self._config.retopology.fallback_on_error:
-                raise
-            reason = f"{retopologizer.method.value}: {exc.message}"
-            log.warning("Retopology failed for %s, keeping the Trellis mesh: %s", asset.id, reason)
-            self._tracker.event(EventKind.WARNING, "retopology_fallback", asset=asset.id, reason=reason)
-            return RetopologyResult(
-                method=RetopologyMethod.DECIMATE, mesh_path=mesh_path, faces_in=None, faces_out=None,
-                duration_s=time.monotonic() - started, fallback_reason=reason,
-            )
-        return result
+        return retopologize_mesh(self._retopologizer, self._layout, self._tracker, asset.id, asset.attempt, mesh_path)
 
     def write_script(self, item: InventoryItem, asset: AssetRecord) -> str:
         naming = self._config.naming
@@ -183,6 +163,8 @@ class AssetSubject:
         """Build the asset, render previews, inspect it and validate the USD round trip."""
         if self._asset.modelling_method == "trellis" and not self._asset.mesh_path:
             raise KitbashError(f"Asset {self._asset.id} has no Trellis mesh")
+        if self._asset.modelling_method == "trellis" and "retopology" not in self._asset.extra:
+            raise KitbashError(f"Asset {self._asset.id} has a Trellis mesh that was never retopologized")
         build = cycle_dir / BUILD_DIR
         blend = build / BLEND_NAME
         prefix = f"cycle_{cycle:02d}"
