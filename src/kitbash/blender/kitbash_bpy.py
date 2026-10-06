@@ -423,7 +423,11 @@ def principled_node(material):
 
 @api
 def add_node(material, node_type, location=None, **properties):
-    """Add a shader node by bl_idname (e.g. 'ShaderNodeTexNoise', 'ShaderNodeValToRGB') and set node properties."""
+    """Add a shader node by bl_idname. Keyword properties are RNA attributes (e.g. operation='MULTIPLY'),
+    NOT input sockets. Set sockets separately: noise.inputs['Scale'].default_value = 5.0;
+    bump.inputs['Strength'].default_value = 0.1. Scale, Detail, Roughness, Strength and Distance
+    are sockets, not attributes accepted through **properties.
+    """
     node = node_tree(material).nodes.new(node_type)
     if location is not None:
         node.location = location
@@ -434,7 +438,9 @@ def add_node(material, node_type, location=None, **properties):
 
 @api
 def link(material, from_socket, to_socket):
-    """Connect ``from_socket`` to ``to_socket`` in the material's node tree."""
+    """Connect sockets in ``material``; all three arguments are required, e.g.
+    kb.link(mat, noise.outputs['Fac'], bump.inputs['Height']).
+    """
     return node_tree(material).links.new(from_socket, to_socket)
 
 
