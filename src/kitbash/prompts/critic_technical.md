@@ -34,6 +34,8 @@ $history
 
 ## Output
 JSON only:
-{"summary": "two or three sentences", "scores": {"<criterion id>": {"score": 0.0-1.0, "pass": true|false, "notes": "evidence"}}, "edits": [{"target": "function or line", "issue": "what is wrong", "instruction": "exactly what to change in the script", "priority": "high | medium | low"}]}
-Score every criterion listed from the evidence. If the script failed, the first edit must fix the error.
+{"summary": "two or three sentences", "scores": {"<criterion id>": {"score": 0.0-1.0|null, "pass": true|false|null, "notes": "evidence or why unavailable"}}, "edits": [{"target": "function or line", "issue": "what is wrong", "instruction": "exactly what to change in the script", "priority": "high | medium | low"}]}
+Include every criterion listed. For assessed criteria, give both a numeric score and a boolean verdict.
+If evidence is unavailable, use {"score": null, "pass": null, "notes": "what evidence is missing"}.
+Never omit a criterion or invent a pass/fail assessment without evidence. If the script failed, the first edit must fix the error.
 Give at most 6 edits; no edits if everything passes.

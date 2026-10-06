@@ -62,6 +62,11 @@ poetry run kitbash resume --output out/
 poetry run kitbash resume --output out/ --from-phase layout
 ```
 
+Ctrl+C and fatal model-access errors stop subprocess groups and wait for modelling workers to unwind
+before closing HTTP or SQLite. Interrupted assets keep their checkpoints; cancellation does not turn
+them into failed assets or start tool retries. A second Ctrl+C during teardown is deferred until cleanup
+finishes.
+
 ### `build` options
 
 | option | default | meaning |
@@ -109,13 +114,13 @@ Main sections:
 - `[models]`: model per role. `[models.phases.<phase>]` overrides roles for one phase.
   `[models.thinking]` sets the omp thinking level per role. `[models.capabilities].image_roles` lists
   the roles whose models must accept images (checked at startup).
-- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (Poly Haven cache),
+- `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (reference and Poly Haven caches),
   `triflow_weights` (default `~/.cache/kitbash/triflow`).
 - `[tools]`: executables for `omp`, `blender`, and the Python that runs Trellis.
 - `[critic]`: cycles, pass threshold, stall detection, revert tolerance, patch attempts.
-- `[reference]`: image search providers and limits. `input_crop` crops the object from your reference
-  image. `omp_web` has the omp agent search the web with its `web_search` tool: slower, but it finds
-  product photos on white backgrounds. `wikimedia` and `openverse` are free image APIs.
+- `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
+  optional `vision_fallback`. Defaults: `input_crop`, `wikimedia`, `openverse`; no model search.
+  Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
 - `[retopology]`: `method` (`triflow` or `decimate`), `face_count = 4000`, `qem_threshold = 12.0`,
@@ -155,10 +160,26 @@ Critics score against [`rubric.md`](rubric.md), a Markdown table:
   `` `usd_roundtrip_score >= 0.85 and missing_textures == 0` ``. When every fact it names was measured,
   the check decides pass or fail. Otherwise the critics decide.
 
+With `critic.require_all_pass = true`, every applicable criterion must have an affirmative assessment:
+missing evidence is **unassessed**, not an implicit pass or an invented failure. A criterion assigned
+to `both` critics needs evidence from both to pass, unless a measured machine check decides it. A
+known negative assessment still makes the criterion failed even if the other critic is unavailable.
+Threshold-only scoring (`require_all_pass = false`) retains its configured behavior, but never
+relabels an unassessed criterion as passed. Final assembly always requires all criteria to pass.
+
+Critic responses must cover every criterion assigned to that role and phase. Omitted criteria use
+the existing response-repair path; unavailable evidence must be represented with `score: null`,
+`pass: null`, and an explanatory `notes` value. A visual critic with no available render marks each
+of its criteria unassessed without asking the model to guess. Scorecard JSON exposes each criterion's
+`status` (`passed`, `failed`, or `unassessed`); terminal tables use the same labels. Unknown verdicts
+remain `pass: null`, distinct from evidenced failures (`pass: false`), across saved scorecards.
+
 Editing the file changes critic prompts, scoring and pass or fail decisions, with no code changes.
 Facts available to checks include `scale_error`, `origin_offset_m`, `up_axis_ok`, `naming_violations`,
 `non_principled_materials`, `missing_textures`, `usd_roundtrip_score`, `usd_broken_materials`,
-`missing_assets`, `floating_assets`, `items` and `unrecognized_items`.
+`missing_assets`, `unexpected_assets`, `missing_placeholders`, `unexpected_placeholders`,
+`floating_assets`, `has_camera`, `items` and `unrecognized_items`. Final USD scene inspection supplies
+the corresponding `usd_`-prefixed instance, placeholder, grounding and camera facts.
 
 ## How it works
 
@@ -171,12 +192,24 @@ Each cycle evaluates a script in headless Blender, then runs two critics in para
   graphs, texture paths) and the USD round-trip results.
 
 Each critic returns rubric scores and a structured list of edits. The **code role** turns those edits
-into a **unified diff** against the best script so far. All Python is written by the code role. Every
+into a **unified diff** against the latest kept script. All Python is written by the code role. Every
 cycle is stored in `cycles/NN/` as `script.py`, `diff.patch`, `critique.json` and `report.json`.
+
+Only kept cycles with successful evaluation, a score and verdict for every applicable criterion, and
+all required artifact files are eligible to return. Breakdown requires inventory, blend and render;
+modelling requires blend, USD and preview; layout requires blend and render. Passing cycles outrank
+non-passing cycles, regardless of score. `passed` always describes the cycle actually returned.
+If no eligible result exists, the loop reports an error instead of returning a broken build.
+
+Resume recognizes a checkpointed pass even if interruption happened before the session was marked
+complete or after the final allowed cycle. It does not patch or re-evaluate that pass. Required files
+are checked again when selecting a saved result; a cached success cannot mask missing artifacts.
 
 The loop never repeats itself:
 
-- A patch that makes the score drop is **reverted**. The next patch starts from the best script.
+- A patch that breaks an eligible build or drops its score beyond `revert_epsilon` is **reverted**.
+  A passing patch is kept even if its score is below a non-passing parent's. The next patch starts
+  from the latest kept script, including a failed initial script that still needs repair.
 - Patches that do not apply are **rejected**, and the reason goes back to the code writer.
 - The full diff history, with each status, goes into every prompt.
 - The loop stops early when a new diff repeats an earlier one, or when the best score has not
@@ -205,7 +238,8 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
   onto the review queue and the worker picks up the next one.
 - **Consumer:** one review loop shows finished assets in completion order, while generation continues.
   For each asset you can approve it, give feedback, regenerate it (new Trellis seed and a new script)
-  or skip it. "Input needed" entries ask for an item name to search for, or a reference image path.
+  or skip it. "Input needed" entries show a ranked reference contact sheet when available: select a
+  candidate number, give another search name or image path, or skip. Prompts run on the main thread.
 - **Backpressure:** at most `--review-buffer` assets are in flight or waiting for review. When the
   buffer is full, workers finish their current asset and then idle. The idle time is reported.
 - **Barrier:** layout starts when every asset is approved or skipped. Skipped assets become labelled
@@ -282,6 +316,53 @@ asset's `retopology` record. With `false`, a retopology failure is handled like 
 asset asks you for another item name or reference image. The analytics report retopology time next to
 Trellis time.
 
+### Reference acquisition: deterministic first
+
+1. An approved backlot reuse decision bypasses reference acquisition and Trellis entirely.
+2. An explicit user image wins next (JPEG, PNG or WebP, subject to decode/size limits). Otherwise,
+   an input-image crop is reused only with at least `reference.min_crop_side_px = 384` pixels on its
+   **original, unpadded shorter side**, plus the automatic quality gates below. Crops are never upscaled.
+3. Commons and Openverse queries are cached and ranked deterministically. Rights are checked before
+   downloading; title/category overlap and provider rank bound download work. Decoded pixel hashes
+   deduplicate identical images across URLs; sharpness, border clipping, approximate foreground
+   occupancy/background uniformity and decoded/native dimensions determine the final ranking.
+4. Automatic selection requires supported rights, `auto_select_threshold = 0.88` and a lead of
+   `ambiguity_margin = 0.08` over the next candidate. Hard gates also require native/decoded shorter
+   sides of at least 384 pixels, token overlap ≥ 0.65, normalized sharpness ≥ 0.2, estimated occupancy
+   between 0.08 and 0.75, edge clipping ≤ 0.02 and border uniformity ≥ 0.9. A lone candidate is not
+   automatically trusted, and does not trigger a model call.
+
+These are **screening heuristics, not proof of the correct object, completeness or lack of occlusion**.
+Ambiguous/low-quality results produce `contact_sheet.png` and `review.json`, then `input_needed` before
+mesh generation. Interactive review can explicitly accept a rights-eligible, decodable candidate below
+the heuristic threshold. `--no-interactive` skips unresolved assets; they remain placeholders/partial
+input, subject to final acceptance—not an expensive mesh run on the top lexical hit.
+Set `reference.vision_fallback = true` to let OMP judge ambiguous candidates when at least one passes
+the automatic quality threshold. Visual fallback cannot override rights or the quality gates; its
+choice must still pass them. It is disabled by default.
+
+The supported rights allow-list defaults to CC0, public-domain declarations and configured versions of
+CC BY / CC BY-SA. Unknown, noncommercial, no-derivatives, conflicting or incomplete rights metadata
+is rejected. Attribution licenses require a creator and a matching license URL. This policy records
+provider claims; it is **not legal clearance**. Users remain responsible for attribution, share-alike
+and other obligations, and for rights to their supplied images/crops. `selection.json`, asset state
+and backlot metadata preserve image URL, provider item ID, page URL, creator, license identifier/URL,
+dimensions, query, content hash and quality assessment rather than only a free-form license label.
+
+Persistent caches live under `paths.downloads/references`: `searches/` uses
+`reference.search_cache_ttl_s = 86400`; `urls/` indexes content-addressed PNGs in `content/`.
+Cache hits are rechecked against current rights, byte/dimension limits and pixel hashes. Delete this
+cache to force fresh retrieval. Incoming and normalized files are limited by `max_download_mb`;
+decoded images are additionally bounded to 16,384 pixels per side and 40 million pixels total.
+
+Downloads permit only public HTTP(S) destinations on standard ports, without URL credentials or
+environment proxies. Every request/redirect validates all DNS answers and connects directly to a
+validated numeric address, retaining the original hostname for verified TLS. Private, loopback,
+link-local, reserved and mixed public/private destinations are rejected; redirects and bodies are
+bounded. HTTP remains supported for provider compatibility, without HTTPS transport guarantees.
+The OS resolver, sockets and TLS trust store are trusted. This hardens a risk boundary; it does not
+assert that the previous implementation was exploited.
+
 ### USD export and material fidelity
 
 The `.blend` is the source of truth. It is fully node based, including procedural nodes. Every asset
@@ -315,6 +396,37 @@ certify arbitrary shader graphs or every unlinked Principled value; the render c
 The comparison is `score = min(SSIM, 1 − 2·mean color delta)`. The rung used for each material, and
 the score, are stored in the backlot (`usd_material_mode`, `usd_roundtrip_score`) and in the analytics.
 
+### Final acceptance
+
+Assembly inspects the **rebuilt, localized `scene.blend`**, not just its earlier layout preview, and
+inspects the **actual re-imported USD**. Both must contain the expected number of each approved asset
+instance (including inventory `same_as` copies) and skipped-item placeholders, with no missing or
+extra placements, a valid camera, available textures and grounded geometry. Inspection includes
+EMPTY-root hierarchies and linked collection instances. Support must be external geometry within
+3 cm of the placement base; the object's own geometry and an imaginary floor at z=0 do not count.
+The USD comparison uses the selected scene camera, not whichever camera imports first.
+
+Automatic publication requires the final rubric to pass with every applicable criterion scored,
+and the structural checks above cannot be disabled by omitting them from a custom rubric. A failed
+or unmeasured final criterion blocks automatic acceptance. Final assembly has no visual/technical
+LLM critic call: custom assembly criteria need measured machine checks to pass automatically.
+
+With `--no-interactive`, failed final acceptance exits nonzero and does not mark assembly complete.
+Completed rejected outputs remain in `phases/04_assembly/rejected/` for diagnosis, including when the
+user quits the acceptance gate. They never replace `scene/`. Interactive runs show the failures and
+default to quitting. Only an explicit `p` choice can **publish degraded**; ordinary approval is not an
+override. Both `.blend` and USD outputs must be nonempty, as must any rendered final frame. A scene
+without a usable camera can only be published without a render by this explicit degraded override.
+
+The current attempt's state metadata and analytics record `acceptance.status` (`pending`, `passed`,
+`failed` or `overridden`), `automatic_pass`, `published` and failure details. A human override records
+`status = "overridden"`, `automatic_pass = false` and the still-failing scorecard; terminal output also
+labels it degraded. Rebuilds clear the current attempt's acceptance before work starts, so a failed or
+interrupted rerun cannot retain an earlier automatic pass. The previous published scene and its
+`scene/assembly.json` remain unchanged; SQLite's `published_assembly` metadata tracks that publication
+separately from the latest `assembly` attempt. Fix the scene and use `resume --from-phase layout`, or
+resume interactively to explicitly publish a degraded output.
+
 ### Performance
 
 The Trellis command from the spec (`--pipeline-type 1024 --steps 64`) is slow: expect roughly 30 to 60
@@ -329,6 +441,22 @@ into `phases/02_modelling/<asset>/trellis/attempt_NN/trellis_attempt_N.log`.
 The backlot is a SQLite database with sqlite-vec for embeddings, stored in `paths.backlot`, never
 inside a scene directory. Each asset folder holds the `.blend`, its `textures/`, the `usd/` tree, a
 preview and `metadata.json`.
+
+New bundles are copied into hidden `.staging/` directories first. Asset metadata and vectors commit
+together with a pending publication status; only a complete bundle renamed into `assets/` becomes
+available to get/list/search. Required blend, USD and preview files must be nonempty and contained in
+the bundle. Opening the library reconciles committed pending bundles, validates migrated legacy
+entries, and removes incomplete publications, abandoned staging and directories left by interrupted
+deletions. Publication and recovery share an OS-owned lock so recovery cannot remove a live writer's
+files.
+
+Vector reuse requires the same embedding model identity **and** dimensions. After changing the
+backlot's model, run `kitbash library reindex`; the old index remains intact if rebuilding fails.
+Existing scene state also requires its original embedding backend (or a new output directory).
+
+Search reads vectors, model identity and asset metadata from one SQLite snapshot, including during
+concurrent publication or reindexing. Scene inventory rows, scene metadata and vectors are replaced
+in one transaction; failed or interrupted embedding/index writes preserve the previous inventory.
 
 Scenes copy the asset folders they use into `scene/assets/`, so the export is self-contained and every
 texture path stays relative and valid. Linked image paths resolve against their owning library, not
@@ -352,10 +480,20 @@ explicitly rather than silently dropping frames/tiles. Packed images remain pack
     01_breakdown/  inventory.json  cycles/NN/{script.py, diff.patch, critique.json, report.json}  renders/
     02_modelling/<asset_id>/  reference/  trellis/  retopo/  script.py  cycles/NN/...  previews/  usd_roundtrip/
     03_layout/     script.py  cycles/NN/...  renders/
+    04_assembly/   rejected/ (last rejected scene and its assembly.json, if any)
   scene/  scene.blend  scene.usd  textures/  assets/  renders/  assembly.json
   analytics/  analytics.json  analytics.md
   logs/  kitbash.log  llm/ (every prompt and answer)  *.log (every subprocess)
 ```
+
+Assembly builds in `.scene-staging/`. Only a validated or explicitly accepted degraded result is
+renamed into `scene/`; failed or interrupted rebuilds leave the previous published scene unchanged.
+Resume removes incomplete staging, recovers `.scene-previous/` if replacement stopped between
+renames, and reconciles published SQLite metadata from `scene/assembly.json`, including a first
+publication interrupted before the SQLite write. Blender library/texture paths stay relative, and
+generated JSON reports point to their final or rejected location rather than staging paths.
+
+Recovery covers process interruption and crashes; it is not a power-loss durability guarantee.
 
 ## Analytics
 
@@ -388,7 +526,8 @@ headless Blender. They cover:
 - the MaterialX and baked-fallback export paths;
 - relative texture paths after an asset is copied into a scene;
 - distinct same-basename textures across asset, scene, and USD copies, including relocated linked libraries;
-- rejection of known lost preview channels before round-trip validation.
+- rejection of known lost preview channels before round-trip validation;
+- scene and USD instance/placeholder counts, grounding, textures and active-camera preservation.
 
 ### Code map
 

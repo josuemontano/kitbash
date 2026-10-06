@@ -11,6 +11,11 @@ from kitbash.ui.tables import simple_table
 
 def print_summary(console: Console, report: Mapping[str, Any]) -> None:
     totals = report["totals"]
+    acceptance = report.get("scene", {}).get("acceptance")
+    if acceptance:
+        console.print(simple_table("Final acceptance", ("status", "automatic pass", "published"), [
+            (acceptance["status"], acceptance["automatic_pass"], acceptance["published"]),
+        ]))
     console.print(
         simple_table(
             "Run summary",

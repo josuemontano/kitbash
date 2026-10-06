@@ -90,16 +90,29 @@ class AssetPipeline:
         return self._board.transition(asset.id, S.REFERENCING)
 
     def _reference(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
-        choice = self._agent.find_reference(item)
+        index = asset.extra.get("reference_index")
+        if index is not None:
+            asset = self._board.update(asset.id, extra={"reference_index": None})
+            choice = self._agent.select_reference(item, index)
+        else:
+            choice = self._agent.find_reference(item)
         if choice is None:
+            review = self._agent.reference_review(item)
+            request = (
+                f"Reference candidates for '{item.name}' need your review; deterministic quality and rights checks "
+                "could not select one automatically. Choose a numbered candidate, give another item name, "
+                "or provide a reference image path."
+                if review else
+                f"No usable reference image was found for '{item.name}'. "
+                "Give an item name to search for, or the path to a reference image."
+            )
             return self._board.transition(
-                asset.id, S.INPUT_NEEDED, "no reference image",
-                input_request=f"No usable reference image was found for '{item.name}'. "
-                "Give an item name to search for, or the path to a reference image.",
+                asset.id, S.INPUT_NEEDED, "reference needs input", input_request=request,
+                extra={**asset.extra, "reference_review": review},
             )
         return self._board.transition(
             asset.id, S.GENERATING, choice.source, reference_path=str(choice.path), error=None,
-            extra={"reference": {"source": choice.source, "title": choice.title, "reason": choice.reason, "license": choice.license}},
+            extra={**asset.extra, "reference": choice.to_dict(), "reference_review": None, "reference_index": None},
         )
 
     def _generate(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
@@ -128,7 +141,7 @@ class AssetPipeline:
             )
         return self._board.transition(
             asset.id, S.BUILDING, "mesh ready", mesh_path=str(retopology.mesh_path),
-            extra={"trellis": trellis_extra, "retopology": retopology.to_extra()},
+            extra={**asset.extra, "trellis": trellis_extra, "retopology": retopology.to_extra()},
         )
 
     def _build(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
@@ -155,10 +168,13 @@ class AssetPipeline:
         match asset.rework_entry:
             case ReworkEntry.REGENERATE:
                 return self._board.transition(
-                    asset.id, S.GENERATING, "regenerate", attempt=asset.attempt + 1, seed=asset.seed + 1, extra={"fresh_script": True}
+                    asset.id, S.GENERATING, "regenerate", attempt=asset.attempt + 1, seed=asset.seed + 1,
+                    extra={**asset.extra, "fresh_script": True},
                 )
             case ReworkEntry.REFERENCE:
-                return self._board.transition(asset.id, S.REFERENCING, "new reference", attempt=asset.attempt + 1, extra={"fresh_script": True})
+                return self._board.transition(
+                    asset.id, S.REFERENCING, "new reference", attempt=asset.attempt + 1, extra={**asset.extra, "fresh_script": True}
+                )
             case _:
                 feedback = asset.feedback[-1] if asset.feedback else None
                 return self._board.transition(asset.id, S.BUILDING, "feedback", extra={**asset.extra, "pending_feedback": feedback})

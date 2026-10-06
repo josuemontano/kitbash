@@ -37,6 +37,7 @@ from kitbash.infra.image_search import (
 )
 from kitbash.infra.omp import OmpClient
 from kitbash.infra.polyhaven import PolyHavenCatalog
+from kitbash.infra.process import ProcessRegistry, defer_interrupts
 from kitbash.infra.trellis import TrellisRunner
 from kitbash.interaction.autopilot import AutoPilot
 from kitbash.interaction.protocols import UserChannel
@@ -55,7 +56,7 @@ from kitbash.retopology import make_retopologizer
 from kitbash.retopology.base import Retopologizer
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.preflight import PreflightReport, run_preflight
-from kitbash.services.references import OmpWebImageProvider, ReferenceFinder
+from kitbash.services.references import ReferenceFinder
 from kitbash.services.usd_fidelity import UsdFidelityChecker
 from kitbash.store.state import StateDB
 from kitbash.ui.dashboard import Dashboard
@@ -156,6 +157,7 @@ class Application:
         configure_logging(layout)
         self.config, self.layout, self.run_input, self.console = config, layout, run_input, console
         self.embedder: Embedder = make_embedder(config.embedding)
+        self._processes = ProcessRegistry()
         self.state = StateDB(layout.state_db, self.embedder)
         self.tracker = Tracker(self.state.spans)
         self.rubric = Rubric.load(layout.rubric_snapshot)
@@ -205,12 +207,17 @@ class Application:
         catalog = PolyHavenCatalog(
             self._http, config.paths.downloads, enabled=config.polyhaven.enabled, ttl_s=config.polyhaven.cache_ttl_s
         )
+        reference_cache = config.paths.downloads / "references"
         finder = ReferenceFinder(
-            self._providers(llm),
-            ImageDownloader(self._http, max_bytes=int(config.reference.max_download_mb * 1024 * 1024), min_side=config.reference.min_side_px),
+            self._providers(),
+            ImageDownloader(
+                self._http, max_bytes=int(config.reference.max_download_mb * 1024 * 1024),
+                min_side=config.reference.min_side_px, cache_dir=reference_cache,
+            ),
             llm,
             config.reference,
             tracker,
+            cache_dir=reference_cache,
         )
         trellis = TrellisRunner(
             config.paths.trellis,
@@ -238,21 +245,28 @@ class Application:
         return SceneAgent(phases, state, tracker, AnalyticsReport(state, layout))
 
     def run(self, from_phase: PhaseName | None = None) -> dict:
-        report = self.preflight()
-        return self.scene_agent(report).run(from_phase)
+        # Each invocation has its own cancellation gate; resume/re-run in this interpreter is safe.
+        self._processes = ProcessRegistry()
+        with self._processes.bind():
+            try:
+                report = self.preflight()
+                return self.scene_agent(report).run(from_phase)
+            finally:
+                self._processes.terminate_all()
 
     def analytics(self) -> dict:
         return AnalyticsReport(self.state, self.layout).write()
 
     def close(self) -> None:
-        self._http.close()
-        self.backlot.close()
-        self.state.close()
+        with defer_interrupts():
+            self._processes.terminate_all()
+            self._http.close()
+            self.backlot.close()
+            self.state.close()
 
-    def _providers(self, llm: LLMService) -> list[CandidateProvider]:
+    def _providers(self) -> list[CandidateProvider]:
         factories = {
-            "input_crop": lambda: InputCropProvider(self.run_input.image, max(512, self.config.reference.min_side_px)),
-            "omp_web": lambda: OmpWebImageProvider(llm),
+            "input_crop": lambda: InputCropProvider(self.run_input.image, self.config.reference.min_crop_side_px),
             "wikimedia": lambda: WikimediaProvider(self._http),
             "openverse": lambda: OpenverseProvider(self._http),
         }

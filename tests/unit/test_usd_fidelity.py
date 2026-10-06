@@ -67,6 +67,7 @@ def test_raw_check_facts_count_preview_loss_without_double_counting(broken_prim,
         usd_path=Path("asset.usdc"),
         export={
             "usd_material_mode": "materialx",
+            "missing_textures": ["export-only.png"],
             "materials": {
                 "Glass Material": {
                     "usd_prim": "glass_material",
@@ -76,10 +77,15 @@ def test_raw_check_facts_count_preview_loss_without_double_counting(broken_prim,
                 "Wood Material": {"usd_prim": "wood_material", "lost_in_preview": []},
             },
         },
-        roundtrip={"materials_total": 2, "materials_ok": 2 - int(broken_prim is not None), "materials": materials},
+        roundtrip={
+            "materials_total": 2, "materials_ok": 2 - int(broken_prim is not None), "materials": materials,
+            "missing_textures": ["shared.png", "material-only.png"],
+            "scene_report": {"missing_textures": ["shared.png", "scene-only.png"]},
+        },
         comparisons=(ImageComparison(ssim=1.0, color_delta=0.0),),
         compare_image=None,
     )
     assert check.facts()["usd_roundtrip_score"] == 1.0
     assert check.facts()["usd_broken_materials"] == expected_broken
+    assert check.facts()["usd_missing_textures"] == 4
     assert check.report()["materials"]["Glass Material"]["lost_in_preview"] == ["Transmission Weight"]

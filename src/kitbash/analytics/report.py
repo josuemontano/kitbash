@@ -369,8 +369,13 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     ]
     if report.get("scene"):
         scene = report["scene"]
-        sections += ["## Scene", f"Blend: `{scene.get('scene_blend')}`  \nUSD: `{scene.get('scene_usd')}`  \n"
+        acceptance = scene.get("acceptance", {})
+        sections += ["## Scene", f"Acceptance: **{acceptance.get('status', 'not validated')}**  \n"
+                     f"Automatic pass: {acceptance.get('automatic_pass', False)}  \nPublished: {acceptance.get('published', False)}  \n"
+                     f"Blend: `{scene.get('scene_blend')}`  \nUSD: `{scene.get('scene_usd')}`  \n"
                      f"USD materials: {scene.get('usd_material_mode')}  \nUSD round trip score: {scene.get('usd_roundtrip_score')}"]
+        if acceptance.get("issues"):
+            sections.append("Validation failures:\n" + "\n".join(f"- {issue}" for issue in acceptance["issues"]))
     return "\n\n".join(sections) + "\n"
 
 

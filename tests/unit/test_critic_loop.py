@@ -1,10 +1,14 @@
 """Critic loop behaviour with a fake subject, fake critics and a scripted patch writer."""
 
 import json
+import os
 import re
+import signal
+import sys
 from pathlib import Path
 
 import pytest
+from attrs import evolve
 
 from kitbash.analytics.tracker import Tracker
 from kitbash.config import load_config
@@ -17,10 +21,12 @@ from kitbash.critique.subject import CriticBrief, Evaluation
 from kitbash.domain.critique import CriterionScore, CriticKind, Critique, Edit
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
-from kitbash.errors import BlenderScriptError
+from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, StateError
 from kitbash.infra.patching import make_diff
+from kitbash.infra.process import ProcessCancelled, current_registry, run_process
 from kitbash.paths import OutputLayout
 from kitbash.store.state import StateDB
+from tests.helpers import process_gone, wait_for
 
 RUBRIC = Rubric.parse("| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n| Quality | 1 | good enough | modelling |")
 SCORE = re.compile(r"^SCORE = ([0-9.]+)$", re.MULTILINE)
@@ -49,19 +55,25 @@ class FakeSubject:
         if cycle in self.fail_on:
             raise BlenderScriptError("boom", traceback_text="Traceback: line 4")
         score = float(SCORE.search(path.read_text()).group(1))
-        return Evaluation(ok=True, facts={"score": score}, report={"cycle": cycle})
+        artifacts = {}
+        for key in ("blend", "usd", "preview", "inventory", "render"):
+            artifact = cycle_dir / key
+            artifact.write_text(f"cycle {cycle}")
+            artifacts[key] = str(artifact)
+        return Evaluation(ok=True, facts={"score": score}, report={"cycle": cycle}, artifacts=artifacts)
 
 
 class FakeCritic:
-    def __init__(self, kind: CriticKind) -> None:
+    def __init__(self, kind: CriticKind, *, fail_on: set[int] | None = None) -> None:
         self.kind = kind
+        self.fail_on = fail_on or set()
 
     def review(self, request: ReviewRequest) -> Critique:
         score = request.evaluation.facts.get("score", 0.0)
         return Critique(
             critic=self.kind.value,
             summary=f"score {score}",
-            scores=(CriterionScore("quality", score, score >= 0.8),),
+            scores=(CriterionScore("quality", score, score >= 0.8 and request.cycle not in self.fail_on),),
             edits=(Edit(instruction="raise the score", source=self.kind.value),),
         )
 
@@ -91,12 +103,12 @@ def env(tmp_path):
     state.close()
 
 
-def make_loop(env, writer: ScriptedPatchWriter) -> CriticLoop:
+def make_loop(env, writer: ScriptedPatchWriter, *, rubric=RUBRIC, critics=None) -> CriticLoop:
     state, layout, config = env
     return CriticLoop(
-        critics=(FakeCritic(CriticKind.VISUAL), FakeCritic(CriticKind.TECHNICAL)),
+        critics=critics if critics is not None else (FakeCritic(CriticKind.VISUAL), FakeCritic(CriticKind.TECHNICAL)),
         patch_writer=writer,
-        rubric=RUBRIC,
+        rubric=rubric,
         config=config.critic,
         store=CycleStore(state.cycles, layout),
         tracker=Tracker(state.spans),
@@ -269,3 +281,219 @@ def test_a_session_without_its_own_cycles_falls_back_to_its_base(env):
     third = loop.run(subject, request="r2", initial_script=lambda: script(0.9), feedback="and again")
     assert third.reason.value == "patch_failed"
     assert third.best.cycle == second.best.cycle and loop.best(subject).cycle == second.best.cycle
+
+
+@pytest.mark.parametrize("failure", ["criterion", "evaluation"])
+def test_passing_lower_score_replaces_failed_high_score(env, failure):
+    class Subject(FakeSubject):
+        def evaluate(self, path, cycle_dir, cycle):
+            evaluation = super().evaluate(path, cycle_dir, cycle)
+            if failure == "evaluation" and cycle == 1:
+                return evolve(evaluation, ok=False, error="USD export failed")
+            return evaluation
+
+    critics = (
+        FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),
+        FakeCritic(CriticKind.TECHNICAL),
+    )
+    writer = ScriptedPatchWriter([0.85])
+    loop = ResumableLoop(make_loop(env, writer, critics=critics), LoopSessions(env[0].meta))
+    subject = Subject()
+    outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
+    assert outcome.passed and outcome.best.cycle == 2 and outcome.best.score == 0.85
+    assert outcome.best.passed and outcome.best.status is DiffStatus.KEPT
+    rows = env[0].cycles.cycles(subject.phase, subject.subject_id)
+    assert [(row.cycle, row.passed) for row in rows] == [(1, False), (2, True)]
+    cached = loop.run(subject, request="build", initial_script=lambda: script(0.95))
+    assert cached.passed and cached.best.cycle == 2 and cached.cycles_run == 0
+    assert subject.evaluated == [1, 2]
+
+
+@pytest.mark.parametrize("budget", [2, 4])
+@pytest.mark.parametrize("interruption", ["pending", "evaluated"])
+def test_interrupted_session_resumes_the_exact_passing_cycle(env, tmp_path, budget, interruption):
+    class Subject(FakeSubject):
+        interrupted = False
+
+        def evaluate(self, path, cycle_dir, cycle):
+            if interruption == "pending" and cycle == 2 and not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            return super().evaluate(path, cycle_dir, cycle)
+
+    class Observer:
+        def building(self, cycle):
+            pass
+
+        def critiquing(self, cycle):
+            pass
+
+        def evaluated(self, result):
+            if interruption == "evaluated" and result.cycle == 2:
+                raise KeyboardInterrupt
+
+    config = evolve(env[2], critic=evolve(env[2].critic, max_cycles=budget))
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
+    loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
+    subject = Subject()
+    with pytest.raises(KeyboardInterrupt):
+        loop.run(subject, request="build", initial_script=lambda: script(0.95), observer=Observer())
+    assert not LoopSessions(env[0].meta).get(subject).done
+
+    reopened = StateDB(tmp_path / "state.db")
+    try:
+        writer = ScriptedPatchWriter([])
+        resumed = ResumableLoop(make_loop((reopened, env[1], config), writer, critics=critics), LoopSessions(reopened.meta))
+        outcome = resumed.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote initial script"))
+        assert outcome.reason is LoopReason.PASSED and outcome.best.cycle == 2
+        assert outcome.best.score == 0.85 and outcome.best.passed and outcome.cycles_run == 2
+        assert subject.evaluated == [1, 2] and writer.requests == []
+        cached = resumed.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+        assert cached.passed and cached.best.cycle == 2 and cached.cycles_run == 0
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("require_all_pass", [True, False])
+def test_unscored_required_criterion_is_not_an_eligible_result(env, require_all_pass):
+    rubric = Rubric.parse(
+        "| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n"
+        "| Quality | 1 | good enough | modelling |\n| Safety | 1 | safe | modelling |"
+    )
+    config = evolve(env[2], critic=evolve(env[2].critic, require_all_pass=require_all_pass))
+    loop = make_loop((*env[:2], config), ScriptedPatchWriter([]), rubric=rubric)
+    subject = FakeSubject()
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(subject, initial_script=lambda: script(0.95), max_cycles=1)
+    assert loop.best(subject) is None
+    assert env[0].cycles.cycles(subject.phase, subject.subject_id)[0].passed is False
+
+
+@pytest.mark.parametrize(
+    "phase, missing",
+    [
+        (PhaseName.BREAKDOWN, "inventory"), (PhaseName.BREAKDOWN, "blend"), (PhaseName.BREAKDOWN, "render"),
+        (PhaseName.MODELLING, "blend"), (PhaseName.MODELLING, "usd"), (PhaseName.MODELLING, "preview"),
+        (PhaseName.LAYOUT, "blend"), (PhaseName.LAYOUT, "render"),
+    ],
+)
+def test_required_artifact_cannot_be_omitted(env, phase, missing):
+    class Subject(FakeSubject):
+        def evaluate(self, path, cycle_dir, cycle):
+            evaluation = super().evaluate(path, cycle_dir, cycle)
+            return evolve(evaluation, artifacts={key: value for key, value in evaluation.artifacts.items() if key != missing})
+
+    subject = Subject()
+    subject.phase = phase
+    rubric = Rubric.parse("| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n| Quality | 1 | good enough | all |")
+    loop = make_loop(env, ScriptedPatchWriter([]), rubric=rubric)
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(subject, initial_script=lambda: script(0.95), max_cycles=1)
+    assert loop.best(subject) is None
+    assert env[0].cycles.cycles(subject.phase, subject.subject_id)[0].passed is False
+
+
+@pytest.mark.parametrize("damage", ["deleted", "directory"])
+def test_completed_session_rechecks_required_artifact_files(env, damage):
+    subject = FakeSubject()
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([])), LoopSessions(env[0].meta))
+    outcome = loop.run(subject, request="build", initial_script=lambda: script(0.9))
+    usd = Path(outcome.best.evaluation.artifacts["usd"])
+    usd.unlink()
+    if damage == "directory":
+        usd.mkdir()
+    with pytest.raises(StateError, match="no eligible result"):
+        loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+    assert loop.best(subject) is None
+
+
+@pytest.mark.parametrize("failure", ["reverted", "evaluation"])
+def test_ineligible_high_score_cannot_replace_a_passing_checkpoint(env, failure):
+    subject = FakeSubject()
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    first = loop.run(subject, initial_script=lambda: script(0.85)).best
+    store = CycleStore(env[0].cycles, env[1])
+    state = store.load(subject)
+    store.write_cycle(subject, state, 2, script(0.99), make_diff(script(0.85), script(0.99)), score_before=0.85)
+    path = store.cycle_dir(subject, 2) / "script.py"
+    evaluation = subject.evaluate(path, path.parent, 2)
+    result = evolve(
+        first, cycle=2, script_path=path, scorecard=evolve(first.scorecard, overall=0.99),
+        evaluation=evolve(evaluation, ok=False) if failure == "evaluation" else evaluation,
+        status=DiffStatus.REVERTED if failure == "reverted" else DiffStatus.KEPT,
+    )
+    store.save_evaluation(subject, result)
+    outcome = loop.run(subject, initial_script=lambda: pytest.fail("rewrote passing checkpoint"), session_start=1, max_cycles=2)
+    assert outcome.passed and outcome.best.cycle == 1 and outcome.best.score == 0.85
+    assert loop.best(subject).cycle == 1
+    assert env[0].cycles.cycles(subject.phase, subject.subject_id)[1].passed is False
+
+
+def test_failed_feedback_session_does_not_fall_back_to_an_old_pass(env):
+    subject = FakeSubject(fail_on={2})
+    config = evolve(env[2], critic=evolve(env[2].critic, max_cycles=1))
+    loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.95])), LoopSessions(env[0].meta))
+    first = loop.run(subject, request="first", initial_script=lambda: script(0.9))
+    assert first.passed
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(subject, request="feedback", initial_script=lambda: script(0.9), feedback="make it taller")
+    assert loop.best(subject) is None
+
+
+def test_cached_pass_cannot_transfer_to_a_nonpassing_cycle(env):
+    subject = FakeSubject()
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
+    outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
+    Path(outcome.best.evaluation.artifacts["usd"]).unlink()
+    assert loop.best(subject).cycle == 1  # the only surviving candidate failed the rubric
+    with pytest.raises(StateError, match="not eligible for a passed outcome"):
+        loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+
+
+def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
+    pid_path = tmp_path / "critic-pid"
+    original = LLMAccessError("provider budget exhausted")
+
+    class RunningCritic(FakeCritic):
+        def review(self, request):
+            run_process([
+                sys.executable, "-c",
+                f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)",
+            ], timeout_s=90)
+            raise AssertionError("cancelled critic continued")
+
+    class FatalCritic(FakeCritic):
+        def review(self, request):
+            wait_for(lambda: pid_path.exists() and pid_path.stat().st_size)
+            raise original
+
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    loop._critics = (RunningCritic(CriticKind.VISUAL), FatalCritic(CriticKind.TECHNICAL))
+    try:
+        with pytest.raises(LLMAccessError) as caught:
+            loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+        assert caught.value is original
+        assert process_gone(int(pid_path.read_text()))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(int(pid_path.read_text()), os.WNOHANG)
+        pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+        assert pending.status == "pending" and pending.passed is None
+    finally:
+        if pid_path.exists() and not process_gone(int(pid_path.read_text())):
+            os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+
+
+def test_last_critic_cancellation_leaves_cycle_pending_and_next_run_is_fresh(env):
+    class CancellingCritic(FakeCritic):
+        def review(self, request):
+            current_registry().terminate_all()
+            return super().review(request)
+
+    loop = make_loop(env, ScriptedPatchWriter([]), critics=(CancellingCritic(CriticKind.VISUAL),))
+    with pytest.raises(ProcessCancelled):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+    pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+    assert pending.status == "pending" and pending.passed is None
+    fresh = make_loop(env, ScriptedPatchWriter([]))
+    assert fresh.run(FakeSubject(), initial_script=lambda: script(0.9)).reason is LoopReason.PASSED

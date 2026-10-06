@@ -1,8 +1,11 @@
 # kitbash rubric
 
-Critics score each criterion that applies to the current phase from 0 to 1 and decide
-whether it passes. Edit this file (or pass `--rubric my_rubric.md`) to change critic
-behavior. No code changes are needed.
+Critics assess every criterion assigned to their role and the current phase. With evidence,
+they give a score from 0 to 1 and a pass/fail verdict. Without evidence, they explicitly return
+null score and verdict plus a reason; the scorecard marks the criterion **unassessed**, not failed.
+Strict scoring (`require_all_pass`) cannot pass an unassessed criterion. When assigned to both
+critics, both must supply evidence to pass unless a measured machine check decides the result.
+Edit this file (or pass `--rubric my_rubric.md`) to change critic behavior. No code changes are needed.
 
 Columns:
 
@@ -26,4 +29,5 @@ Columns:
 | Spatial arrangement matches the reference | 3 | Relative positions, rotations, relationships (on, next to, inside) and camera framing match the reference | breakdown, layout | visual |
 | Style compliance | 2 | Shading, lighting, camera and color treatment follow the selected style | layout | both |
 | Lighting | 2 | Lighting is plausible for the scene, exposure is balanced and nothing is blown out or crushed | layout | visual |
-| Scene integrity | 1 | Every approved asset is placed, skipped assets have labelled placeholders, nothing floats or intersects unintentionally `missing_assets == 0` | layout | technical |
+| Scene integrity | 1 | Every inventory instance of an approved asset is placed, skipped items have placeholders, the active camera is valid and every placement is supported `missing_assets == 0 and unexpected_assets == 0 and missing_placeholders == 0 and unexpected_placeholders == 0 and floating_assets == 0 and has_camera and missing_textures == 0` | layout, assembly | technical |
+| USD scene integrity | 1 | Re-imported USD preserves every expected asset instance and placeholder, the selected camera and grounding `usd_missing_assets == 0 and usd_unexpected_assets == 0 and usd_missing_placeholders == 0 and usd_unexpected_placeholders == 0 and usd_floating_assets == 0 and usd_has_camera` | assembly | technical |

@@ -17,7 +17,6 @@ from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import ConfigError, KitbashError
 from kitbash.infra.embeddings import make_embedder
-from kitbash.infra.process import REGISTRY
 from kitbash.paths import OutputLayout
 from kitbash.services.plan import Planner
 from kitbash.ui.summary import print_plan, print_summary
@@ -52,7 +51,6 @@ def _guard(action: Callable[[], Any]) -> Any:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
-        REGISTRY.terminate_all()
         console.print("\n[yellow]Interrupted. Progress is checkpointed; continue with `kitbash resume --output <dir>`.[/yellow]")
         raise typer.Exit(130) from None
 
@@ -94,8 +92,10 @@ def _run(application: Application, from_phase: PhaseName | None = None) -> None:
         application.close()
     print_summary(console, report)
     layout = application.layout
+    acceptance = report.get("scene", {}).get("acceptance", {})
+    label = "[bold yellow]Published degraded scene (human override).[/bold yellow]" if acceptance.get("status") == "overridden" else "[bold green]Done.[/bold green]"
     console.print(
-        f"\n[bold green]Done.[/bold green] Scene: {layout.scene_blend}\nUSD: {layout.scene_usd}\n"
+        f"\n{label} Scene: {layout.scene_blend}\nUSD: {layout.scene_usd}\n"
         f"Analytics: {layout.analytics_md}"
     )
 

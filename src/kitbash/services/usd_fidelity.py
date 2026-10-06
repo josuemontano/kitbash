@@ -40,9 +40,13 @@ class UsdCheck:
             name for name, info in self.roundtrip.get("materials", {}).items()
             if not info.get("found") or not info.get("principled") or info.get("missing_channels")
         }
+        scene_facts = {f"usd_{key}": value for key, value in self.roundtrip.get("scene_facts", {}).items()}
+        scene_missing = self.roundtrip.get("scene_report", {}).get("missing_textures", [])
+        imported_missing = set(self.roundtrip.get("missing_textures", [])) | set(scene_missing)
         return {
+            **scene_facts,
             "usd_roundtrip_score": round(self.score, 4),
-            "usd_missing_textures": len(self.export.get("missing_textures", [])) + len(self.roundtrip.get("missing_textures", [])),
+            "usd_missing_textures": len(self.export.get("missing_textures", [])) + len(imported_missing),
             "usd_broken_materials": max(broken, len(broken_materials | lost)),
             "usd_absolute_texture_paths": len(self.export.get("absolute_texture_paths", [])),
             "usd_material_mode": self.mode,
@@ -66,6 +70,7 @@ class UsdCheck:
             "missing_textures": list(self.export.get("missing_textures", [])) + list(self.roundtrip.get("missing_textures", [])),
             "comparisons": [c.to_dict() for c in self.comparisons],
             "roundtrip_score": round(self.score, 4),
+            **({"scene_report": self.roundtrip["scene_report"]} if "scene_report" in self.roundtrip else {}),
         }
 
 
@@ -84,6 +89,7 @@ class UsdFidelityChecker:
         log_dir: Path,
         scene: bool = False,
         engine: str | None = None,
+        scene_expectations: Mapping[str, Any] | None = None,
     ) -> UsdCheck:
         """Export ``blend`` to ``usd_path``, re-import it in a clean session, render both and compare."""
         toolkit = self._toolkit
@@ -104,11 +110,14 @@ class UsdFidelityChecker:
         expected = {info.get("usd_prim") or name: info.get("expected_preview_channels", []) for name, info in export["materials"].items()}
         roundtrip = toolkit.usd_roundtrip(
             usd_path, expected, mode="scene" if scene else "asset", output_dir=roundtrip_dir,
-            prefix=f"{prefix}_usd", log_dir=log_dir, engine=engine,
+            prefix=f"{prefix}_usd", log_dir=log_dir, engine=engine, scene_expectations=scene_expectations,
         )
         settings = {"resolution": toolkit.roundtrip_resolution, "samples": toolkit.roundtrip_samples}
         if scene:
-            originals = [toolkit.render_scene(blend, roundtrip_dir / f"{prefix}_blend_camera.png", log_dir, engine=engine, **settings)]
+            originals = (
+                [toolkit.render_scene(blend, roundtrip_dir / f"{prefix}_blend_camera.png", log_dir, engine=engine, **settings)]
+                if roundtrip["images"] else []
+            )
         else:
             originals = toolkit.render_views(blend, roundtrip_dir, f"{prefix}_blend", log_dir, **settings)
         renders = [Path(p) for p in roundtrip["images"]]

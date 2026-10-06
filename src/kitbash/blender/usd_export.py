@@ -55,9 +55,19 @@ def localize_instances():
             active_object=instancers[0], object=instancers[0], selected_objects=instancers, selected_editable_objects=instancers
         ):
             bpy.ops.object.duplicates_make_real(use_base_parent=True, use_hierarchy=True)
+        # Keep the tagged placement root as the parent of its realized geometry, without exporting
+        # the collection instance a second time. Only the root carries kb_asset_key.
+        for obj in instancers:
+            obj.instance_type = "NONE"
+            obj.instance_collection = None
 
 
 localize_instances()
+if include_scene:
+    for obj in bpy.context.scene.objects:
+        if obj.type == "CAMERA":
+            obj["kb_camera_name"] = obj.name
+            obj["kb_active_camera"] = obj == bpy.context.scene.camera
 
 
 def export(path, materialx):
@@ -74,6 +84,11 @@ def export(path, materialx):
         "export_normals": True,
         "selected_objects_only": False,
         "evaluation_mode": "RENDER",
+        "use_instancing": False,
+        "export_custom_properties": True,
+        "custom_properties_namespace": "userProperties",
+        "author_blender_name": True,
+        "merge_parent_xform": False,
         "export_cameras": include_scene,
         "export_lights": include_scene,
         "convert_world_material": include_scene,

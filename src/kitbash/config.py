@@ -134,6 +134,12 @@ class ReferenceConfig:
     max_download_mb: float
     timeout_s: float
     query_suffix: str
+    allowed_licenses: tuple[str, ...]
+    min_crop_side_px: int
+    auto_select_threshold: float
+    ambiguity_margin: float
+    vision_fallback: bool
+    search_cache_ttl_s: float
 
 
 @frozen
@@ -381,6 +387,15 @@ def _validate(config: Config) -> None:
         raise ConfigError("usd.materialx must be 'auto' or 'off'")
     if config.assembly.mode not in {"append", "link"}:
         raise ConfigError("assembly.mode must be 'append' or 'link'")
+    reference = config.reference
+    if set(reference.providers) - {"input_crop", "wikimedia", "openverse"}:
+        raise ConfigError("reference.providers supports input_crop, wikimedia and openverse; use vision_fallback for optional visual selection")
+    if min(reference.max_candidates, reference.per_provider, reference.min_side_px, reference.min_crop_side_px) < 1:
+        raise ConfigError("reference candidate counts and minimum dimensions must be positive")
+    if not (0 < reference.auto_select_threshold <= 1 and 0 <= reference.ambiguity_margin <= 1):
+        raise ConfigError("reference.auto_select_threshold must be in (0, 1] and ambiguity_margin in [0, 1]")
+    if not (reference.max_download_mb > 0 and reference.timeout_s > 0 and reference.search_cache_ttl_s >= 0):
+        raise ConfigError("reference download/timeout limits must be positive and cache TTL nonnegative")
 
 
 # -- generic structuring ---------------------------------------------------------------------------

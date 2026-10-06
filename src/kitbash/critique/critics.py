@@ -9,7 +9,7 @@ from attrs import frozen
 
 from kitbash.analytics import context
 from kitbash.critique.subject import CriticBrief, Evaluation
-from kitbash.domain.critique import CriticKind, Critique, Edit
+from kitbash.domain.critique import CriterionScore, CriticKind, Critique, Edit
 from kitbash.domain.roles import Role
 from kitbash.domain.rubric import Rubric
 from kitbash.errors import LLMError
@@ -53,7 +53,10 @@ class LLMCritic:
         if not criteria:
             return Critique(critic=self.kind.value, summary="No rubric criteria for this critic.")
         if reason := self.cannot_review(request.evaluation):
-            return Critique(critic=self.kind.value, summary=f"Skipped: {reason}")
+            return Critique(
+                critic=self.kind.value, summary=f"Skipped: {reason}",
+                scores=tuple(CriterionScore(c.id, None, None, reason) for c in criteria),
+            )
         ids = {c.id for c in criteria}
         model = self._llm.model_for(self.role, phase)
 
@@ -62,8 +65,15 @@ class LLMCritic:
                 raise LLMError("Expected a JSON object with 'scores', 'summary' and 'edits'")
             critique = Critique.parse(self.kind.value, data, model=model)
             known = tuple(s for s in critique.scores if s.criterion_id in ids)
-            if not known:
-                raise LLMError(f"No scores for the rubric criteria {sorted(ids)}")
+            missing = ids - {s.criterion_id for s in known}
+            if missing:
+                raise LLMError(f"Missing assessments for rubric criteria: {sorted(missing)}")
+            for score in known:
+                if score.score is None:
+                    if score.passed is not None or not score.notes.strip():
+                        raise LLMError(f"{score.criterion_id}: unavailable evidence requires score=null, pass=null and an explanation")
+                elif score.passed is None:
+                    raise LLMError(f"{score.criterion_id}: an assessed score requires an explicit pass or fail verdict")
             return Critique(critic=critique.critic, summary=critique.summary, scores=known, edits=critique.edits, model=model)
 
         with context.bind(agent=f"{self.kind.value}_critic"):
@@ -103,7 +113,7 @@ class VisualCritic(LLMCritic):
     template = "critic_visual"
 
     def cannot_review(self, evaluation: Evaluation) -> str | None:
-        return None if evaluation.images else "the script produced no renders"
+        return None if any(image.is_file() for image in evaluation.images) else "the script produced no available renders"
 
     def variables(self, request: ReviewRequest) -> dict[str, str]:
         references = [p.name for p in request.brief.references]

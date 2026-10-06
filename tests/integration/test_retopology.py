@@ -24,6 +24,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.blender, requires_blender]
 def workspace(tmp_path, monkeypatch):
     log = tmp_path / "omp_calls.jsonl"
     monkeypatch.setenv("FAKE_OMP_LOG", str(log))
+    # Exercise retopology with an explicit reference, not the crop quality gate.
+    monkeypatch.setenv("FAKE_OMP_REFERENCE", str(reference_image(tmp_path / "asset.png")))
     return tmp_path, log
 
 

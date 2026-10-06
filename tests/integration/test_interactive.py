@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.blender, requires_blender]
 def test_interactive_feedback_reenters_the_critic_loops(tmp_path, monkeypatch):
     log = tmp_path / "omp_calls.jsonl"
     monkeypatch.setenv("FAKE_OMP_LOG", str(log))
+    monkeypatch.setenv("FAKE_OMP_REFERENCE", str(reference_image(tmp_path / "asset.png")))
     config = write_test_config(tmp_path, pipeline={"threads": 1})
     answers = [
         "f", "Make the crate a little taller",  # breakdown gate: feedback -> another critic cycle

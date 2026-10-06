@@ -108,11 +108,14 @@ def respond(task: str, prompt: str) -> str:
     if task == "preflight.ping":
         return "pong"
     if task.startswith("breakdown.analyze"):
-        return "```json\n" + json.dumps(INVENTORY) + "\n```"
+        inventory = INVENTORY
+        if reference := os.environ.get("FAKE_OMP_REFERENCE"):
+            inventory = {**INVENTORY, "items": [{**item, "user_reference": reference} for item in INVENTORY["items"]]}
+        return "```json\n" + json.dumps(inventory) + "\n```"
     if ".critic." in task:
         return json.dumps(critique(prompt))
     if task == "modelling.reference.select":
-        return json.dumps({"choice": 0, "reason": "the crop shows the whole object", "background": "other"})
+        return json.dumps({"choice": 1, "reason": "the crop shows the whole object", "background": "other"})
     if task == "modelling.script":
         return "```python\n" + BUILD_SCRIPT + "```"
     if task == "layout.script":

@@ -274,6 +274,7 @@ def test_pipeline_builds_from_the_retopology_result(tmp_path, generating):
     after = pipeline._generate(asset, pipeline.item_for(asset))
     assert after.state is S.BUILDING and after.mesh_path == str(result_mesh) and agent.retopology_calls == 1
     assert after.extra["trellis"] == {"duration_s": 3.0, "retries": 1, "runs": 1}
+    assert after.extra["reference"] == asset.extra["reference"]
     assert after.extra["retopology"] == {
         "method": "triflow", "faces_in": 900, "faces_out": 400, "duration_s": 1.5, "device": "cpu", "fallback_reason": None,
     }
@@ -291,6 +292,7 @@ def test_pipeline_keeps_the_trellis_mesh_after_a_fallback(tmp_path, generating):
     after = pipeline._generate(asset, pipeline.item_for(asset))
     assert after.state is S.BUILDING and after.mesh_path == str(tmp_path / "trellis" / "wooden_crate.obj")
     assert after.extra["retopology"]["fallback_reason"] == "triflow: no GPU" and retopology_method(after) == "decimate"
+    assert after.extra["reference"] == asset.extra["reference"]
 
 
 def test_pipeline_fails_the_asset_like_a_trellis_failure(generating):

@@ -27,9 +27,16 @@ class SceneAgent:
             self._state.phases.reset(from_phase.and_later())
         try:
             for phase in self._phases:
-                if self._state.phases.status(phase.name) is PhaseStatus.DONE:
+                done = self._state.phases.status(phase.name) is PhaseStatus.DONE
+                if phase.name is PhaseName.ASSEMBLY:
+                    # Old checkpoints marked assembly done even when its scorecard failed. They
+                    # need final inspection, not a cached success without a publication decision.
+                    assembly = self._state.meta.get("assembly") or {}
+                    done = done and assembly.get("acceptance", {}).get("published", False)
+                if done:
                     continue
                 with context.bind(phase=phase.name.value, agent="scene_agent"), self._tracker.span(SpanKind.PHASE, phase.name.value):
+                    self._state.meta.set("run_finished_at", None)
                     self._state.phases.set_status(phase.name, PhaseStatus.RUNNING)
                     phase.run()
                     self._state.phases.set_status(phase.name, PhaseStatus.DONE)

@@ -23,6 +23,8 @@ runner = CliRunner()
 def workspace(tmp_path, monkeypatch):
     log = tmp_path / "omp_calls.jsonl"
     monkeypatch.setenv("FAKE_OMP_LOG", str(log))
+    # Reconstruction/reuse tests supply an explicit reference, independent of search heuristics.
+    monkeypatch.setenv("FAKE_OMP_REFERENCE", str(reference_image(tmp_path / "asset.png")))
     return tmp_path, write_test_config(tmp_path), log
 
 
@@ -68,7 +70,8 @@ def test_full_pipeline_then_reuse_from_the_backlot(workspace):
     assert assembly["scorecard"]["criteria"]["usd_material_fidelity"]["pass"] is True
 
     first_calls = {c["task"] for c in omp_calls(log)}
-    assert {"breakdown.analyze.image", "modelling.reference.select", "modelling.script", "layout.script"} <= first_calls
+    assert {"breakdown.analyze.image", "modelling.script", "layout.script"} <= first_calls
+    assert "modelling.reference.select" not in first_calls
 
     # A second run on a similar image reuses the approved assets instead of regenerating them.
     log.write_text("")
@@ -125,3 +128,23 @@ def test_resume_is_idempotent(workspace):
     assert result.exit_code == 0, result.output
     tasks = {c["task"] for c in omp_calls(log)}
     assert "modelling.script" not in tasks and "breakdown.analyze.image" not in tasks
+
+
+def test_unresolved_references_leave_placeholders_without_mesh_generation(workspace, monkeypatch):
+    tmp, config, log = workspace
+    monkeypatch.delenv("FAKE_OMP_REFERENCE")
+    output = tmp / "partial"
+    build(config, reference_image(tmp / "small-room.png"), output)
+    state = StateDB(output / "state.db")
+    try:
+        assets = state.assets.all()
+        assert {asset.id: asset.state.value for asset in assets} == {"wooden_crate": "skipped", "ceramic_mug": "skipped"}
+        assert all(asset.reference_path is None and asset.mesh_path is None for asset in assets)
+    finally:
+        state.close()
+    assert not list((output / "phases/02_modelling").glob("*/trellis"))
+    assert "modelling.script" not in {call["task"] for call in omp_calls(log)}
+    assembly = json.loads((output / "scene/assembly.json").read_text())
+    assert set(assembly["placeholders"]) == {"wooden_crate", "ceramic_mug"}
+    assert assembly["assets"] == {}
+    assert (output / "scene/scene.usd").is_file()

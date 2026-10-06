@@ -20,31 +20,43 @@ class Database:
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
         self._conn.row_factory = sqlite3.Row
         try:
-            self._conn.enable_load_extension(True)
-            sqlite_vec.load(self._conn)
-            self._conn.enable_load_extension(False)
-        except (AttributeError, sqlite3.OperationalError) as exc:
-            raise StateError(
-                f"Could not load sqlite-vec into SQLite {sqlite3.sqlite_version}: {exc}",
-                hint="Use a Python build whose sqlite3 module supports loadable extensions.",
-            ) from exc
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                self._conn.enable_load_extension(True)
+                sqlite_vec.load(self._conn)
+                self._conn.enable_load_extension(False)
+            except (AttributeError, sqlite3.OperationalError) as exc:
+                raise StateError(
+                    f"Could not load sqlite-vec into SQLite {sqlite3.sqlite_version}: {exc}",
+                    hint="Use a Python build whose sqlite3 module supports loadable extensions.",
+                ) from exc
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
+        """Serialize access; deferred transactions give readers a consistent WAL snapshot."""
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            nested = self._conn.in_transaction
+            begin = "BEGIN IMMEDIATE" if immediate else "BEGIN"
+            self._conn.execute("SAVEPOINT kitbash_nested" if nested else begin)
             try:
                 yield self._conn
+                self._conn.execute("RELEASE kitbash_nested" if nested else "COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    if nested:
+                        self._conn.execute("ROLLBACK TO kitbash_nested")
+                        self._conn.execute("RELEASE kitbash_nested")
+                    else:
+                        self._conn.execute("ROLLBACK")
                 raise
-            self._conn.execute("COMMIT")
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
