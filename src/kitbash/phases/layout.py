@@ -1,14 +1,11 @@
 """Phase 3: layout. Place the approved assets, set camera, lighting and world for the style, critique,
 then pass the gate."""
 
-import hashlib
 import shutil
-from collections.abc import Sequence
 
-from kitbash.agents.layout import LayoutAgent, PlacedAsset
+from kitbash.agents.layout import LayoutAgent
 from kitbash.analytics.tracker import Tracker
 from kitbash.critique.sessions import ResumableLoop
-from kitbash.domain.inventory import InventoryItem
 from kitbash.domain.phases import PhaseName
 from kitbash.interaction.protocols import GateAction, PhaseSummary, UserChannel
 from kitbash.paths import OutputLayout
@@ -17,7 +14,7 @@ from kitbash.phases.scene_assets import SceneCast
 from kitbash.store.state import RunMetaRepository
 from kitbash.ui.dashboard import Dashboard, PhaseProgress
 
-CAST_KEY = "layout_cast"
+DEPENDENCIES_KEY = "layout_dependencies"
 
 
 class LayoutPhase:
@@ -47,20 +44,21 @@ class LayoutPhase:
         inventory, placed, skipped = self._cast.load()
         subject = self._agent.subject(inventory, placed, skipped)
         rounds = GateRounds(self._state_meta, self.name)
-        cast = cast_fingerprint(placed, skipped)
-        fresh = self._state_meta.get(CAST_KEY) != cast  # the approved assets changed: write a new layout
-        if fresh:
+        dependencies = subject.dependency_fingerprint()
+        if self._state_meta.get(DEPENDENCIES_KEY) != dependencies:
             rounds.reset()
-            self._state_meta.set(CAST_KEY, cast)
+            self._state_meta.set(DEPENDENCIES_KEY, dependencies)
         while True:
             progress = PhaseProgress("Layout")
             with self._dashboard.showing(progress.view):
                 outcome = self._loop.run(
                     subject,
-                    request=rounds.request(prefix=f"cast-{cast}-"),
+                    request=rounds.request(prefix=f"layout-{dependencies}-"),
                     initial_script=lambda: self._agent.write_script(inventory, placed, skipped),
                     feedback=rounds.feedback,
-                    fresh=fresh and not rounds.rounds,
+                    # Round zero is fresh even after interruption between the dependency
+                    # checkpoint and session creation. Matching sessions still resume.
+                    fresh=not rounds.rounds,
                     observer=progress,
                 )
             shutil.copy2(outcome.best.script_path, self._layout.layout_script)
@@ -75,9 +73,3 @@ class LayoutPhase:
             if decision.action is GateAction.APPROVE:
                 return
             rounds.add(decision.feedback)
-
-
-def cast_fingerprint(placed: Sequence[PlacedAsset], skipped: Sequence[InventoryItem]) -> str:
-    """Identifies which assets the layout places and which items are placeholders."""
-    text = "|".join(sorted(f"{a.key}={a.backlot_id}" for a in placed)) + "#" + "|".join(sorted(i.id for i in skipped))
-    return hashlib.sha1(text.encode()).hexdigest()[:10]

@@ -224,6 +224,14 @@ User feedback starts a new session of up to `--max-cycles` more cycles. The feed
 highest-priority edit, and the session's result is never reverted to the result from before the
 feedback.
 
+Layout sessions are keyed on normalized scene/camera data, inventory instances (dimensions,
+positions, rotations, relationships and duplicate bindings), asset identities/specifications,
+placeholders, and the selected style's name, guidance and render engine. On entering layout,
+changed dependencies clear its gate feedback and start a fresh session; an interrupted old cycle
+is abandoned, and old results cannot serve as a fallback. Unchanged inputs resume without rewriting
+the script. Legacy cast-only session keys rebuild once. After editing upstream inputs in a completed
+workspace, use `kitbash resume --output <dir> --from-phase layout` to rebuild layout and assembly.
+
 The breakdown uses the same loop. Its "script" holds the inventory as data and builds a labelled
 blockout (one proxy box per item, seen through the estimated camera), so critics compare the blockout
 render with the reference.
