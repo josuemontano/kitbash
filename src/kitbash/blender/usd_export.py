@@ -168,23 +168,26 @@ for info in analysis.values():
 
 
 def split_shared_materials():
-    """Bake targets must map to one mesh: duplicate a baked material used by several meshes."""
+    """A baked material belongs to one object, even when placements share their mesh.
+
+    Do not infer object independence from node types: groups and coordinate inputs can hide it.
+    Object-linked slots isolate bake targets without copying geometry or changing other users.
+    """
     users = {}
     for obj in meshes:
-        for slot in obj.material_slots:
+        for index, slot in enumerate(obj.material_slots):
             if slot.material is not None:
-                users.setdefault(slot.material.name, []).append(obj)
+                users.setdefault(slot.material.name, {}).setdefault(obj, []).append(index)
     for name, info in list(analysis.items()):
-        datas = {o.data.name for o in users.get(name, [])}
-        if not info["bake_channels"] or len(datas) < 2:
+        if not info["bake_channels"]:
             continue
-        for mesh_name in sorted(datas)[1:]:
-            mesh = bpy.data.meshes[mesh_name]
+        for obj, indices in list(users.get(name, {}).items())[1:]:
             copy = bpy.data.materials[name].copy()
-            copy.name = f"{name}_{kb.part_name(mesh_name)}"  # no dots: USD prim names drop them
-            for index, slot_material in enumerate(mesh.materials):
-                if slot_material is not None and slot_material.name == name:
-                    mesh.materials[index] = copy
+            copy.name = f"{name}_{kb.part_name(obj.name)}"  # no dots: USD prim names drop them
+            for index in indices:
+                slot = obj.material_slots[index]
+                slot.link = "OBJECT"
+                slot.material = copy
             analysis[copy.name] = {**info, "baked": {}, "copy_of": name}
 
 

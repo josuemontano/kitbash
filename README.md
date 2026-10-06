@@ -425,6 +425,13 @@ Baking happens in a temporary copy, so the original `.blend` is never modified. 
 importer only reads UsdPreviewSurface, so by default (`usd.bake_preview_fallback = true`) MaterialX
 materials also get a baked preview-surface fallback for supported channels.
 
+Baked materials and their images are isolated per object, including placements sharing a mesh. The
+export copy uses object-level material slots so Object Info Color variation is not overwritten by
+another placement's bake; geometry stays shared and the source material assignments stay unchanged.
+This applies to every material that needs baking rather than trying to prove a shader independent of
+object state (which node groups can hide). Repeated procedural assets therefore use more bake images;
+materials needing no bake are not split. This does not certify every object-dependent shader.
+
 **Known preview loss is a failure**, not a successful round trip. Before importing or comparing renders,
 the fidelity checker rejects any material with `lost_in_preview` channels, naming the material and
 inputs in the error. This includes unsupported linked inputs such as transmission or subsurface,
@@ -592,6 +599,7 @@ headless Blender. They cover:
 - relative texture paths after an asset is copied into a scene;
 - distinct same-basename textures across asset, scene, and USD copies, including relocated linked libraries;
 - rejection of known lost preview channels before round-trip validation;
+- preservation of per-placement Object Info Color on shared meshes, including node groups and object-linked material slots;
 - scene and USD instance/placeholder counts, grounding, textures and active-camera preservation.
 
 ### Code map
