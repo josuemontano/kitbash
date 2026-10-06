@@ -12,6 +12,7 @@ expected = [max(float(v), 1e-4) for v in options["expected_dimensions"]]
 meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
 if not meshes:
     raise RuntimeError("The asset has no mesh objects")
+kb.validate_meshes(meshes)
 
 object_rx = kb.naming_regex("object")
 root = next((o for o in meshes if object_rx.match(o.name)), None) or max(meshes, key=lambda o: len(o.data.polygons))

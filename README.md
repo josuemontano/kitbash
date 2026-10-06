@@ -479,6 +479,16 @@ and `gamma` in `customLayerData.kitbash.view_settings`; Kitbash restores them fo
 Other USD viewers must select an equivalent display transform themselves. The comparison does not
 replace missing lighting with the source scene's lighting.
 
+Orthographic cameras are authored as standard `UsdGeomCamera` prims when Blender's exporter omits
+them ([Blender's documented camera limitation](https://docs.blender.org/manual/en/latest/files/import_export/usd.html#exporting-to-usd-files)).
+Projection, apertures, offsets, clipping and transforms use USD units and remain usable by standard
+USD consumers. The selected camera identity and source raster/pixel aspect are retained as application
+metadata; comparison renders preserve that aspect within the configured resolution budget.
+Blender 5.2's bare USD importer also misses the orthographic aperture tenth-unit conversion. Kitbash
+normalizes the scale of the already-imported camera from standard USD attributes; it never invents a
+missing camera or substitutes a perspective camera. Use Kitbash's round-trip renderer for matching
+Blender renders of the USD, or apply the equivalent unit correction when importing manually.
+
 ### Final acceptance
 
 Assembly inspects the **rebuilt, localized `scene.blend`**, not just its earlier layout preview, and
@@ -492,6 +502,10 @@ the object's own geometry and an imaginary floor at z=0 do not count. Inventory 
 instance count permits unsupported geometry; scene-authored exemption tags do not. Empty or invalid
 geometry still fails. Both Blender and USD inspections use that same policy.
 The USD comparison uses the selected scene camera, not whichever camera imports first.
+
+Asset saving, cached asset inspection and USD export reject malformed face indices and non-finite
+geometry without silently deleting faces. Fix the generating script and rework/reapprove the asset;
+importer repair can otherwise drop faces and shift material assignments while appearing to succeed.
 
 Automatic publication requires the final rubric to pass with every applicable criterion scored,
 and the structural checks above cannot be disabled by omitting them from a custom rubric. A failed

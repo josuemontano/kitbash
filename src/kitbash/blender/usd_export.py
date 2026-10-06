@@ -13,6 +13,7 @@ import bpy
 import kb_files
 import kb_materials as km
 import kb_render
+import kb_usd_cameras
 import kitbash_bpy as kb
 from pxr import Gf, Sdf, Usd, UsdLux, UsdShade
 
@@ -28,6 +29,11 @@ textures_dir = os.path.join(usd_dir, "textures")
 work_dir = os.path.abspath(options["work_dir"])
 include_scene = bool(options.get("scene", False))
 export_options = {p.identifier for p in bpy.ops.wm.usd_export.get_rna_type().properties}
+render = bpy.context.scene.render
+source_render_settings = {
+    name: getattr(render, name)
+    for name in ("resolution_x", "resolution_y", "pixel_aspect_x", "pixel_aspect_y")
+}
 materialx_supported = options.get("materialx", "auto") == "auto" and "generate_materialx_network" in export_options
 os.makedirs(work_dir, exist_ok=True)
 os.makedirs(textures_dir, exist_ok=True)
@@ -63,6 +69,7 @@ def localize_instances():
 
 
 localize_instances()
+kb.validate_meshes([obj for obj in bpy.context.scene.objects if obj.type == "MESH"])
 if include_scene:
     for obj in bpy.context.scene.objects:
         if obj.type == "CAMERA":
@@ -258,19 +265,26 @@ if any(info["bake_channels"] for info in analysis.values()):
         bake_channel(channel, targets)
 
 # -- 5. final export and USD authoring --------------------------------------------------------------
+# Baking uses a small square render; it must not change either camera projection.
+for name, value in source_render_settings.items():
+    setattr(render, name, value)
 export(output_usd, materialx_supported)
 stage = Usd.Stage.Open(output_usd)
 if include_scene:
+    kb_usd_cameras.author_orthographic_cameras(stage, bpy.context.scene)
     # USD does not standardize Blender's display transform; retain it as application metadata
     # so a round-trip compares the same view, rather than AgX defaults against a graded scene.
     scene = bpy.context.scene
     layer = stage.GetRootLayer()
     layer.customLayerData = {
         **layer.customLayerData,
-        "kitbash": {"view_settings": {
-            name: getattr(scene.view_settings, name)
-            for name in ("view_transform", "look", "exposure", "gamma")
-        }},
+        "kitbash": {
+            "render_settings": source_render_settings,
+            "view_settings": {
+                name: getattr(scene.view_settings, name)
+                for name in ("view_transform", "look", "exposure", "gamma")
+            },
+        },
     }
     # Blender's world exporter loses a Background's strength when exporting an environment
     # texture. Author the physical intensity on the dome, not a round-trip-only correction.

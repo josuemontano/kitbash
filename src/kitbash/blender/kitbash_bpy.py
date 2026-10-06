@@ -156,6 +156,55 @@ def dimensions(obj):
 # -- meshes ----------------------------------------------------------------------------------------
 
 
+def _validate_mesh_faces(mesh, object_name):
+    vertex_count, loop_count = len(mesh.vertices), len(mesh.loops)
+    errors = []
+    invalid_count = 0
+    for polygon in mesh.polygons:
+        start, count = polygon.loop_start, polygon.loop_total
+        if count < 3 or start < 0 or start + count > loop_count:
+            reason = f"invalid loop range ({start}, {count})"
+        else:
+            vertices = tuple(polygon.vertices)
+            if any(index < 0 or index >= vertex_count for index in vertices):
+                reason = f"out-of-range vertex indices {vertices} for {vertex_count} vertices"
+            elif len(set(vertices)) != count:
+                reason = f"repeated vertex indices {vertices}"
+            else:
+                continue
+        invalid_count += 1
+        if len(errors) < 8:
+            errors.append(f"face {polygon.index}: {reason}")
+    if errors:
+        raise ValueError(
+            f"Invalid face topology in mesh {mesh.name!r} on object {object_name!r} "
+            f"({invalid_count} invalid faces): {'; '.join(errors)}. "
+            "Rebuild the source faces with valid, distinct vertex indices; automatic repair would "
+            "discard geometry and can shift USD material assignments."
+        )
+
+
+@api
+def validate_meshes(objects):
+    """Reject malformed faces without repairing or deleting geometry, including evaluated modifiers.
+    Called before asset saving, inspection and USD export; fix the source face indices on failure."""
+    seen = set()
+    depsgraph = None
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        if obj.data not in seen:
+            _validate_mesh_faces(obj.data, obj.name)
+            seen.add(obj.data)
+        if obj.modifiers:
+            if depsgraph is None:
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+            mesh = obj.evaluated_get(depsgraph).data
+            if mesh not in seen:
+                _validate_mesh_faces(mesh, obj.name)
+                seen.add(mesh)
+
+
 @api
 def import_mesh(path=None, name=None, up_axis=None):
     """Import the Trellis mesh (GLB, OBJ, PLY, STL or FBX; default ``args()['mesh_path']``) as ONE mesh object.
@@ -597,7 +646,9 @@ def apply_naming(obj):
 @api
 def save_asset(obj):
     """Finish the asset: link ``obj`` into the asset collection, apply naming and parent other meshes to it.
-    Purge unused data and save ``args()['output_blend']`` with relative texture paths."""
+    Reject malformed mesh faces without repair, purge unused data and save
+    ``args()['output_blend']`` with relative texture paths."""
+    validate_meshes(bpy.data.objects)
     home = asset_collection()
     if obj.name not in home.objects:
         home.objects.link(obj)

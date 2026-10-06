@@ -112,7 +112,7 @@ class UsdFidelityChecker:
             usd_path, expected, mode="scene" if scene else "asset", output_dir=roundtrip_dir,
             prefix=f"{prefix}_usd", log_dir=log_dir, engine=engine, scene_expectations=scene_expectations,
         )
-        settings = {"resolution": toolkit.roundtrip_resolution, "samples": toolkit.roundtrip_samples}
+        settings = {"resolution": roundtrip.get("render_resolution", toolkit.roundtrip_resolution), "samples": toolkit.roundtrip_samples}
         if scene:
             originals = (
                 [toolkit.render_scene(blend, roundtrip_dir / f"{prefix}_blend_camera.png", log_dir, engine=engine, **settings)]

@@ -27,6 +27,8 @@ procedural nodes (noise, voronoi, wave, color ramp, bump) when appropriate for t
 Assign materials to the appropriate components or with `kb.assign(obj, mat, where=lambda c, n: ...)`
 using normalized face center `c` (0..1 on X, Y, Z) and world normal `n`. Every face needs a material.
 End with `kb.save_asset(obj)`. This same built asset is rendered, inspected, critiqued and exported to USD.
+Every polygon must reference at least three distinct, in-range vertex indices. Saving and export reject
+malformed faces; fix the source indexing rather than deleting faces or relying on importer repair.
 
 Keep it one straightforward top-level script (no argument parsing, no main guard), well commented,
 under about 200 lines.

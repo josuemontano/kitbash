@@ -10,6 +10,7 @@ import re
 import bpy
 import kb_materials as km
 import kb_render
+import kb_usd_cameras
 import kitbash_bpy as kb
 from kb_files import image_path
 from pxr import Usd
@@ -36,8 +37,20 @@ bpy.ops.wm.usd_import(**{k: v for k, v in wanted.items() if k in import_options}
 scene_expectations = options.get("scene_expectations")
 scene_inspection = {}
 if options["mode"] == "scene":
+    render = bpy.context.scene.render
     stage = Usd.Stage.Open(options["usd_path"])
-    view_settings = stage.GetRootLayer().customLayerData.get("kitbash", {}).get("view_settings", {})
+    metadata = stage.GetRootLayer().customLayerData.get("kitbash", {})
+    view_settings = metadata.get("view_settings", {})
+    render_settings = metadata.get("render_settings", {})
+    if render_settings:
+        # Preserve the source raster aspect within the requested comparison budget.
+        # Pixel aspect is separate: changing it would also change camera framing.
+        width, height = render_settings["resolution_x"], render_settings["resolution_y"]
+        scale = min(options["resolution"][0] / width, options["resolution"][1] / height)
+        options["resolution"] = [max(1, round(width * scale)), max(1, round(height * scale))]
+        render.pixel_aspect_x = render_settings["pixel_aspect_x"]
+        render.pixel_aspect_y = render_settings["pixel_aspect_y"]
+    kb_usd_cameras.normalize_imported_orthographic_scale(stage, bpy.context.scene)
     for name in ("view_transform", "look", "exposure", "gamma"):
         if name in view_settings:
             setattr(bpy.context.scene.view_settings, name, view_settings[name])
@@ -101,6 +114,7 @@ kb.emit(
         "materials_ok": sum(1 for m in materials_report.values() if m["found"] and m["principled"] and not m["missing_channels"]),
         "missing_textures": sorted(missing),
         "images": images,
+        "render_resolution": list(options["resolution"]),
         **scene_inspection,
     },
 )
