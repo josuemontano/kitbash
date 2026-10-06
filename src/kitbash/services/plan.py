@@ -44,7 +44,10 @@ class Planner:
         return self._config.models.model_for(role, phase)
 
     def _critics(self, phase: PhaseName) -> str:
-        return f"{self._model(Role.VISUAL_CRITIC, phase)} + {self._model(Role.TECHNICAL_CRITIC, phase)}"
+        return (
+            f"{self._config.evaluation.model}; on failure/uncertainty: "
+            f"{self._model(Role.VISUAL_CRITIC, phase)} + {self._model(Role.TECHNICAL_CRITIC, phase)}"
+        )
 
     def steps(self) -> list[PlanRow]:
         c = self._config.critic.max_cycles
@@ -60,16 +63,16 @@ class Planner:
             ]
         return [
             PlanRow("breakdown", f"analyze the {self._input.mode.value}", f"1 call to {self._model(analysis_role, B)}"),
-            PlanRow("breakdown", "critic loop (blockout render vs reference)", f"<= {c} cycles x (2 Blender runs, 2 critics: {self._critics(B)})"),
+            PlanRow("breakdown", "evaluation loop (blockout render vs reference)", f"<= {c} cycles x (2 Blender runs, {self._critics(B)})"),
             PlanRow("breakdown", "patches", f"<= {c - 1} calls to {self._model(Role.CODE, B)}"),
             PlanRow("breakdown", "backlot lookup, unrecognized items, user gate", "embedding search per item"),
             *reconstruction,
             PlanRow("modelling", "per asset: build script", f"1 call to {self._model(Role.CODE, M)}"),
-            PlanRow("modelling", "per asset: critic loop", f"<= {c} cycles x (7 Blender runs incl. USD export + round trip, 2 critics: {self._critics(M)})"),
+            PlanRow("modelling", "per asset: evaluation loop", f"<= {c} cycles x (7 Blender runs incl. USD export + round trip, {self._critics(M)})"),
             PlanRow("modelling", "per asset: patches", f"<= {c - 1} calls to {self._model(Role.CODE, M)}"),
-            PlanRow("modelling", "pipeline", f"{cfg.pipeline.threads} workers, review buffer {cfg.pipeline.review_buffer}, max LLM calls per asset {3 * c + 1}"),
+            PlanRow("modelling", "pipeline", f"{cfg.pipeline.threads} workers, review buffer {cfg.pipeline.review_buffer}; bounded evaluation, optional critics and patches"),
             PlanRow("layout", "layout script", f"1 call to {self._model(Role.CODE, L)}"),
-            PlanRow("layout", "critic loop", f"<= {c} cycles x (3 Blender runs, 2 critics: {self._critics(L)})"),
+            PlanRow("layout", "evaluation loop", f"<= {c} cycles x (3 Blender runs, {self._critics(L)})"),
             PlanRow("layout", "patches and user gate", f"<= {c - 1} calls to {self._model(Role.CODE, L)}"),
             PlanRow("assembly", "copy assets, rebuild scene, localize files", "2 Blender runs"),
             PlanRow("assembly", "final render", f"{cfg.blender.final_resolution[0]}x{cfg.blender.final_resolution[1]}, {cfg.blender.final_samples} samples"),
@@ -96,7 +99,9 @@ class Planner:
         return [("triflow weights", str(cfg.paths.triflow_weights), status)]
 
     def models(self) -> list[tuple[str, str, str]]:
-        return [(phase.value if phase else "all", role.value, model) for phase, role, model in self._config.models.all_assignments()]
+        return [
+            (phase.value if phase else "all", role.value, model) for phase, role, model in self._config.models.all_assignments()
+        ] + [("all", "evaluator", self._config.evaluation.model)]
 
     def paths(self) -> list[tuple[str, str, str]]:
         cfg = self._config

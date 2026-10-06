@@ -45,6 +45,7 @@ def write_test_config(tmp: Path, **sections: dict) -> Path:
         "tools": {"omp": str(fake_omp(tmp)), "blender": "blender", "trellis_python": sys.executable},
         "omp": {"timeout_s": 60, "retries": 0},
         "embedding": {"backend": "hashing", "dimensions": 64},
+        "evaluation": {"base_url": "http://kitbash-integration-clef.test"},
         "reference": {"providers": ["input_crop"]},
         "polyhaven": {"enabled": False},
         "trellis": {"timeout_s": 60, "retries": 2},

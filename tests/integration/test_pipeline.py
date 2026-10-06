@@ -193,7 +193,7 @@ def test_procedural_prompt_build_critique_export_and_resume(workspace, monkeypat
     calls = omp_calls(log)
     scripts = [call for call in calls if call["task"] == "modelling.script"]
     assert len(scripts) == 2 and all(not call["attachments"] for call in scripts)
-    assert any(call["task"].startswith("modelling.critic.") for call in calls)
+    assert not any(call["task"].startswith("modelling.critic.") for call in calls)  # Clef passes need no feedback.
     assert not any(call["task"].startswith("modelling.reference") for call in calls)
     assembly = json.loads((output / "scene/assembly.json").read_text())
     assert not assembly["placeholders"] and len(assembly["assets"]) == 2

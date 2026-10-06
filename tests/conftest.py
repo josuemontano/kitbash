@@ -1,6 +1,28 @@
+import json
+
+import httpx
 import pytest
 
 from kitbash.infra.embeddings import HashingEmbedder
+from tests.fakes.clef_flash import answer
+
+
+@pytest.fixture(autouse=True)
+def clef_api(monkeypatch):
+    """Only the explicit fake endpoint is intercepted; adapter tests use their own transport."""
+    requests = []
+    send = httpx.Client.send
+
+    def fake_send(client, request, **kwargs):
+        if request.url.host != "kitbash-integration-clef.test":
+            return send(client, request, **kwargs)
+        assert request.method == "POST" and request.url.path == "/v1/systemone"
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(200, json=answer(payload), request=request)
+
+    monkeypatch.setattr(httpx.Client, "send", fake_send)
+    return requests
 
 
 @pytest.fixture

@@ -30,6 +30,8 @@ image or prompt
 - Blender 4.2 or newer on `PATH` (developed against Blender 5.2.2). MaterialX export is detected at
   startup, never assumed.
 - `omp` on `PATH`, already configured with the models you use (kitbash never manages API keys).
+- [Ollama](https://ollama.com) 0.35.1 or newer, running locally with `ollama pull clef-flash` completed.
+  Clef-Flash handles bounded rubric decisions; `omp` remains the code writer and feedback critic.
 - For the default `modelling.method = "trellis"`: a [trellis-mac](https://github.com/shivampkumar/trellis-mac)
   checkout with its `.venv` set up and model weights downloaded. Procedural mode does not require Trellis or TriFlow.
 
@@ -98,7 +100,7 @@ reference search. Keep `method = "trellis"` (the default) for reference-driven r
 | `--review-buffer N` | 6 | max assets waiting for your review (backpressure) |
 | `--max-cycles N` | 4 | critic cycles per phase and per asset (and per round of feedback) |
 | `--retopology` | `triflow` | retopology method for the Trellis mesh: `triflow` or `decimate` (see below) |
-| `--rubric PATH` | packaged `rubric.md` | rubric the critics score against |
+| `--rubric PATH` | packaged `rubric.md` | canonical criteria and bounded scoring definitions |
 | `--config PATH` | packaged `config.toml` | config overriding the defaults |
 | `--model.<role>=<name>` | from config | model for a role in every phase |
 | `--model.<phase>.<role>=<name>` | from config | model for a role in one phase |
@@ -137,7 +139,10 @@ Main sections:
 - `[paths]`: `backlot` (default `~/.local/share/backlot`), `trellis`, `downloads` (reference and Poly Haven caches),
   `triflow_weights` (default `~/.cache/kitbash/triflow`).
 - `[tools]`: executables for `omp`, `blender`, and the Python that runs Trellis.
-- `[critic]`: cycles, pass threshold, stall detection, revert tolerance, patch attempts.
+- `[evaluation]`: local Clef-Flash `model`, Ollama `base_url` (default `http://localhost:11434`), and
+  `timeout_s` (120). Uses the documented System One HTTP API through the existing `httpx` dependency.
+- `[critic]`: cycles, normalized pass threshold, confidence threshold, stall detection, per-criterion
+  revert tolerance, and patch attempts. Critic model selection still uses `[models]`.
 - `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
   optional `vision_fallback`. Defaults: `input_crop`, `wikimedia`, `openverse`; no model search.
   Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
@@ -169,57 +174,86 @@ two errors are fatal and never retried. Any problem stops the run with a list of
 
 ## The rubric
 
-Critics score against [`rubric.md`](rubric.md), a Markdown table:
+[`src/kitbash/defaults/rubric.md`](src/kitbash/defaults/rubric.md) remains the canonical specification.
+Pass `--rubric` to use your own Markdown table; each run snapshots it unchanged.
 
 ```
-| criterion | weight | pass condition | applies to | critic |
+| criterion | weight | pass condition | applies to | critic | levels | threshold |
 ```
 
 - `applies to` lists phases (`breakdown, modelling, layout, assembly` or `all`).
-- `critic` (optional) is `visual`, `technical` or `both`.
-- Text in backticks inside the pass condition is a machine check over measured facts, for example
-  `` `usd_roundtrip_score >= 0.85 and missing_textures == 0` ``. When every fact it names was measured,
-  the check decides pass or fail. Otherwise the critics decide.
+- `critic` (optional) is `visual`, `technical` or `both`; it selects evidence requirements and feedback
+  reviewers, not separate model scores. Visual criteria require available rendered output, not just references.
+- Backtick expressions in the pass condition are machine checks over measured facts, for example
+  `` `usd_roundtrip_score >= 0.85 and missing_textures == 0` ``. When their inputs are available,
+  the measured result is authoritative and needs no model call.
+- Without `levels`, criteria are **binary**: Clef-Flash estimates the probability that the explicit
+  pass condition is met (`noul`), rather than inventing a subjective numeric scale.
+- Optional `levels` is a JSON object defining 2–26 ordered numeric values and their meanings.
+  Optional `threshold` is a minimum score on that raw scale (0–1 for binary criteria).
 
-With `critic.require_all_pass = true`, every applicable criterion must have an affirmative assessment:
-missing evidence is **unassessed**, not an implicit pass or an invented failure. A criterion assigned
-to `both` critics needs evidence from both to pass, unless a measured machine check decides it. A
-known negative assessment still makes the criterion failed even if the other critic is unavailable.
-Threshold-only scoring (`require_all_pass = false`) retains its configured behavior, but never
-relabels an unassessed criterion as passed. Final assembly always requires all criteria to pass.
+For example, an ordinal criterion can be added without coupling the rubric to a provider:
 
-Critic responses must cover every criterion assigned to that role and phase. Omitted criteria use
-the existing response-repair path; unavailable evidence must be represented with `score: null`,
-`pass: null`, and an explanatory `notes` value. A visual critic with no available render marks each
-of its criteria unassessed without asking the model to guess. Scorecard JSON exposes each criterion's
-`status` (`passed`, `failed`, or `unassessed`); terminal tables use the same labels. Unknown verdicts
-remain `pass: null`, distinct from evidenced failures (`pass: false`), across saved scorecards.
+```markdown
+| criterion | weight | pass condition | applies to | critic | levels | threshold |
+|---|---|---|---|---|---|---|
+| Shape | 3 | Preserve the reference silhouette | modelling | visual | {"1":"unrecognizable", "2":"major shape errors", "3":"recognizable with noticeable errors", "4":"strong match", "5":"excellent match"} | 3 |
+```
 
-Editing the file changes critic prompts, scoring and pass or fail decisions, with no code changes.
+Clef-Flash receives these explicit meanings as ordered `score` criteria. Its probability-weighted
+zero-based output is mapped back to the rubric's raw values, including nonuniform scales. The
+scorecard retains `raw_score`; `score` and the weighted `overall` stay normalized to 0–1 for existing
+consumers: `(raw - minimum) / (maximum - minimum)`. Without a criterion threshold, the global
+`critic.pass_threshold` is mapped onto the raw scale. The global aggregate threshold still applies.
+
+Kitbash—not Clef-Flash—decides pass/fail. `critic.require_all_pass = true` requires every applicable
+criterion to pass. Lenient aggregate scoring can tolerate known failures, but **never uncertainty**.
+Missing/invalid responses, missing evidence, provider errors, or confidence below
+`critic.confidence_threshold` (default 0.7) prevent automatic completion and escalate to the critic.
+Scorecard `status` is `pass`, `fail`, or `uncertain`; criterion `status` remains `passed`, `failed`, or
+`unassessed`, with `pass: null` for unknown verdicts. Low-confidence numeric scores remain visible.
+
+Confidence measures distribution concentration, **not calibrated correctness**. Ordinal confidence
+comes from the API; binary confidence is derived as `1 - entropy(p) / ln(2)` from the returned yes/no
+probability. Both probabilities and confidence are retained at full precision in checkpoints.
+
+The adapter uses Ollama's documented [`POST /v1/systemone`](https://docs.ollama.com/api/systemone),
+not a chat-completion prompt or invented SDK method. Existing renders, references, comparison images,
+facts, reports, script, task context, feedback and previous results form the evaluation state. Questions
+are batched at 64; body limits are 64 KiB without images and 32 MiB with images. Oversized evidence
+fails explicitly instead of being silently truncated. Direct video input is not supported by this API;
+existing preview images and structured animation metadata can be evidence.
+
 Facts available to checks include `scale_error`, `origin_offset_m`, `up_axis_ok`, `naming_violations`,
 `non_principled_materials`, `missing_textures`, `usd_roundtrip_score`, `usd_broken_materials`,
 `missing_assets`, `unexpected_assets`, `missing_placeholders`, `unexpected_placeholders`,
-`floating_assets`, `has_camera`, `items` and `unrecognized_items`. Final USD scene inspection supplies
-the corresponding `usd_`-prefixed instance, placeholder, grounding and camera facts.
+`floating_assets`, `has_camera`, `items` and `unrecognized_items`. Final assembly remains a strict,
+measured publication gate; its custom criteria need machine checks, not a new model call.
 
 ## How it works
 
 ### Critic loop (breakdown, modelling per asset, layout)
 
-Each cycle evaluates a script in headless Blender, then runs two critics in parallel:
+Each cycle runs the existing Blender rendering/inspection pipeline, seals its evidence, then evaluates
+the rubric with `ClefFlashEvaluator`. Application-owned thresholds classify the structured scorecard:
 
-- the **visual critic** sees the renders and the references;
-- the **technical critic** sees the script, the inspection report (names, dimensions, origin, node
-  graphs, texture paths) and the USD round-trip results.
+```
+generate → render/inspect → bounded scores → thresholds
+                                      ├─ pass → finish
+                                      └─ fail/uncertain → critic → patch → re-evaluate
+```
 
-Each critic returns rubric scores and a structured list of edits. The **code role** turns those edits
-into a **unified diff** against the latest kept script. All Python is written by the code role. Every
-cycle is stored in `cycles/NN/` as `script.py`, `diff.patch`, `critique.json` and `report.json`.
+Clean passes skip generative critics. On failure, uncertainty, regression or invalid artifacts, the
+existing **visual critic** sees renders/references and the **technical critic** sees the script,
+inspection report and USD results. Both receive the structured scorecard and return explanations and
+actionable edits only; they cannot replace scores or override thresholds. The **code role** turns
+those edits into a **unified diff** against the latest kept script. Every cycle is stored in
+`cycles/NN/` as `script.py`, `diff.patch`, `critique.json` and `report.json`, plus SQLite cycle metadata.
 
-Only kept cycles with successful evaluation, a score and verdict for every applicable criterion, and
-all required artifact files are eligible to return. Breakdown requires inventory, blend and render;
-modelling requires blend, USD and preview; layout requires blend and render. Passing cycles outrank
-non-passing cycles, regardless of score. `passed` always describes the cycle actually returned.
+Only kept cycles with successful evaluation, a score and verdict for every applicable criterion, no
+criterion regression, and all required artifact files are eligible to return. Breakdown requires
+inventory, blend and render; modelling requires blend, USD and preview; layout requires blend and
+render. Passing cycles outrank non-passing cycles. `passed` describes the cycle actually returned.
 If no eligible result exists, the loop reports an error instead of returning a broken build.
 
 Resume recognizes a checkpointed pass even if interruption happened before the session was marked
@@ -233,11 +267,13 @@ its ownership evidence. Published backlots remain relocatable.
 
 The loop never repeats itself:
 
-- A patch that breaks an eligible build or drops its score beyond `revert_epsilon` is **reverted**.
-  A passing patch is kept even if its score is below a non-passing parent's. The next patch starts
-  from the latest kept script, including a failed initial script that still needs repair.
+- A patch that breaks an eligible build or drops **any normalized criterion** beyond
+  `critic.revert_epsilon` is **reverted**, even if its overall score rises. Losing a known pass also
+  counts as regression. Deltas from uncertain prior scores remain visible without treating them as
+  reliable regressions. The next patch starts from the latest kept script.
 - Patches that do not apply are **rejected**, and the reason goes back to the code writer.
-- The full diff history, with each status, goes into every prompt.
+- Full diff history and per-criterion scores, deltas and regression flags—including reverted cycles—
+  reach the evaluator, critics and patch writer after resume. Reverted gains do not reset stall detection.
 - The loop stops early when a new diff repeats an earlier one, or when the best score has not
   improved for 2 cycles. It also stops after `--max-cycles`. It then escalates to you.
 
@@ -608,6 +644,12 @@ these down per step, agent, model, role, asset and phase. They also report:
 - a **per-asset timeline** (ASCII Gantt) marking when you reviewed each asset, and a **review overlap**
   table measuring how much generation and critique ran for other assets while you reviewed one.
 
+`clef_flash` spans record evaluation latency and actual token usage; monetary cost is `null` because
+the local System One API does not report it. Machine-only evaluation is a step, not an invented LLM
+call. `critic_cycle` events include evaluation id, iteration, per-criterion raw/normalized score,
+probabilities, confidence, threshold, verdict, delta, regression and escalation reasons. Image bodies,
+scripts and credentials are not copied into these events; detailed evidence stays in cycle reports.
+
 A summary table is printed at the end of every run.
 
 ## Development
@@ -619,8 +661,11 @@ poetry run ruff check src tests
 ```
 
 The integration tests use a fake `omp` (`tests/fakes/fake_omp.py`, which answers each prompt by its
-`<!-- kitbash-task -->` marker) and a fake Trellis (`tests/fakes/trellis/generate.py`), with real
-headless Blender. They cover:
+`<!-- kitbash-task -->` marker), a fake Trellis (`tests/fakes/trellis/generate.py`), and a mocked
+System One HTTP boundary, with real headless Blender. No evaluation test requires a live model.
+`tests/fixtures/clef_crate.json` replays the existing crate case through failure, critic feedback,
+patching, pass, checkpoint restoration and resume; adapter tests use `httpx.MockTransport`.
+Coverage also includes:
 
 - the full pipeline, then backlot reuse on a similar image;
 - generation continuing during review;
@@ -631,6 +676,8 @@ headless Blender. They cover:
 - rejection of known lost preview channels before round-trip validation;
 - preservation of per-placement Object Info Color on shared meshes, including node groups and object-linked material slots;
 - scene and USD instance/placeholder counts, grounding, textures and active-camera preservation.
+- bounded binary/ordinal conversion, explicit level meanings, invalid/missing responses, confidence
+  thresholds, per-criterion failures, regressions despite rising totals, and conditional critic escalation.
 
 ### Code map
 
@@ -638,15 +685,15 @@ headless Blender. They cover:
 src/kitbash/
   cli.py, app.py            command line; composition root (all wiring happens in app.py)
   config.py, paths.py       configuration; deterministic output layout
-  domain/                   inventory, asset state machine, rubric, critiques, phases, roles
+  domain/                   inventory, asset state machine, rubric, bounded decisions, scorecards, feedback
   agents/                   scene (orchestrator), breakdown, modelling, layout agents
   phases/                   one class per phase: gates, persistence, coordination
   pipeline/                 asset board, scheduler (backpressure), review queue, workers, per-asset steps
-  critique/                 critic loop, resumable sessions, critics, patch writer, diff history
+  critique/                 evaluator, critic loop, resumable sessions, feedback critics, patches, history
   llm/                      provider-neutral client types, prompt library, typed calls, parsing
   retopology/               retopology methods behind one protocol: decimate (pass-through) and triflow
                             (vendored TriFlow: sparse/ pure-torch backend, models/, geometry/, engine, weights)
-  infra/                    omp, Blender runner, Trellis, image search, Poly Haven, imaging, patching, embeddings
+  infra/                    Clef-Flash HTTP adapter, omp, Blender, Trellis, image search, imaging, embeddings
   services/                 Blender toolkit, USD fidelity checker, reference finder, preflight, dry-run plan
   store/, backlot/          scene state DB, sqlite-vec index, asset library
   analytics/                spans and events, report builder

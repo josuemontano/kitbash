@@ -1,4 +1,4 @@
-"""Critic output and aggregated scores."""
+"""Critic feedback and application-owned rubric decisions."""
 
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
@@ -10,14 +10,6 @@ from attrs import field, frozen
 class CriticKind(StrEnum):
     VISUAL = "visual"
     TECHNICAL = "technical"
-
-
-@frozen
-class CriterionScore:
-    criterion_id: str
-    score: float | None
-    passed: bool | None
-    notes: str = ""
 
 
 @frozen
@@ -44,28 +36,19 @@ class Edit:
 class Critique:
     critic: str
     summary: str
-    scores: tuple[CriterionScore, ...] = ()
     edits: tuple[Edit, ...] = ()
     model: str = ""
-
-    def score_for(self, criterion_id: str) -> CriterionScore | None:
-        return next((s for s in self.scores if s.criterion_id == criterion_id), None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "critic": self.critic,
             "model": self.model,
             "summary": self.summary,
-            "scores": {s.criterion_id: {"score": s.score, "pass": s.passed, "notes": s.notes} for s in self.scores},
             "edits": [e.to_dict() for e in self.edits],
         }
 
     @classmethod
     def parse(cls, critic: str, data: Mapping[str, Any], *, model: str = "") -> Critique:
-        raw_scores = data.get("scores") or {}
-        if isinstance(raw_scores, list):
-            raw_scores = {str(s.get("criterion") or s.get("id")): s for s in raw_scores if isinstance(s, Mapping)}
-        scores = tuple(_parse_score(cid, value) for cid, value in raw_scores.items())
         edits = tuple(
             Edit(
                 instruction=str(e.get("instruction") or e.get("change") or e.get("fix") or ""),
@@ -77,32 +60,7 @@ class Critique:
             for e in data.get("edits") or []
             if isinstance(e, Mapping) and (e.get("instruction") or e.get("change") or e.get("fix"))
         )
-        return cls(critic=critic, summary=str(data.get("summary", "")), scores=scores, edits=edits, model=model)
-
-
-def _parse_score(criterion_id: str, value: Any) -> CriterionScore:
-    if isinstance(value, Mapping):
-        score, passed, notes = value.get("score"), value.get("pass", value.get("passed")), str(value.get("notes", ""))
-    else:
-        score, passed, notes = value, None, ""
-    return CriterionScore(
-        criterion_id=criterion_id,
-        score=_unit_score(score),
-        passed=passed if isinstance(passed, bool) else None,
-        notes=notes,
-    )
-
-
-def _unit_score(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number > 1.0:  # tolerate 0-10 or 0-100 scales
-        number = number / 10.0 if number <= 10.0 else number / 100.0
-    return min(max(number, 0.0), 1.0)
+        return cls(critic=critic, summary=str(data.get("summary", "")), edits=edits, model=model)
 
 
 @frozen
@@ -113,7 +71,13 @@ class CardEntry:
     score: float | None
     passed: bool | None
     notes: tuple[str, ...] = ()
-    decided_by: str = ""  # "check", "critics" or "" when unscored
+    decided_by: str = ""
+    raw_score: float | None = None
+    confidence: float | None = None
+    probabilities: Mapping[str, float] = field(factory=dict)
+    threshold: float | None = None
+    delta: float | None = None
+    regressed: bool = False
 
     @property
     def status(self) -> str:
@@ -130,6 +94,17 @@ class ScoreCard:
     threshold: float
     facts: Mapping[str, Any] = field(factory=dict)
 
+    @property
+    def status(self) -> str:
+        if self.regressions():
+            return "fail"
+        if self.unassessed():
+            return "uncertain"
+        return "pass" if self.passed else "fail"
+
+    def regressions(self) -> Sequence[CardEntry]:
+        return [e for e in self.entries if e.regressed]
+
     def failing(self) -> Sequence[CardEntry]:
         return [e for e in self.entries if e.passed is False]
 
@@ -138,14 +113,21 @@ class ScoreCard:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "overall": round(self.overall, 4),
+            "overall": self.overall,
             "passed": self.passed,
+            "status": self.status,
             "threshold": self.threshold,
             "criteria": {
                 e.criterion_id: {
                     "name": e.name,
                     "weight": e.weight,
-                    "score": None if e.score is None else round(e.score, 4),
+                    "score": e.score,
+                    "raw_score": e.raw_score,
+                    "confidence": e.confidence,
+                    "probabilities": dict(e.probabilities),
+                    "threshold": e.threshold,
+                    "delta": e.delta,
+                    "regressed": e.regressed,
                     "pass": e.passed,
                     "status": e.status,
                     "decided_by": e.decided_by,
@@ -167,6 +149,12 @@ def scorecard_from_dict(data: Mapping[str, Any]) -> ScoreCard:
             passed=item.get("pass"),
             notes=tuple(item.get("notes", ())),
             decided_by=str(item.get("decided_by", "")),
+            raw_score=item.get("raw_score"),
+            confidence=item.get("confidence"),
+            probabilities=dict(item.get("probabilities", {})),
+            threshold=item.get("threshold"),
+            delta=item.get("delta"),
+            regressed=bool(item.get("regressed", False)),
         )
         for cid, item in (data.get("criteria") or {}).items()
     )
