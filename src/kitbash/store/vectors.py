@@ -37,7 +37,7 @@ class VectorIndex:
                 "CREATE TABLE IF NOT EXISTS vector_meta (table_name TEXT PRIMARY KEY, dimensions INTEGER, embedder TEXT)"
             )
             row = self._db.one("SELECT dimensions, embedder FROM vector_meta WHERE table_name = ?", (self._table,))
-            if row is None:
+            if row is None and self._db.one("SELECT 1 FROM sqlite_master WHERE name = ?", (self._table,)) is None:
                 self._create()
             elif not rebuild:
                 self._check_identity()
@@ -55,11 +55,13 @@ class VectorIndex:
         self._db.execute(f"DELETE FROM {self._table} WHERE rowid = ?", (rowid,))
 
     def clear(self) -> None:
-        self._db.execute(f"DELETE FROM {self._table}")
+        with self._db.transaction():
+            self._check_identity()
+            self._db.execute(f"DELETE FROM {self._table}")
 
     def nearest(self, vector: Sequence[float], k: int) -> list[Neighbour]:
         self._check(vector)
-        with self._db.transaction():
+        with self._db.transaction(immediate=False):
             self._check_identity()
             rows = self._db.query(
                 f"SELECT rowid, distance FROM {self._table} WHERE embedding MATCH ? AND k = ? ORDER BY distance",

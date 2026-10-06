@@ -336,16 +336,20 @@ or unmeasured final criterion blocks automatic acceptance. Final assembly has no
 LLM critic call: custom assembly criteria need measured machine checks to pass automatically.
 
 With `--no-interactive`, failed final acceptance exits nonzero and does not mark assembly complete.
-Files remain available for diagnosis; their presence is **not** proof that the run passed. Interactive
-runs show the failures and default to quitting. Only an explicit `p` choice can **publish degraded**;
-ordinary approval is not an override. Both `.blend` and USD outputs must exist for this option.
+Completed rejected outputs remain in `phases/04_assembly/rejected/` for diagnosis, including when the
+user quits the acceptance gate. They never replace `scene/`. Interactive runs show the failures and
+default to quitting. Only an explicit `p` choice can **publish degraded**; ordinary approval is not an
+override. Both `.blend` and USD outputs must be nonempty, as must any rendered final frame. A scene
+without a usable camera can only be published without a render by this explicit degraded override.
 
-`scene/assembly.json`, state metadata and analytics record `acceptance.status` (`pending`, `passed`,
+The current attempt's state metadata and analytics record `acceptance.status` (`pending`, `passed`,
 `failed` or `overridden`), `automatic_pass`, `published` and failure details. A human override records
 `status = "overridden"`, `automatic_pass = false` and the still-failing scorecard; terminal output also
-labels it degraded. Rebuilds clear previous acceptance before work starts, so a failed or interrupted
-rerun cannot retain an earlier automatic pass. Fix the scene and use `resume --from-phase layout`,
-or resume interactively to explicitly publish the degraded output.
+labels it degraded. Rebuilds clear the current attempt's acceptance before work starts, so a failed or
+interrupted rerun cannot retain an earlier automatic pass. The previous published scene and its
+`scene/assembly.json` remain unchanged; SQLite's `published_assembly` metadata tracks that publication
+separately from the latest `assembly` attempt. Fix the scene and use `resume --from-phase layout`, or
+resume interactively to explicitly publish a degraded output.
 
 ### Performance
 
@@ -364,13 +368,19 @@ preview and `metadata.json`.
 
 New bundles are copied into hidden `.staging/` directories first. Asset metadata and vectors commit
 together with a pending publication status; only a complete bundle renamed into `assets/` becomes
-available to get/list/search. Opening the library reconciles committed pending bundles and removes
-abandoned staging. Publication and recovery share an OS-owned lock so recovery cannot remove a live
-writer's files.
+available to get/list/search. Required blend, USD and preview files must be nonempty and contained in
+the bundle. Opening the library reconciles committed pending bundles, validates migrated legacy
+entries, and removes incomplete publications, abandoned staging and directories left by interrupted
+deletions. Publication and recovery share an OS-owned lock so recovery cannot remove a live writer's
+files.
 
 Vector reuse requires the same embedding model identity **and** dimensions. After changing the
 backlot's model, run `kitbash library reindex`; the old index remains intact if rebuilding fails.
 Existing scene state also requires its original embedding backend (or a new output directory).
+
+Search reads vectors, model identity and asset metadata from one SQLite snapshot, including during
+concurrent publication or reindexing. Scene inventory rows, scene metadata and vectors are replaced
+in one transaction; failed or interrupted embedding/index writes preserve the previous inventory.
 
 Scenes copy the asset folders they use into `scene/assets/`, so the export is self-contained and every
 texture path stays relative and valid. External files such as HDRIs are copied into `scene/textures/`.
@@ -385,17 +395,20 @@ texture path stays relative and valid. External files such as HDRIs are copied i
     01_breakdown/  inventory.json  cycles/NN/{script.py, diff.patch, critique.json, report.json}  renders/
     02_modelling/<asset_id>/  reference/  trellis/  script.py  cycles/NN/...  previews/  usd_roundtrip/
     03_layout/     script.py  cycles/NN/...  renders/
+    04_assembly/   rejected/ (last rejected scene and its assembly.json, if any)
   scene/  scene.blend  scene.usd  textures/  assets/  renders/  assembly.json
   analytics/  analytics.json  analytics.md
   logs/  kitbash.log  llm/ (every prompt and answer)  *.log (every subprocess)
 ```
 
-`scene/` is published only after assembly, round-trip validation, and the assembly rubric pass, with
-nonempty blend, USD and render files. Assembly builds in `.scene-staging/` and renames the validated
-directory into place; a failed rebuild leaves the previous published scene unchanged. Resume removes
-interrupted staging, recovers `.scene-previous/` if replacement stopped between renames, and reconciles
-SQLite assembly metadata from the published `assembly.json`. Blender library/texture paths stay
-relative, and generated JSON reports use final paths rather than staging paths.
+Assembly builds in `.scene-staging/`. Only a validated or explicitly accepted degraded result is
+renamed into `scene/`; failed or interrupted rebuilds leave the previous published scene unchanged.
+Resume removes incomplete staging, recovers `.scene-previous/` if replacement stopped between
+renames, and reconciles published SQLite metadata from `scene/assembly.json`, including a first
+publication interrupted before the SQLite write. Blender library/texture paths stay relative, and
+generated JSON reports point to their final or rejected location rather than staging paths.
+
+Recovery covers process interruption and crashes; it is not a power-loss durability guarantee.
 
 ## Analytics
 

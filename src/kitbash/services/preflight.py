@@ -2,7 +2,7 @@
 
 import shutil
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from attrs import frozen
@@ -55,7 +55,12 @@ def ping_models(config: Config, omp: str, models: Mapping[str, Role], log_dir: P
     registry = current_registry()
     with registry.bind(), ThreadPoolExecutor(max_workers=max(1, len(models))) as pool:
         try:
-            answers = [a for a in pool.map(context.propagate(lambda pair: ping(*pair)), models.items()) if a]
+            registry.check_cancelled()
+            futures = [pool.submit(context.propagate(ping), model, role) for model, role in models.items()]
+            for future in as_completed(futures):
+                future.result()
+            answers = [answer for future in futures if (answer := future.result()) is not None]
+            registry.check_cancelled()
         except BaseException:
             with defer_interrupts():
                 registry.terminate_all()

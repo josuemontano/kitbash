@@ -8,7 +8,7 @@ import time
 import pytest
 
 from kitbash.infra import process as processes
-from kitbash.infra.process import ProcessCancelled, ProcessRegistry, run_process
+from kitbash.infra.process import ProcessCancelled, ProcessRegistry, current_registry, run_process
 from tests.helpers import process_gone as gone
 from tests.helpers import wait_for
 
@@ -28,6 +28,14 @@ def test_ctrl_c_reaps_child_and_preserves_interrupt(tmp_path, repeat_interrupt):
         + repr(child_code)
         + f"], timeout_s=90, log_path=__import__('pathlib').Path({str(tmp_path / 'child.log')!r}))\n"
         "except KeyboardInterrupt:\n"
+        "    import os\n"
+        f"    child_pid = int(__import__('pathlib').Path({str(pid_path)!r}).read_text())\n"
+        "    try:\n"
+        "        os.waitpid(child_pid, os.WNOHANG)\n"
+        "    except ChildProcessError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        raise AssertionError('direct child was not reaped')\n"
         "    print('original KeyboardInterrupt', flush=True)\n"
         "    raise SystemExit(130)\n"
     )
@@ -208,3 +216,68 @@ def test_interrupt_during_parallel_preflight_reaps_all_pings(tmp_path):
         for path in markers:
             if path.exists() and path.stat().st_size and not gone(int(path.read_text())):
                 os.killpg(int(path.read_text()), signal.SIGKILL)
+
+
+def test_last_preflight_task_cancellation_cannot_report_success(tmp_path, monkeypatch):
+    from kitbash.config import load_config
+    from kitbash.domain.roles import Role
+    from kitbash.services.preflight import OmpClient, ping_models
+
+    def cancel(self, request):
+        current_registry().terminate_all()
+
+    monkeypatch.setattr(OmpClient, "complete", cancel)
+    with pytest.raises(ProcessCancelled):
+        ping_models(load_config(None), "unused", {"last": Role.CODE}, tmp_path)
+
+
+def test_cancelled_preflight_does_not_start_another_model_request(tmp_path, monkeypatch):
+    from kitbash.config import load_config
+    from kitbash.domain.roles import Role
+    from kitbash.services.preflight import OmpClient, ping_models
+
+    def unexpected_request(self, request):
+        pytest.fail("cancelled preflight invoked the model")
+
+    monkeypatch.setattr(OmpClient, "complete", unexpected_request)
+    owner = ProcessRegistry()
+    owner.terminate_all()
+    with owner.bind(), pytest.raises(ProcessCancelled):
+        ping_models(load_config(None), "unused", {"never": Role.CODE}, tmp_path)
+
+
+def test_preflight_fatal_cancels_earlier_ping_without_masking_original(tmp_path, monkeypatch):
+    from kitbash.config import load_config
+    from kitbash.domain.roles import Role
+    from kitbash.services.preflight import OmpClient, ping_models
+
+    pid_path = tmp_path / "running-ping"
+    registry = ProcessRegistry()
+    original = FileNotFoundError("configured model executable disappeared")
+    # Bound the broken implementation: ordered map masks the completed failure with cancellation.
+    watchdog = threading.Timer(5, registry.terminate_all)
+
+    def complete(self, request):
+        if request.model == "running":
+            run_process([
+                sys.executable, "-c",
+                f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)",
+            ], timeout_s=90)
+        else:
+            wait_for(lambda: pid_path.exists() and pid_path.stat().st_size)
+            watchdog.start()
+            raise original
+
+    monkeypatch.setattr(OmpClient, "complete", complete)
+    try:
+        with registry.bind(), pytest.raises(FileNotFoundError) as caught:
+            ping_models(load_config(None), "unused", {"running": Role.CODE, "broken": Role.CODE}, tmp_path)
+        assert caught.value is original
+        assert gone(int(pid_path.read_text()))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(int(pid_path.read_text()), os.WNOHANG)
+    finally:
+        watchdog.cancel()
+        if watchdog.ident is not None:
+            watchdog.join()
+        registry.terminate_all()

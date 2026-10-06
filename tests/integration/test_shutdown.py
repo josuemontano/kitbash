@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import sqlite3
 import sys
 import threading
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 from rich.console import Console
 
 from kitbash.app import Application, create_workspace
+from kitbash.critique.loop import CriticLoop
 from kitbash.domain.assets import AssetRecord, AssetState
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import LLMAccessError
@@ -132,7 +134,7 @@ def test_modelling_joins_children_before_application_teardown(tmp_path, monkeypa
         expected = sorted(set(assets) - {"fatal"})
         assert sorted(asset for asset, _ in unwound) == expected
         assert all(not was_closed for _, was_closed in unwound)
-        assert all(observation == {"workers": [], "pids_gone": True, "unwound": expected} for observation in close_observations)
+        assert close_observations == [{"workers": [], "pids_gone": True, "unwound": expected}] * 3
         assert invocations.read_text().splitlines() == ["started"]  # no Trellis retry or launch from its waiting slot
         resumed = StateDB(layout.state_db)
         try:
@@ -149,3 +151,95 @@ def test_modelling_joins_children_before_application_teardown(tmp_path, monkeypa
         for thread in threading.enumerate():
             if thread.name.startswith("worker-"):
                 thread.join(10)
+
+
+@pytest.mark.parametrize("unwinding", [False, True], ids=["successful-run", "fatal-run"])
+def test_interrupt_during_application_close_finishes_resource_teardown(tmp_path, monkeypatch, unwinding):
+    config_path = write_test_config(tmp_path)
+    config, layout, run_input = create_workspace(tmp_path / "out", RunInput.create(None, "close probe"), config_path, None, {})
+    application = Application(config, layout, run_input, interactive=False, console=Console(quiet=True))
+    original = LLMAccessError("original provider refusal")
+    close_http = application._http.close
+
+    def interrupted_close():
+        os.kill(os.getpid(), signal.SIGINT)
+        close_http()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(application._http, "close", interrupted_close)
+            with pytest.raises(LLMAccessError if unwinding else KeyboardInterrupt) as caught:
+                try:
+                    if unwinding:
+                        raise original
+                finally:
+                    application.close()
+        if unwinding:
+            assert caught.value is original
+        assert application._http.is_closed
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            application.state.meta.get("phase")
+    finally:
+        application.close()
+
+
+def test_simultaneous_worker_fatals_join_nested_critics_before_close(tmp_path):
+    config_path = write_test_config(tmp_path, pipeline={"threads": 3, "review_buffer": 3})
+    config, layout, run_input = create_workspace(tmp_path / "out", RunInput.create(None, "nested shutdown"), config_path, None, {})
+    application = Application(config, layout, run_input, interactive=False, console=Console(quiet=True))
+    board = AssetBoard(application.state.assets)
+    board.ensure(AssetRecord(id=name, name=name, state=AssetState.GENERATING) for name in ("active", "fatal1", "fatal2"))
+    pid_path = tmp_path / "nested-critic"
+    fatal_barrier = threading.Barrier(2)
+    originals = [LLMAccessError("first provider failure"), LLMAccessError("second provider failure")]
+    unwound = []
+
+    class RunningCritic:
+        def review(self, request):
+            try:
+                run_process([
+                    sys.executable, "-c",
+                    f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)",
+                ], timeout_s=90)
+            finally:
+                assert not application._http.is_closed
+                application.state.meta.set("nested_critic_unwound", True)
+                unwound.append("critic")
+
+    loop = CriticLoop(
+        critics=(RunningCritic(),), patch_writer=None, rubric=None, config=config.critic, store=None, tracker=application.tracker,
+    )
+
+    def advance(asset_id):
+        try:
+            if asset_id == "active":
+                loop._review(None)
+                pytest.fail("cancelled nested critic returned a result")
+            wait_for(lambda: pid_path.exists() and pid_path.stat().st_size)
+            fatal_barrier.wait(timeout=10)
+            raise originals[int(asset_id[-1]) - 1]
+        finally:
+            assert not application._http.is_closed
+            application.state.meta.set(f"unwound_{asset_id}", True)
+            unwound.append(asset_id)
+
+    def fail(asset_id, error):
+        pytest.fail(f"fatal/cancellation became an ordinary asset failure: {error}")
+
+    phase = ModellingPhase(
+        None, None, None, application.state, application.user, application.dashboard, application.tracker, config,
+    )
+    try:
+        with pytest.raises(LLMAccessError) as caught:
+            phase._execute(board, SimpleNamespace(advance=advance, fail=fail))
+        assert any(caught.value is original for original in originals)
+        assert sorted(unwound) == ["active", "critic", "fatal1", "fatal2"]
+        assert not any(thread.name.startswith(("worker-", "ThreadPoolExecutor-")) for thread in threading.enumerate())
+        assert gone(int(pid_path.read_text()))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(int(pid_path.read_text()), os.WNOHANG)
+        assert application.state.meta.get("nested_critic_unwound") is True
+    finally:
+        application.close()
+        if pid_path.exists() and not gone(int(pid_path.read_text())):
+            os.killpg(int(pid_path.read_text()), signal.SIGKILL)

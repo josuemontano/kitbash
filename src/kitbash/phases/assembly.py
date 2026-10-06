@@ -62,6 +62,15 @@ class AssemblyPhase:
     def run(self) -> None:
         with self._staging() as scene:
             report = self._assemble(scene)
+            if not report["acceptance"]["published"]:
+                rejected = self._retain_rejected(scene, report)
+                raise StateError(
+                    "Final assembly validation failed",
+                    hint="; ".join(report["acceptance"]["issues"])
+                    + f". Rejected outputs are in {rejected}; the published scene is unchanged. "
+                    "Fix the layout and resume from layout, or explicitly publish degraded in interactive mode.",
+                )
+            report = self._relocate_reports(scene, self._layout.scene_dir, report)
             previous = self._layout.root / ".scene-previous"
             if self._layout.scene_dir.exists():
                 self._layout.scene_dir.rename(previous)
@@ -69,14 +78,7 @@ class AssemblyPhase:
             self._record(report)
             if previous.exists():
                 shutil.rmtree(previous)
-        acceptance = report.get("acceptance", {})
-        if not acceptance.get("published"):
-            issues = acceptance.get("issues", [])
-            raise StateError(
-                "Final assembly validation failed",
-                hint="; ".join(issues) + ". Outputs are retained for inspection, not accepted. Fix the layout and resume from layout, or explicitly publish degraded in interactive mode.",
-            )
-        card_passed = report.get("scorecard", {}).get("passed")
+        card_passed = report["scorecard"]["passed"]
         label = "Scene passed final validation" if card_passed else "Degraded scene published by human override (validation failed)"
         self._user.notify(
             f"{label}: {self._layout.relative(self._layout.scene_blend)}, {self._layout.relative(self._layout.scene_usd)} "
@@ -105,7 +107,7 @@ class AssemblyPhase:
             progress.status = "inspecting the assembled scene"
             with self._tracker.span(SpanKind.STEP, "assembly.inspect"):
                 inspection, blend_facts = self._toolkit.inspect_scene(
-                    scene / "scene.blend", args.get("assets", {}), [item.id for item in skipped], logs, "scene_inspect"
+                    scene / "scene.blend", args["assets"], [item.id for item in skipped], logs, "scene_inspect"
                 )
             final = None
             if blend_facts["has_camera"]:
@@ -123,8 +125,8 @@ class AssemblyPhase:
                     roundtrip_dir=scene / "renders" / "usd_roundtrip", prefix="scene", log_dir=logs,
                     scene=True, engine=self._config.style.render_engine,
                     scene_expectations={
-                        "assets": args.get("assets", {}),
-                        "expected_assets": {key: spec["instances"] for key, spec in args.get("assets", {}).items()},
+                        "assets": args["assets"],
+                        "expected_assets": {key: spec["instances"] for key, spec in args["assets"].items()},
                         "expected_placeholders": [item.id for item in skipped],
                         "camera_name": inspection["camera"]["name"] if inspection["camera"] else None,
                     },
@@ -155,9 +157,15 @@ class AssemblyPhase:
                     issues.append(f"{prefix}{key}: {facts.get(prefix + key, 'not measured')}")
             if facts.get(prefix + "has_camera") is not True:
                 issues.append(f"{prefix}has_camera: missing or invalid active camera")
-        outputs_exist = (scene / "scene.blend").is_file() and (scene / "scene.usd").is_file()
-        if not outputs_exist:
-            issues.append("Required scene.blend or scene.usd output is missing")
+        required = [scene / "scene.blend", scene / "scene.usd"]
+        if final is not None:
+            required.append(final)
+        missing = [path for path in required if not path.is_file() or path.stat().st_size == 0]
+        outputs_exist = not missing and (final is not None or blend_facts["has_camera"] is False)
+        if missing:
+            issues.append("Required outputs are missing or empty: " + ", ".join(path.name for path in missing))
+        if final is None:
+            issues.append("Final render is unavailable")
         card = evolve(card, passed=card.passed and not issues)
         acceptance = {"status": "passed" if card.passed else "failed", "automatic_pass": card.passed, "published": card.passed, "issues": issues}
         report = {
@@ -172,22 +180,38 @@ class AssemblyPhase:
             "scorecard": card.to_dict(),
             "acceptance": acceptance,
         }
-        if not card.passed and getattr(self._user, "interactive", False) and outputs_exist:
-            decision = run_gate(self._user, self._tracker, PhaseSummary(
-                phase=self.name,
-                headline="Final validation failed. This scene is not an automatic pass.",
-                columns=("acceptance failure",), rows=tuple((issue,) for issue in issues),
-                images=(final,) if final else (), scorecard=card,
-                message="Explicitly publish a degraded result, or stop and fix the scene. An ordinary approval does not override validation.",
-            ))
+        if not card.passed and self._user.interactive and outputs_exist:
+            try:
+                decision = run_gate(self._user, self._tracker, PhaseSummary(
+                    phase=self.name,
+                    headline="Final validation failed. This scene is not an automatic pass.",
+                    columns=("acceptance failure",), rows=tuple((issue,) for issue in issues),
+                    images=(final,) if final else (), scorecard=card,
+                    message="Explicitly publish a degraded result, or stop and fix the scene. An ordinary approval does not override validation.",
+                ))
+            except BaseException:
+                self._retain_rejected(scene, report)
+                raise
             if decision.action is GateAction.PUBLISH_DEGRADED:
                 acceptance.update(status="overridden", published=True, override="publish_degraded")
-                report["acceptance"] = acceptance
-        report = self._published_paths(report, scene)
-        # Reports written by Blender also contain absolute output paths. Keep them valid after rename.
-        for path in scene.rglob("*.json"):
+        return report
+
+    def _retain_rejected(self, scene: Path, report: dict[str, Any]) -> Path:
+        destination = self._layout.phase_dir(self.name) / "rejected"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            shutil.rmtree(destination)
+        report = self._relocate_reports(scene, destination, report)
+        scene.rename(destination)
+        self._record(report)
+        return destination
+
+    def _relocate_reports(self, scene: Path, destination: Path, report: dict[str, Any]) -> dict[str, Any]:
+        report = self._relocated_paths(report, scene, destination)
+        # Only generated reports belong to assembly; copied asset bundles may contain arbitrary JSON.
+        for path in (scene / "renders").rglob("*.json"):
             data = json.loads(path.read_text(encoding="utf-8"))
-            path.write_text(json.dumps(self._published_paths(data, scene), indent=2), encoding="utf-8")
+            path.write_text(json.dumps(self._relocated_paths(data, scene, destination), indent=2), encoding="utf-8")
         (scene / "assembly.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         return report
 
@@ -203,6 +227,11 @@ class AssemblyPhase:
             except BlockingIOError as exc:
                 raise StateError("Another process is publishing this scene.") from exc
             self._recover_previous(previous)
+            published = layout.scene_dir / "assembly.json"
+            if published.is_file():
+                report = json.loads(published.read_text(encoding="utf-8"))
+                if report.get("acceptance", {}).get("published"):
+                    self._record(report)
             if scene.exists():
                 shutil.rmtree(scene)
             self._state.meta.set("assembly", {
@@ -224,25 +253,26 @@ class AssemblyPhase:
                 shutil.rmtree(previous)
             else:
                 previous.rename(self._layout.scene_dir)
-            published = self._layout.scene_dir / "assembly.json"
-            if published.is_file():
-                self._record(json.loads(published.read_text(encoding="utf-8")))
 
     def _record(self, report: dict[str, Any]) -> None:
         usd = report.get("usd", {})
-        self._state.meta.set("assembly", {
+        metadata = {
             **{key: report.get(key) for key in ("scene_blend", "scene_usd", "final_render", "scorecard", "acceptance")},
             "usd_material_mode": usd.get("usd_material_mode"),
             "usd_roundtrip_score": usd.get("roundtrip_score"),
-        })
+        }
+        with self._state.db.transaction():
+            self._state.meta.set("assembly", metadata)
+            if (report.get("acceptance") or {}).get("published"):
+                self._state.meta.set("published_assembly", metadata)
 
-    def _published_paths(self, value: Any, scene: Path) -> Any:
+    def _relocated_paths(self, value: Any, scene: Path, destination: Path) -> Any:
         if isinstance(value, dict):
-            return {key: self._published_paths(item, scene) for key, item in value.items()}
+            return {key: self._relocated_paths(item, scene, destination) for key, item in value.items()}
         if isinstance(value, list):
-            return [self._published_paths(item, scene) for item in value]
+            return [self._relocated_paths(item, scene, destination) for item in value]
         if isinstance(value, str) and (value == str(scene) or value.startswith(f"{scene}/")):
-            return str(self._layout.scene_dir / Path(value).relative_to(scene))
+            return str(destination / Path(value).relative_to(scene))
         return value
 
     def _copy_assets(self, placed: Sequence[PlacedAsset], destination: Path) -> dict[str, Path]:

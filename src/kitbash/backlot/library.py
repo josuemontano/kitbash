@@ -135,7 +135,7 @@ class Backlot:
             with self._db.transaction():
                 columns = {row["name"] for row in self._db.query("PRAGMA table_info(assets)")}
                 if "publication_status" not in columns:
-                    self._db.execute("ALTER TABLE assets ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'ready'")
+                    self._db.execute("ALTER TABLE assets ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'pending'")
             self._index = VectorIndex(self._db, VECTOR_TABLE, embedder.dimensions, embedder.name, rebuild=rebuild_index)
             with self._publication_lock(blocking=False) as acquired:
                 if acquired:
@@ -217,16 +217,17 @@ class Backlot:
         if not query.strip():
             return []
         vector = self._embedder.embed([query])[0]
-        pending = self._db.one("SELECT COUNT(*) AS n FROM assets WHERE publication_status = 'pending'")["n"]
-        neighbours = self._index.nearest(vector, (k * 4 if style else k) + pending)
-        rows = {
-            r["rowid"]: r
-            for r in self._db.query(
-                f"SELECT * FROM assets WHERE publication_status = 'ready' "
-                f"AND rowid IN ({','.join('?' for _ in neighbours) or 'NULL'})",
-                tuple(n.rowid for n in neighbours),
-            )
-        }
+        with self._db.transaction(immediate=False):
+            pending = self._db.one("SELECT COUNT(*) AS n FROM assets WHERE publication_status = 'pending'")["n"]
+            neighbours = self._index.nearest(vector, (k * 4 if style else k) + pending)
+            rows = {
+                r["rowid"]: r
+                for r in self._db.query(
+                    f"SELECT * FROM assets WHERE publication_status = 'ready' "
+                    f"AND rowid IN ({','.join('?' for _ in neighbours) or 'NULL'})",
+                    tuple(n.rowid for n in neighbours),
+                )
+            }
         hits = [SearchHit(self._entry(rows[n.rowid]), n.similarity) for n in neighbours if n.rowid in rows]
         if style:
             hits = [h for h in hits if h.entry.style == style]
@@ -283,7 +284,14 @@ class Backlot:
                 return False
             for key in ("blend_path", "usd_path", "preview_path"):
                 relative = Path(row[key]).relative_to(Path("assets") / row["id"])
-                if metadata[key] != row[key] or not (directory / relative).is_file():
+                artifact = directory / relative
+                if (
+                    ".." in relative.parts
+                    or metadata[key] != row[key]
+                    or not artifact.is_file()
+                    or artifact.stat().st_size == 0
+                    or not artifact.resolve().is_relative_to(directory.resolve())
+                ):
                     return False
         except (OSError, ValueError, KeyError, TypeError):
             return False
@@ -309,6 +317,11 @@ class Backlot:
                 shutil.rmtree(staging)
             else:
                 staging.unlink()
+        # Deletion may have committed just before process death interrupted directory cleanup.
+        owned = {row["id"] for row in self._db.query("SELECT id FROM assets")}
+        for destination in self.assets_dir.iterdir():
+            if destination.name not in owned and destination.is_dir():
+                shutil.rmtree(destination)
 
     def _next_version(self, slug: str) -> int:
         row = self._db.one("SELECT COALESCE(MAX(version), 0) + 1 AS v FROM assets WHERE slug = ?", (slug,))

@@ -296,10 +296,12 @@ class CriticLoop:
         registry = current_registry()
         with registry.bind(), ThreadPoolExecutor(max_workers=max(1, len(self._critics))) as pool:
             try:
+                registry.check_cancelled()
                 futures = [pool.submit(context.propagate(run), critic) for critic in self._critics]
                 # Observe a fatal result even when an earlier critic is still inside a subprocess.
                 for future in as_completed(futures):
                     future.result()
+                registry.check_cancelled()
                 return tuple(future.result() for future in futures)
             except BaseException:
                 with defer_interrupts():

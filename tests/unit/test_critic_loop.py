@@ -23,7 +23,7 @@ from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
 from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, StateError
 from kitbash.infra.patching import make_diff
-from kitbash.infra.process import run_process
+from kitbash.infra.process import ProcessCancelled, current_registry, run_process
 from kitbash.paths import OutputLayout
 from kitbash.store.state import StateDB
 from tests.helpers import process_gone, wait_for
@@ -292,7 +292,10 @@ def test_passing_lower_score_replaces_failed_high_score(env, failure):
                 return evolve(evaluation, ok=False, error="USD export failed")
             return evaluation
 
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),)
+    critics = (
+        FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),
+        FakeCritic(CriticKind.TECHNICAL),
+    )
     writer = ScriptedPatchWriter([0.85])
     loop = ResumableLoop(make_loop(env, writer, critics=critics), LoopSessions(env[0].meta))
     subject = Subject()
@@ -330,7 +333,7 @@ def test_interrupted_session_resumes_the_exact_passing_cycle(env, tmp_path, budg
                 raise KeyboardInterrupt
 
     config = evolve(env[2], critic=evolve(env[2].critic, max_cycles=budget))
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}),)
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
     loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
     subject = Subject()
     with pytest.raises(KeyboardInterrupt):
@@ -439,13 +442,15 @@ def test_failed_feedback_session_does_not_fall_back_to_an_old_pass(env):
 
 def test_cached_pass_cannot_transfer_to_a_nonpassing_cycle(env):
     subject = FakeSubject()
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}),)
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
     loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
     outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
     Path(outcome.best.evaluation.artifacts["usd"]).unlink()
     assert loop.best(subject).cycle == 1  # the only surviving candidate failed the rubric
     with pytest.raises(StateError, match="not eligible for a passed outcome"):
         loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+
+
 def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
     pid_path = tmp_path / "critic-pid"
     original = LLMAccessError("provider budget exhausted")
@@ -470,8 +475,25 @@ def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
             loop.run(FakeSubject(), initial_script=lambda: script(0.9))
         assert caught.value is original
         assert process_gone(int(pid_path.read_text()))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(int(pid_path.read_text()), os.WNOHANG)
         pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
         assert pending.status == "pending" and pending.passed is None
     finally:
         if pid_path.exists() and not process_gone(int(pid_path.read_text())):
             os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+
+
+def test_last_critic_cancellation_leaves_cycle_pending_and_next_run_is_fresh(env):
+    class CancellingCritic(FakeCritic):
+        def review(self, request):
+            current_registry().terminate_all()
+            return super().review(request)
+
+    loop = make_loop(env, ScriptedPatchWriter([]), critics=(CancellingCritic(CriticKind.VISUAL),))
+    with pytest.raises(ProcessCancelled):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+    pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+    assert pending.status == "pending" and pending.passed is None
+    fresh = make_loop(env, ScriptedPatchWriter([]))
+    assert fresh.run(FakeSubject(), initial_script=lambda: script(0.9)).reason is LoopReason.PASSED

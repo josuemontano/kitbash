@@ -9,7 +9,7 @@ from typing import Any
 from attrs import frozen
 
 from kitbash.domain.assets import AssetRecord, AssetState, asset_from_dict, asset_to_dict
-from kitbash.domain.inventory import Inventory, InventoryItem
+from kitbash.domain.inventory import Inventory
 from kitbash.domain.phases import PhaseName, PhaseStatus
 from kitbash.infra.embeddings import Embedder
 from kitbash.store.database import Database
@@ -116,6 +116,10 @@ class InventoryRepository:
 
     def save(self, inventory: Inventory) -> None:
         now = time.time()
+        vectors = (
+            self._embedder.embed([item.embedding_text() for item in inventory.items])
+            if self._embedder is not None else None
+        )
         with self._db.transaction() as conn:
             conn.execute("DELETE FROM inventory_items")
             for order, item in enumerate(inventory.items):
@@ -124,30 +128,29 @@ class InventoryRepository:
                     (item.id, order, item.name, item.description, item.category, item.confidence,
                      _dumps(item.to_dict()), now),
                 )
-        self._meta.set("scene_info", inventory.scene.to_dict())
-        self._reindex(inventory.items)
+            self._meta.set("scene_info", inventory.scene.to_dict())
+            if self._index is not None and vectors is not None:
+                self._index.clear()
+                rowids = {row["id"]: row["rowid"] for row in self._db.query("SELECT rowid, id FROM inventory_items")}
+                for item, vector in zip(inventory.items, vectors, strict=True):
+                    self._index.upsert(rowids[item.id], vector)
 
     def load(self) -> Inventory | None:
-        rows = self._db.query("SELECT data FROM inventory_items ORDER BY ord")
-        if not rows:
-            return None
-        return Inventory.from_dict({"scene": self._meta.get("scene_info", {}), "items": [json.loads(r["data"]) for r in rows]})
+        with self._db.transaction(immediate=False):
+            rows = self._db.query("SELECT data FROM inventory_items ORDER BY ord")
+            if not rows:
+                return None
+            scene = self._meta.get("scene_info", {})
+        return Inventory.from_dict({"scene": scene, "items": [json.loads(r["data"]) for r in rows]})
 
     def search(self, query: str, k: int = 5) -> list[tuple[str, float]]:
         if self._index is None or self._embedder is None:
             return []
-        neighbours = self._index.nearest(self._embedder.embed([query])[0], k)
-        ids = {row["rowid"]: row["id"] for row in self._db.query("SELECT rowid, id FROM inventory_items")}
+        vector = self._embedder.embed([query])[0]
+        with self._db.transaction(immediate=False):
+            neighbours = self._index.nearest(vector, k)
+            ids = {row["rowid"]: row["id"] for row in self._db.query("SELECT rowid, id FROM inventory_items")}
         return [(ids[n.rowid], n.similarity) for n in neighbours if n.rowid in ids]
-
-    def _reindex(self, items: Sequence[InventoryItem]) -> None:
-        if self._index is None or self._embedder is None:
-            return
-        self._index.clear()
-        rowids = {row["id"]: row["rowid"] for row in self._db.query("SELECT rowid, id FROM inventory_items")}
-        vectors = self._embedder.embed([item.embedding_text() for item in items])
-        for item, vector in zip(items, vectors, strict=True):
-            self._index.upsert(rowids[item.id], vector)
 
 
 class AssetRepository:

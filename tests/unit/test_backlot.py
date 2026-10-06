@@ -30,6 +30,15 @@ def interrupted_add(root: Path, boundary: str) -> None:
             (destination / "asset.blend").write_bytes(b"partial")
             os._exit(73)
         module.shutil.copytree = copy_partial
+    elif boundary == "metadata":
+        write_text = Path.write_text
+
+        def partial_metadata(path, *args, **kwargs):
+            if path.name == "metadata.json":
+                path.write_bytes(b'{"id":')
+                os._exit(73)
+            return write_text(path, *args, **kwargs)
+        Path.write_text = partial_metadata
     elif boundary == "index":
         upsert = library._index.upsert
 
@@ -40,7 +49,13 @@ def interrupted_add(root: Path, boundary: str) -> None:
     elif boundary == "rename":
         Path.rename = lambda *args: os._exit(73)
     else:
-        library._mark_ready = lambda asset_id: os._exit(73)
+        mark_ready = library._mark_ready
+
+        def interrupt_ready(asset_id):
+            if boundary == "published":
+                mark_ready(asset_id)
+            os._exit(73)
+        library._mark_ready = interrupt_ready
     library.add(draft("Oak chair", "Oak dining chair"), source)
 
 
@@ -128,7 +143,10 @@ def test_reindex_after_embedder_change(tmp_path):
     library.close()
 
 
-@pytest.mark.parametrize("boundary,published", [("copy", False), ("index", False), ("rename", True), ("ready", True)])
+@pytest.mark.parametrize("boundary,published", [
+    ("copy", False), ("metadata", False), ("index", False),
+    ("rename", True), ("ready", True), ("published", True),
+])
 def test_reopen_recovers_process_interruption(tmp_path, boundary, published):
     process = multiprocessing.get_context("spawn").Process(target=interrupted_add, args=(tmp_path, boundary))
     process.start()
@@ -140,9 +158,9 @@ def test_reopen_recovers_process_interruption(tmp_path, boundary, published):
     assert process.exitcode == 73
 
     root = tmp_path / "backlot"
-    # Only the post-rename interruption may have made a public directory, already complete.
+    # Only post-rename interruptions may expose a public directory, already complete.
     public = list((root / "assets").iterdir())
-    assert bool(public) == (boundary == "ready")
+    assert bool(public) == (boundary in {"ready", "published"})
     if public:
         assert (public[0] / "metadata.json").is_file()
         assert (public[0] / "asset.blend").read_bytes() == b"blend"
@@ -181,7 +199,8 @@ def test_pending_bundle_is_hidden_until_reopen(backlot, tmp_path, monkeypatch):
         reopened.close()
 
 
-def test_incomplete_pending_bundle_is_removed(backlot, tmp_path, monkeypatch):
+@pytest.mark.parametrize("damage", ["missing", "empty", "metadata"])
+def test_incomplete_pending_bundle_is_removed(backlot, tmp_path, monkeypatch, damage):
     def interrupt(asset_id):
         raise OSError("ready update interrupted")
 
@@ -189,7 +208,12 @@ def test_incomplete_pending_bundle_is_removed(backlot, tmp_path, monkeypatch):
     with pytest.raises(OSError):
         backlot.add(draft("Oak chair", "Oak dining chair"), bundle(tmp_path, "chair"))
     public = next(backlot.assets_dir.iterdir())
-    (public / "asset.blend").unlink()
+    if damage == "missing":
+        (public / "asset.blend").unlink()
+    elif damage == "empty":
+        (public / "asset.blend").write_bytes(b"")
+    else:
+        (public / "metadata.json").write_text("{", encoding="utf-8")
     reopened = Backlot(backlot.root, HashingEmbedder(64))
     try:
         assert reopened.list() == []
@@ -331,3 +355,131 @@ def test_reindex_fresh_library(tmp_path):
         assert library.search("oak chair")[0].entry.id == entry.id
     finally:
         library.close()
+
+
+@pytest.mark.parametrize("artifact", ["blend", "usd", "preview"])
+def test_empty_artifact_is_never_published(backlot, tmp_path, artifact):
+    source = bundle(tmp_path, "empty")
+    getattr(source, artifact).write_bytes(b"")
+    with pytest.raises(BacklotError):
+        backlot.add(draft("Oak chair", "Oak dining chair"), source)
+    assert backlot.list() == []
+    assert backlot.search("oak chair") == []
+    assert list(backlot.assets_dir.iterdir()) == []
+    assert list((backlot.root / ".staging").iterdir()) == []
+
+
+def test_search_keeps_ready_hits_when_pending_publication_commits(backlot, tmp_path, monkeypatch):
+    ready = backlot.add(draft("Mug", "White coffee mug"), bundle(tmp_path, "mug"))
+    writer = Backlot(backlot.root, HashingEmbedder(64))
+    source = bundle(tmp_path, "chair")
+    one = backlot._db.one
+
+    def interrupt(asset_id):
+        raise OSError("pending publication")
+
+    def publish_after_count(sql, params=()):
+        row = one(sql, params)
+        if "COUNT(*)" in sql and "pending" in sql:
+            monkeypatch.setattr(backlot._db, "one", one)
+            with pytest.raises(OSError, match="pending publication"):
+                writer.add(draft("Oak chair", "Oak dining chair"), source)
+        return row
+
+    monkeypatch.setattr(writer, "_mark_ready", interrupt)
+    monkeypatch.setattr(backlot._db, "one", publish_after_count)
+    try:
+        assert [hit.entry.id for hit in backlot.search("Oak chair furniture Oak dining chair wood", k=1)] == [ready.id]
+    finally:
+        writer.close()
+
+
+def test_search_uses_one_snapshot_during_model_replacement(backlot, tmp_path, monkeypatch):
+    entry = backlot.add(draft("Mug", "White coffee mug"), bundle(tmp_path, "mug"))
+    replacement = Backlot(backlot.root, OtherModel(32), rebuild_index=True)
+    one = backlot._db.one
+
+    def reindex_after_count(sql, params=()):
+        row = one(sql, params)
+        if "COUNT(*)" in sql and "pending" in sql:
+            monkeypatch.setattr(backlot._db, "one", one)
+            replacement.reindex()
+        return row
+
+    monkeypatch.setattr(backlot._db, "one", reindex_after_count)
+    try:
+        assert backlot.search("white coffee mug", k=1)[0].entry.id == entry.id
+        with pytest.raises(StateError):
+            backlot.search("white coffee mug")
+        with pytest.raises(StateError):
+            backlot.add(draft("Chair", "Oak chair"), bundle(tmp_path, "chair"))
+        assert replacement.search("white coffee mug", k=1)[0].entry.id == entry.id
+        assert replacement.list() == [entry]
+    finally:
+        replacement.close()
+
+
+def test_recovery_finishes_interrupted_directory_removal(backlot, tmp_path, monkeypatch):
+    import kitbash.backlot.library as module
+
+    entry = backlot.add(draft("Mug", "White coffee mug"), bundle(tmp_path, "mug"))
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.shutil, "rmtree", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            backlot.remove(entry.id)
+    assert entry.directory.exists()
+    reopened = Backlot(backlot.root, HashingEmbedder(64))
+    try:
+        assert reopened.list() == []
+        assert reopened.search("white coffee mug") == []
+        assert not entry.directory.exists()
+    finally:
+        reopened.close()
+
+
+def test_migration_discards_incomplete_legacy_publication(tmp_path):
+    root = tmp_path / "backlot"
+    library = Backlot(root, HashingEmbedder(64))
+    ready = library.add(draft("Mug", "White coffee mug"), bundle(tmp_path, "mug"))
+    incomplete = library.add(draft("Chair", "Oak chair"), bundle(tmp_path, "chair"))
+    library.close()
+    (incomplete.directory / "metadata.json").unlink()
+    db = Database(root / "backlot.db")
+    db.execute("ALTER TABLE assets DROP COLUMN publication_status")
+    db.close()
+    reopened = Backlot(root, HashingEmbedder(64))
+    try:
+        assert reopened.list() == [ready]
+        assert [hit.entry.id for hit in reopened.search("oak chair")] == [ready.id]
+        assert not incomplete.directory.exists()
+    finally:
+        reopened.close()
+
+
+def test_metadata_less_legacy_index_requires_explicit_rebuild(tmp_path):
+    root = tmp_path / "backlot"
+    library = Backlot(root, HashingEmbedder(64))
+    entry = library.add(draft("Mug", "White coffee mug"), bundle(tmp_path, "mug"))
+    # Legacy table creation and model metadata used separate autocommits.
+    library._db.execute("DELETE FROM vector_meta WHERE table_name = 'asset_vec'")
+    library.close()
+    with pytest.raises(StateError):
+        Backlot(root, HashingEmbedder(64))
+    replacement = Backlot(root, OtherModel(32), rebuild_index=True)
+    try:
+        assert replacement.get(entry.id) == entry
+        with pytest.raises(StateError):
+            replacement.search("white coffee mug")
+        assert replacement.reindex() == 1
+        assert replacement.search("white coffee mug", k=1)[0].entry.id == entry.id
+    finally:
+        replacement.close()
+    reopened = Backlot(root, OtherModel(32))
+    try:
+        assert reopened.search("white coffee mug", k=1)[0].entry.id == entry.id
+    finally:
+        reopened.close()

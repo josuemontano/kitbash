@@ -37,7 +37,7 @@ from kitbash.infra.image_search import (
 )
 from kitbash.infra.omp import OmpClient
 from kitbash.infra.polyhaven import PolyHavenCatalog
-from kitbash.infra.process import ProcessRegistry
+from kitbash.infra.process import ProcessRegistry, defer_interrupts
 from kitbash.infra.trellis import TrellisRunner
 from kitbash.interaction.autopilot import AutoPilot
 from kitbash.interaction.protocols import UserChannel
@@ -246,10 +246,11 @@ class Application:
         return AnalyticsReport(self.state, self.layout).write()
 
     def close(self) -> None:
-        self._processes.terminate_all()
-        self._http.close()
-        self.backlot.close()
-        self.state.close()
+        with defer_interrupts():
+            self._processes.terminate_all()
+            self._http.close()
+            self.backlot.close()
+            self.state.close()
 
     def _providers(self) -> list[CandidateProvider]:
         factories = {
