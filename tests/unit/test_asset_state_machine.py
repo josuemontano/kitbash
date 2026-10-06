@@ -36,12 +36,13 @@ def test_happy_path_is_allowed():
     for target in HAPPY_PATH:
         check_transition(current, target)
         current = target
+    check_transition(S.QUEUED, S.BUILDING)
 
 
 @pytest.mark.parametrize(
     "current, target",
     [
-        (S.QUEUED, S.BUILDING),
+        (S.QUEUED, S.CRITIQUING),
         (S.REFERENCING, S.AWAITING_REVIEW),
         (S.GENERATING, S.APPROVED),
         (S.AWAITING_REVIEW, S.BUILDING),
@@ -68,8 +69,11 @@ def test_state_properties():
 
 
 def test_record_serialization_round_trip():
-    record = AssetRecord(id="a", name="A", state=S.NEEDS_REWORK, feedback=("x",), extra={"cycle": 2})
+    record = AssetRecord(id="a", name="A", state=S.NEEDS_REWORK, feedback=("x",), extra={"cycle": 2}, modelling_method="procedural")
     assert asset_from_dict(asset_to_dict(record)) == record
+    legacy = asset_to_dict(record)
+    del legacy["modelling_method"]
+    assert asset_from_dict(legacy).modelling_method == "trellis"
 
 
 def test_board_persists_transitions_and_notifies(board):

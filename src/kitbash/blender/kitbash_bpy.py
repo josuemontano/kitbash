@@ -590,9 +590,11 @@ def apply_naming(obj):
 
 @api
 def save_asset(obj):
-    """Finish the asset: apply naming, keep only the asset collection's objects (other meshes are parented to
-    ``obj``), purge unused data and save ``args()['output_blend']`` with relative texture paths."""
+    """Finish the asset: link ``obj`` into the asset collection, apply naming and parent other meshes to it.
+    Purge unused data and save ``args()['output_blend']`` with relative texture paths."""
     home = asset_collection()
+    if obj.name not in home.objects:
+        home.objects.link(obj)
     for other in list(bpy.data.objects):
         if other.type != "MESH" and other.name not in home.objects:
             bpy.data.objects.remove(other, do_unlink=True)

@@ -63,6 +63,7 @@ class BacklotCommitter:
                 tags=tuple(dict.fromkeys((item.category, *item.materials_hint))),
                 metadata={
                     "slug": item.id,
+                    "modelling_method": asset.modelling_method,
                     "scene_output": str(self._layout.root),
                     "cycle": best.cycle,
                     "score": round(best.score, 4),

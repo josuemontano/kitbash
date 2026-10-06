@@ -38,7 +38,7 @@ class SceneWriter:
     def localize(self, blend, logs):
         return {"missing": [], "copied": []}
 
-    def inspect_scene(self, blend, assets, placeholders, logs, name):
+    def inspect_scene(self, blend, assets, placeholders, logs, name, *, airborne=None):
         return {"camera": {"name": "Camera"}}, {
             "missing_assets": 0, "unexpected_assets": 0,
             "missing_placeholders": 0, "unexpected_placeholders": 0,
@@ -73,7 +73,7 @@ def assembly(tmp_path):
     layout.create()
     state = StateDB(layout.state_db)
     writer = SceneWriter()
-    subject = SimpleNamespace(run_args=lambda output, blends, mode: {"output_blend": str(output), "assets": {}})
+    subject = SimpleNamespace(run_args=lambda output, blends, mode: {"output_blend": str(output), "assets": {}, "airborne": {}})
     phase = AssemblyPhase(
         SimpleNamespace(subject=lambda *args: subject),
         SimpleNamespace(best=lambda subject: SimpleNamespace(script_path=tmp_path / "layout.py")),

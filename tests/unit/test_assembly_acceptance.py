@@ -47,7 +47,7 @@ class Toolkit:
     def localize(self, blend, logs):
         return {"missing": [], "copied": []}
 
-    def inspect_scene(self, blend, assets, placeholders, logs, name):
+    def inspect_scene(self, blend, assets, placeholders, logs, name, *, airborne=None):
         return {"camera": {"name": "Camera"} if self.facts["has_camera"] else None}, dict(self.facts)
 
     def render_scene(self, blend, output, logs, **settings):

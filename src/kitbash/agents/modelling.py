@@ -1,4 +1,4 @@
-"""Modelling agent: one asset at a time (reference image, Trellis mesh, Blender build script, checks)."""
+"""Modelling agent: reconstruct a reference or construct geometry, then build and critique assets."""
 
 import json
 import logging
@@ -38,9 +38,9 @@ class ModellingAgent:
         llm: LLMService,
         toolkit: BlenderToolkit,
         fidelity: UsdFidelityChecker,
-        finder: ReferenceFinder,
-        trellis: TrellisRunner,
-        retopologizer: Retopologizer,
+        finder: ReferenceFinder | None,
+        trellis: TrellisRunner | None,
+        retopologizer: Retopologizer | None,
         catalog: PolyHavenCatalog,
         config: Config,
         layout: OutputLayout,
@@ -58,6 +58,8 @@ class ModellingAgent:
         self._tracker = tracker
 
     def find_reference(self, item: InventoryItem) -> ReferenceChoice | None:
+        if self._finder is None:
+            raise KitbashError("Reference search is unavailable in procedural modelling mode")
         with context.bind(agent="modelling_agent"):
             return self._finder.find(item, self._layout.asset_reference_dir(item.id))
 
@@ -66,16 +68,22 @@ class ModellingAgent:
         return json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
 
     def select_reference(self, item: InventoryItem, index: int) -> ReferenceChoice | None:
+        if self._finder is None:
+            raise KitbashError("Reference selection is unavailable in procedural modelling mode")
         with context.bind(agent="modelling_agent"):
             return self._finder.select_reviewed(item, self._layout.asset_reference_dir(item.id), index)
 
     def generate_mesh(self, asset: AssetRecord, reference: Path) -> TrellisResult:
+        if self._trellis is None:
+            raise KitbashError("Trellis is unavailable in procedural modelling mode")
         directory = self._layout.asset_trellis_dir(asset.id) / f"attempt_{asset.attempt:02d}"
         return self._trellis.generate(reference, directory, asset.id, seed=asset.seed)
 
     def retopologize(self, asset: AssetRecord, mesh_path: Path) -> RetopologyResult:
         """Retopologize the Trellis mesh. With ``fallback_on_error`` a failure keeps the Trellis mesh (the decimate path)."""
         retopologizer = self._retopologizer
+        if retopologizer is None:
+            raise KitbashError("Retopology is unavailable in procedural modelling mode")
         if retopologizer.method is RetopologyMethod.DECIMATE:
             return retopologizer.retopologize(mesh_path, mesh_path.parent, asset.id)
         directory = self._layout.asset_retopo_dir(asset.id) / f"attempt_{asset.attempt:02d}"
@@ -114,13 +122,13 @@ class ModellingAgent:
                     "dimensions": _dimensions(item),
                     "materials": ", ".join(item.materials_hint) or "not specified",
                     "style": self._config.pipeline.style,
-                    "retopology": _retopology_note(retopology_method(asset)),
+                    "geometry": _geometry_instructions(asset),
                     "feedback": "\n".join(f"- {f}" for f in asset.feedback) or "(none)",
                     "naming": naming.describe(item.id),
                     "textures": json.dumps(textures) if textures else "(none)",
                     "api": blender_api_reference(),
                 },
-                attachments=tuple(p for p in (Path(asset.reference_path),) if asset.reference_path and p.is_file()),
+                attachments=tuple(Path(p) for p in (asset.reference_path,) if p and Path(p).is_file()),
             )
 
     def subject(self, item: InventoryItem, asset: AssetRecord) -> AssetSubject:
@@ -173,7 +181,7 @@ class AssetSubject:
 
     def evaluate(self, script: Path, cycle_dir: Path, cycle: int) -> Evaluation:
         """Build the asset, render previews, inspect it and validate the USD round trip."""
-        if not self._asset.mesh_path:
+        if self._asset.modelling_method == "trellis" and not self._asset.mesh_path:
             raise KitbashError(f"Asset {self._asset.id} has no Trellis mesh")
         build = cycle_dir / BUILD_DIR
         blend = build / BLEND_NAME
@@ -181,9 +189,10 @@ class AssetSubject:
         self._toolkit.run_script(
             script,
             {
+                "modelling_method": self._asset.modelling_method,
                 "mesh_path": self._asset.mesh_path,
                 "mesh_up_axis": self._config.trellis.mesh_up_axis,
-                "retopology_method": retopology_method(self._asset),
+                "retopology_method": retopology_method(self._asset) if self._asset.modelling_method == "trellis" else None,
                 "output_blend": str(blend),
                 "textures_dir": str(build / "textures"),
                 "slug": self._item.id,
@@ -219,6 +228,28 @@ class AssetSubject:
 def retopology_method(asset: AssetRecord) -> str:
     """The method that produced the asset's mesh: ``decimate`` for a raw Trellis mesh (including after a fallback)."""
     return asset.extra.get("retopology", {}).get("method", RetopologyMethod.DECIMATE.value)
+
+
+def _geometry_instructions(asset: AssetRecord) -> str:
+    if asset.modelling_method == "procedural":
+        return (
+            "PROCEDURAL CONSTRUCTION: no input mesh or reference image is provided. Construct the complete object "
+            "from its inventory description using editable Blender mesh primitives, curves, mesh data and modifiers. "
+            "Do not call kb.import_mesh(), fabricate an input mesh path, or create a stand-in bounding box. "
+            "Model the recognizable silhouette, structural components and visible details as actual geometry. "
+            "Start with kb.reset_scene(); create components at their final real-world size, with front facing -Y "
+            "and the base at Z=0. Apply transforms and convert curves to meshes as needed. Join mesh components "
+            "into one obj (preserving material slots) before kb.save_asset(obj). Use the described style and "
+            "materials, not photographic defaults."
+        )
+    return (
+        "TRELLIS RECONSTRUCTION: an untextured mesh and its reference image are provided. Start with "
+        "kb.reset_scene(), then obj = kb.import_mesh(). Call kb.decimate(obj) and kb.clean_mesh(obj). "
+        + _retopology_note(retopology_method(asset))
+        + " Fix orientation with kb.rotate(obj, (x, y, z)) if needed: upright, front facing -Y. "
+        "Set real-world scale with kb.fit_dimensions(obj, mode=...) ('height' for most objects), "
+        "then kb.origin_to_base(obj). Match reference colors."
+    )
 
 
 def _retopology_note(method: str) -> str:

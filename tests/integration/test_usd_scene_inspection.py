@@ -177,3 +177,48 @@ def test_missing_source_active_camera_returns_failure_without_source_render(scen
     assert result.comparisons == ()
     assert result.compare_image is None
     assert result.score == 0.0
+
+
+@pytest.mark.parametrize("textured_world", [False, True], ids=["color-world", "environment-map"])
+def test_world_strength_and_color_grade_survive_rendered_roundtrip(tmp_path, textured_world):
+    config = load_config(None, {"usd.materialx": "off", "usd.roundtrip_resolution": [128, 128], "usd.roundtrip_samples": 32})
+    kit = BlenderToolkit(BlenderRunner("blender", timeout_s=300), config.blender, config.usd, config.naming, tmp_path)
+    script = tmp_path / "world.py"
+    script.write_text("""import os
+import bpy
+import kitbash_bpy as kb
+kb.reset_scene()
+kb.ground_plane(size=200)
+bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, location=(0, 0, 1))
+kb.assign(bpy.context.object, kb.principled("sphere", base_color=(0.25, 0.5, 0.15), roughness=0.8))
+cloud = bpy.context.object
+cloud["kb_asset_key"] = "sphere"
+cloud.location.z = 1.5
+kb.camera((4, -6, 3.5), look_at_point=(0, 0, 1), focal_length_mm=45)
+kb.color_world((0.4, 0.6, 0.8), 0.15)
+if kb.args()["textured_world"]:
+    image = bpy.data.images.new("environment", width=16, height=8, float_buffer=True)
+    image.pixels[:] = [0.4, 0.6, 0.8, 1.0] * (16 * 8)
+    image.filepath_raw = os.path.join(os.path.dirname(kb.args()["output_blend"]), "environment.exr")
+    image.file_format = "OPEN_EXR"
+    image.save()
+    tree = bpy.context.scene.world.node_tree
+    texture = tree.nodes.new("ShaderNodeTexEnvironment")
+    texture.image = image
+    background = next(n for n in tree.nodes if n.type == "BACKGROUND")
+    tree.links.new(texture.outputs["Color"], background.inputs["Color"])
+bpy.context.scene.view_settings.view_transform = "AgX"
+bpy.context.scene.view_settings.look = "AgX - Punchy"
+bpy.context.scene.view_settings.exposure = 0.7
+kb.save_scene()
+""")
+    blend = tmp_path / "scene.blend"
+    kit.run_script(script, {"output_blend": str(blend), "textured_world": textured_world}, tmp_path / "build.log")
+    result = UsdFidelityChecker(kit).check(
+        blend, tmp_path / "scene.usda", work_dir=tmp_path / "work", roundtrip_dir=tmp_path / "roundtrip",
+        prefix="scene", log_dir=tmp_path / "logs", scene=True,
+        scene_expectations={"assets": {"sphere": {}}, "airborne": {"sphere": 1}},
+    )
+    assert result.score > 0.96, result.report()
+    assert result.facts()["usd_floating_assets"] == 0
+    assert result.report()["scene_report"]["intentional_airborne"] == ["Sphere"]

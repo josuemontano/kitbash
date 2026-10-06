@@ -14,7 +14,7 @@ import kb_files
 import kb_materials as km
 import kb_render
 import kitbash_bpy as kb
-from pxr import Sdf, Usd, UsdShade
+from pxr import Gf, Sdf, Usd, UsdLux, UsdShade
 
 MATERIALX = "materialx"
 PREVIEW_BAKED = "preview_surface_baked"
@@ -260,6 +260,35 @@ if any(info["bake_channels"] for info in analysis.values()):
 # -- 5. final export and USD authoring --------------------------------------------------------------
 export(output_usd, materialx_supported)
 stage = Usd.Stage.Open(output_usd)
+if include_scene:
+    # USD does not standardize Blender's display transform; retain it as application metadata
+    # so a round-trip compares the same view, rather than AgX defaults against a graded scene.
+    scene = bpy.context.scene
+    layer = stage.GetRootLayer()
+    layer.customLayerData = {
+        **layer.customLayerData,
+        "kitbash": {"view_settings": {
+            name: getattr(scene.view_settings, name)
+            for name in ("view_transform", "look", "exposure", "gamma")
+        }},
+    }
+    # Blender's world exporter loses a Background's strength when exporting an environment
+    # texture. Author the physical intensity on the dome, not a round-trip-only correction.
+    world = scene.world
+    output = next((n for n in world.node_tree.nodes if n.type == "OUTPUT_WORLD" and n.is_active_output), None) if world and world.node_tree else None
+    background = output.inputs["Surface"].links[0].from_node if output and output.inputs["Surface"].is_linked else None
+    if background and background.type == "BACKGROUND" and not background.inputs["Strength"].is_linked:
+        color = background.inputs["Color"]
+        if not color.is_linked or color.links[0].from_node.type == "TEX_ENVIRONMENT":
+            for prim in stage.Traverse():
+                if prim.IsA(UsdLux.DomeLight):
+                    dome = UsdLux.DomeLight(prim)
+                    dome.CreateIntensityAttr(float(background.inputs["Strength"].default_value))
+                    dome.CreateExposureAttr(0.0)
+                    # Constant Background colors may already be baked into a tiny EXR by Blender.
+                    texture = dome.GetTextureFileAttr().Get()
+                    tint = color.default_value[:3] if not color.is_linked and not (texture and texture.path) else (1, 1, 1)
+                    dome.CreateColorAttr(Gf.Vec3f(*tint))
 exported = usd_materials(stage)
 for name, info in analysis.items():
     material = exported.get(name)

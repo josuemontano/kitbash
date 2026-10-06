@@ -12,6 +12,7 @@ import kb_materials as km
 import kb_render
 import kitbash_bpy as kb
 from kb_files import image_path
+from pxr import Usd
 
 options = kb.args()
 kb.reset_scene()
@@ -35,6 +36,11 @@ bpy.ops.wm.usd_import(**{k: v for k, v in wanted.items() if k in import_options}
 scene_expectations = options.get("scene_expectations")
 scene_inspection = {}
 if options["mode"] == "scene":
+    stage = Usd.Stage.Open(options["usd_path"])
+    view_settings = stage.GetRootLayer().customLayerData.get("kitbash", {}).get("view_settings", {})
+    for name in ("view_transform", "look", "exposure", "gamma"):
+        if name in view_settings:
+            setattr(bpy.context.scene.view_settings, name, view_settings[name])
     cameras = [obj for obj in bpy.context.scene.objects if obj.type == "CAMERA"]
     if scene_expectations is not None and "camera_name" in scene_expectations:
         expected_camera = scene_expectations["camera_name"]

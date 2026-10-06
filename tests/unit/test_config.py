@@ -15,6 +15,7 @@ def test_defaults_load_with_spec_values():
     assert config.models.model_for(Role.VISUAL_CRITIC) == "gemini-3.8-flash"
     assert config.models.model_for(Role.PROMPT_ANALYSIS) == "gpt-6-sol"
     assert config.trellis.steps == 64 and config.trellis.pipeline_type == "1024" and config.trellis.no_texture
+    assert config.modelling.method == "trellis"
     assert set(config.styles) == {"photorealistic", "2d", "animated-3d"}
     assert config.paths.backlot == Path("~/.local/share/backlot").expanduser()
 
@@ -32,8 +33,9 @@ def test_user_file_and_overrides_merge(tmp_path):
     assert ("layout", "code") in phases and ("breakdown", "visual_critic") in phases
 
 
-def test_snapshot_round_trips(tmp_path):
-    config = load_config(None, {"pipeline.threads": 7})
+@pytest.mark.parametrize("method", ["trellis", "procedural"])
+def test_snapshot_round_trips(tmp_path, method):
+    config = load_config(None, {"pipeline.threads": 7, "modelling.method": method})
     snapshot = tmp_path / "config.snapshot.toml"
     snapshot.write_text(config.snapshot_toml())
     assert load_config(snapshot) == config
@@ -49,6 +51,7 @@ def test_snapshot_round_trips(tmp_path):
         ('[models]\nfoo = "x"\n', "Unknown config key"),
         ('[models.phases.nowhere]\ncode = "x"\n', "Unknown phase"),
         ('[usd]\nmaterialx = "sometimes"\n', "materialx"),
+        ('[modelling]\nmethod = "fallback"\n', "modelling.method"),
         ("[pipeline\n", "Invalid TOML"),
     ],
 )
@@ -76,3 +79,11 @@ def test_missing_model_for_role_is_an_error():
     data["models"] = {k: v for k, v in data["models"].items() if k != "code"}
     with pytest.raises(ConfigError, match="code"):
         structure_config(data)
+
+
+def test_legacy_snapshot_defaults_to_trellis():
+    data = dict(load_config().raw)
+    del data["modelling"]
+    config = structure_config(data)
+    assert config.modelling.method == "trellis"
+    assert config.raw["modelling"] == {"method": "trellis"}

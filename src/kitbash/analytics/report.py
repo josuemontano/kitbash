@@ -164,6 +164,7 @@ class AnalyticsReport:
             retopology = [s for s in own if s["name"] == "retopology"]
             result[asset_id] = {
                 "name": record.name,
+                "modelling_method": record.modelling_method,
                 "state": record.state.value,
                 "reused": record.reused,
                 "backlot_id": record.backlot_id,

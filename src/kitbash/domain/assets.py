@@ -1,6 +1,7 @@
 """Per-asset state machine for the modelling phase.
 
 queued -> referencing -> generating -> building -> critiquing -> awaiting_review -> approved | skipped | needs_rework
+Procedural assets take queued -> building, then the same critique, review and approval path.
 
 ``input_needed`` extends the machine for assets that wait on the user (no reference image found,
 unrecognized item, Trellis failing on every attempt). Workers never block on it: the asset leaves the
@@ -45,7 +46,7 @@ class AssetState(StrEnum):
 S = AssetState
 
 TRANSITIONS: Mapping[AssetState, frozenset[AssetState]] = {
-    S.QUEUED: frozenset({S.REFERENCING, S.SKIPPED}),
+    S.QUEUED: frozenset({S.REFERENCING, S.BUILDING, S.SKIPPED}),
     S.REFERENCING: frozenset({S.GENERATING, S.INPUT_NEEDED}),
     S.INPUT_NEEDED: frozenset({S.QUEUED, S.SKIPPED}),
     S.GENERATING: frozenset({S.BUILDING, S.INPUT_NEEDED}),
@@ -92,6 +93,7 @@ class AssetRecord:
     input_request: str | None = None
     error: str | None = None
     extra: Mapping[str, Any] = field(factory=dict)
+    modelling_method: str = "trellis"
 
     @property
     def has_build(self) -> bool:
@@ -116,6 +118,7 @@ def asset_to_dict(record: AssetRecord) -> dict[str, Any]:
         "input_request": record.input_request,
         "error": record.error,
         "extra": dict(record.extra),
+        "modelling_method": record.modelling_method,
     }
 
 
@@ -137,4 +140,5 @@ def asset_from_dict(data: Mapping[str, Any]) -> AssetRecord:
         input_request=data.get("input_request"),
         error=data.get("error"),
         extra=dict(data.get("extra", {})),
+        modelling_method=data.get("modelling_method", "trellis"),
     )

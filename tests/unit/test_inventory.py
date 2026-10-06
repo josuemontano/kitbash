@@ -147,3 +147,12 @@ def test_naming_helpers():
     assert unique_slug("Lamp", taken) == "lamp_02" and "lamp_02" in taken
     convention = NamingConvention()
     assert "mat_oak_chair_<part>" in convention.describe("oak_chair")
+
+
+def test_airborne_support_survives_inventory_roundtrip_and_invalid_policy_fails():
+    inventory = Inventory.from_dict({"items": [{"id": "cloud", "support": "airborne"}, {"id": "house"}]})
+    restored = Inventory.from_dict(inventory.to_dict())
+    assert restored.item("cloud").support == "airborne"
+    assert restored.item("house").support == "contact"
+    with pytest.raises(InventoryError, match="support policy"):
+        Inventory.from_dict({"items": [{"id": "cloud", "support": "ignore"}]})

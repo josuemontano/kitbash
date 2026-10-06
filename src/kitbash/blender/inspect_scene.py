@@ -106,6 +106,17 @@ def _support(root, surfaces, errors):
                 hit, _, _, distance = target["tree"].ray_cast(origin, up, GROUND_TOLERANCE + RAY_EPSILON)
                 if hit is not None and distance - RAY_EPSILON <= GROUND_TOLERANCE:
                     return None
+    # Wall-mounted pieces and terrain intersections have real contact without a support below
+    # their lowest vertices. Check actual surfaces, never bounding-box overlap or script tags.
+    for source in own:
+        for target in other:
+            if source["tree"].overlap(target["tree"]):
+                return None
+            for first, second in ((source, target), (target, source)):
+                for point in chain(first["vertices"], first["centers"]):
+                    hit, _, _, distance = second["tree"].find_nearest(point, GROUND_TOLERANCE)
+                    if hit is not None and distance <= GROUND_TOLERANCE:
+                        return None
     return {
         "object": root.name,
         "gap_m": None if nearest is None else round(nearest, 4),
@@ -204,8 +215,15 @@ def inspect_scene(options: dict) -> tuple[dict, dict]:
     unexpected_placeholders = actual_placeholders - expected_placeholders
     surfaces, errors, materials = _geometry(depsgraph, roots)
     floating = []
+    airborne = Counter(options.get("airborne", {}))
+    intentional_airborne = []
     for root in sorted(roots, key=lambda obj: obj.name):
         failure = _support(root, surfaces, errors)
+        key = root.get("kb_asset_key") or root.get("kb_placeholder")
+        if failure is not None and failure["reason"] in {"no_external_support", "support_too_far"} and airborne[key] > 0:
+            airborne[key] -= 1
+            intentional_airborne.append(root.name)
+            continue
         if failure is not None:
             floating.append(failure)
 
@@ -243,6 +261,7 @@ def inspect_scene(options: dict) -> tuple[dict, dict]:
         "missing_placeholders": sorted(missing_placeholders.elements()),
         "unexpected_placeholders": sorted(unexpected_placeholders.elements()),
         "floating": floating,
+        "intentional_airborne": intentional_airborne,
         "naming_violations": violations,
         "camera": camera,
         "camera_error": camera_error,

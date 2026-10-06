@@ -149,6 +149,11 @@ class PolyHavenConfig:
 
 
 @frozen
+class ModellingConfig:
+    method: str
+
+
+@frozen
 class TrellisConfig:
     steps: int
     pipeline_type: str
@@ -230,6 +235,7 @@ class Config:
     embedding: EmbeddingConfig
     reference: ReferenceConfig
     polyhaven: PolyHavenConfig
+    modelling: ModellingConfig
     trellis: TrellisConfig
     retopology: RetopologyConfig
     blender: BlenderConfig
@@ -278,6 +284,7 @@ def load_config(user_path: Path | None = None, overrides: Mapping[str, Any] | No
 
 def structure_config(data: Mapping[str, Any]) -> Config:
     raw = copy.deepcopy(dict(data))
+    raw.setdefault("modelling", {"method": "trellis"})
     body = dict(raw)
     models = dict(body.pop("models"))
     body["models"] = {
@@ -374,6 +381,8 @@ def _validate(config: Config) -> None:
         raise ConfigError("--threads and --review-buffer must be at least 1")
     if config.critic.max_cycles < 1:
         raise ConfigError("--max-cycles must be at least 1")
+    if config.modelling.method not in {"trellis", "procedural"}:
+        raise ConfigError("modelling.method must be 'trellis' or 'procedural'")
     methods = [m.value for m in RetopologyMethod]
     if config.retopology.method not in methods:
         raise ConfigError(f"Unknown retopology method {config.retopology.method!r}", hint=f"Methods: {', '.join(methods)}.")

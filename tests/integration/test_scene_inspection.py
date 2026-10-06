@@ -252,3 +252,30 @@ bpy.ops.wm.save_as_mainfile(filepath=kb.args()["output_blend"])
     assert result["facts"]["missing_assets"] == 1
     assert result["facts"]["floating_assets"] == 0
     assert result["report"]["camera"]["name"] == "camera"
+
+
+def test_wall_contact_and_explicit_airborne_budget_do_not_allow_missing_geometry(tmp_path):
+    result = run_scene(tmp_path, """
+wall = cube("wall", (0, 0, 1.5))
+wall.scale = (0.2, 4, 3)
+window = cube("window", (0.35, 0, 1.5))
+window.scale = (0.5, 1, 1)
+window["kb_asset_key"] = "window"
+cloud = cube("cloud", (3, 0, 4))
+cloud["kb_asset_key"] = "cloud"
+cloud["airborne"] = True  # Untrusted scene tags cannot exempt grounding.
+empty = bpy.data.objects.new("empty", None)
+bpy.context.scene.collection.objects.link(empty)
+empty["kb_asset_key"] = "empty"
+snapshot("default")
+snapshot("intentional", airborne={"cloud": 1, "empty": 1})
+second = cube("cloud_02", (5, 0, 4))
+second["kb_asset_key"] = "cloud"
+window.location.x += 0.2
+snapshot("separated", airborne={"cloud": 1, "empty": 1})
+""", expectations={"assets": {"window": {}, "cloud": {}, "empty": {}}})
+    assert {row["object"] for row in result["default"]["report"]["floating"]} == {"cloud", "empty"}
+    intentional = result["intentional"]["report"]
+    assert intentional["intentional_airborne"] == ["cloud"]
+    assert [(row["object"], row["reason"]) for row in intentional["floating"]] == [("empty", "no_inspectable_geometry")]
+    assert {row["object"] for row in result["separated"]["report"]["floating"]} == {"cloud_02", "empty", "window"}

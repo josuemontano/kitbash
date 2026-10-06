@@ -157,7 +157,7 @@ class Application:
         self.user: UserChannel = TerminalUser(console, self.dashboard, images) if interactive else AutoPilot()
         self.backlot = Backlot(config.paths.backlot, self.embedder)
         self._http = make_http_client(config.reference.timeout_s)
-        self.retopologizer = retopology_factory(config, self.tracker)
+        self.retopologizer = retopology_factory(config, self.tracker) if config.modelling.method == "trellis" else None
 
     def preflight(self) -> PreflightReport:
         report = run_preflight(self.config, self.layout.logs_dir, self.retopologizer)
@@ -209,7 +209,7 @@ class Application:
             config.reference,
             tracker,
             cache_dir=reference_cache,
-        )
+        ) if config.modelling.method == "trellis" else None
         trellis = TrellisRunner(
             config.paths.trellis,
             python=report.trellis_python,
@@ -220,7 +220,7 @@ class Application:
             retries=config.trellis.retries,
             max_concurrent=config.trellis_concurrency(),
             recorder=tracker,
-        )
+        ) if config.modelling.method == "trellis" else None
         breakdown = BreakdownAgent(llm, prompts, toolkit, config, layout, self.run_input)
         modelling = ModellingAgent(llm, toolkit, fidelity, finder, trellis, self.retopologizer, catalog, config, layout, tracker)
         layout_agent = LayoutAgent(llm, toolkit, catalog, config, layout, self.run_input)

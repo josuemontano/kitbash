@@ -109,7 +109,8 @@ class AssemblyPhase:
             progress.status = "inspecting the assembled scene"
             with self._tracker.span(SpanKind.STEP, "assembly.inspect"):
                 inspection, blend_facts = self._toolkit.inspect_scene(
-                    scene / "scene.blend", args["assets"], [item.id for item in skipped], logs, "scene_inspect"
+                    scene / "scene.blend", args["assets"], [item.id for item in skipped], logs, "scene_inspect",
+                    airborne=args["airborne"],
                 )
             final = None
             if blend_facts["has_camera"]:
@@ -131,6 +132,7 @@ class AssemblyPhase:
                         "expected_assets": {key: spec["instances"] for key, spec in args["assets"].items()},
                         "expected_placeholders": [item.id for item in skipped],
                         "camera_name": inspection["camera"]["name"] if inspection["camera"] else None,
+                        "airborne": args["airborne"],
                     },
                 )
         usd_facts = usd.facts()

@@ -56,6 +56,63 @@ kb.assign(obj, body)
 kb.save_asset(obj)
 '''
 
+PROCEDURAL_SCRIPT = '''import kitbash_bpy as kb
+
+import bpy
+import math
+
+kb.reset_scene()
+parts = []
+if kb.args()["slug"] == "wooden_crate":
+    def plank(location, size):
+        bpy.ops.mesh.primitive_cube_add(size=1, location=location)
+        obj = bpy.context.object
+        obj.scale = size
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        parts.append(obj)
+
+    plank((0, 0, 0.015), (0.6, 0.4, 0.03))
+    for z in (0.08, 0.19, 0.30):
+        for y in (-0.185, 0.185):
+            plank((0, y, z), (0.6, 0.03, 0.10))
+        for x in (-0.285, 0.285):
+            plank((x, 0, z), (0.03, 0.34, 0.10))
+    # The scene places its mug on top, so this storage crate needs a slatted lid.
+    for y in (-0.16, -0.08, 0, 0.08, 0.16):
+        plank((0, y, 0.335), (0.6, 0.075, 0.03))
+    body = kb.principled("pine", base_color=(0.55, 0.36, 0.2), roughness=0.6)
+else:
+    # Closed, hollow cup with an annular rim and a curved handle.
+    vertices = []
+    for radius, z in ((0.045, 0), (0.045, 0.1), (0.039, 0.1), (0.039, 0.008)):
+        vertices.extend((radius * math.cos(i * math.tau / 32), radius * math.sin(i * math.tau / 32), z) for i in range(32))
+    faces = []
+    for ring in range(3):
+        for i in range(32):
+            j = (i + 1) % 32
+            faces.append((ring * 32 + i, ring * 32 + j, (ring + 1) * 32 + j, (ring + 1) * 32 + i))
+    faces.extend((tuple(reversed(range(32))), tuple(range(96, 128))))
+    mesh = bpy.data.meshes.new("cup")
+    mesh.from_pydata(vertices, [], faces)
+    cup = bpy.data.objects.new("cup", mesh)
+    bpy.context.collection.objects.link(cup)
+    parts.append(cup)
+    bpy.ops.mesh.primitive_torus_add(major_radius=0.025, minor_radius=0.007, location=(0.055, 0, 0.053), rotation=(math.pi / 2, 0, 0))
+    parts.append(bpy.context.object)
+    body = kb.principled("ceramic", base_color=(0.9, 0.9, 0.9), roughness=0.25)
+bpy.ops.object.select_all(action="DESELECT")
+for obj in parts:
+    obj.select_set(True)
+bpy.context.view_layer.objects.active = parts[0]
+bpy.ops.object.join()
+obj = bpy.context.object
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+kb.fit_dimensions(obj, mode="exact")
+kb.origin_to_base(obj)
+kb.assign(obj, body)
+kb.save_asset(obj)
+'''
+
 LAYOUT_SCRIPT = '''import kitbash_bpy as kb
 
 PLACEMENTS = {placements}
@@ -117,7 +174,8 @@ def respond(task: str, prompt: str) -> str:
     if task == "modelling.reference.select":
         return json.dumps({"choice": 1, "reason": "the crop shows the whole object", "background": "other"})
     if task == "modelling.script":
-        return "```python\n" + BUILD_SCRIPT + "```"
+        script = PROCEDURAL_SCRIPT if "PROCEDURAL CONSTRUCTION:" in prompt else BUILD_SCRIPT
+        return "```python\n" + script + "```"
     if task == "layout.script":
         return "```python\n" + layout_script(prompt) + "```"
     if task.endswith(".patch"):

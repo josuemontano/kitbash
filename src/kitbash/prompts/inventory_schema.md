@@ -37,6 +37,12 @@ rotation_deg [90, 0, 0] looks horizontally along +Y, [75, 0, 0] looks slightly d
 - `id`: unique snake_case. `image_bbox`: normalized [x0, y0, x1, y1], origin top-left (use null without an image).
 - `relationships[].type`: on, next_to, inside, under, attached_to, in_front_of or behind; `target` is another item id.
 - `confidence`: how sure you are what the object is (below 0.45 means "I cannot tell what this is").
+- `support`: `contact` (default) for objects resting on or attached to another surface; `airborne` only
+  for deliberately floating/flying objects requested by the scene, such as a cloud. Never use it to
+  excuse a misplaced object. An airborne object still needs complete visible geometry.
 - Do not list the floor, walls, ceiling, ground, sky or backdrop; the layout builds those.
 - List each distinct physical object once. Repeated identical objects (e.g. 4 dining chairs) are separate
   items with ids like `dining_chair_01`, `dining_chair_02` and the same name and description.
+- Keep the components of one assembled object together: a cottage includes its roof, walls, door and
+  windows; a tree includes its trunk and canopy. Split components only when they need independent placement.
+  Describe their individual shapes and materials within that object's description.

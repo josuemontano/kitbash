@@ -102,12 +102,14 @@ class BlenderToolkit:
         return Path(result["images"][0])
 
     def inspect_scene(
-        self, blend: Path, assets: Mapping[str, Any], expected_placeholders: Sequence[str], log_dir: Path, log_name: str
+        self, blend: Path, assets: Mapping[str, Any], expected_placeholders: Sequence[str], log_dir: Path, log_name: str,
+        *, airborne: Mapping[str, int] | None = None,
     ) -> tuple[dict, dict]:
         result = self._fixed(
             "inspect_scene.py", blend, log_dir, log_name,
             assets=dict(assets), expected_assets={key: int(spec.get("instances", 1)) for key, spec in assets.items()},
             expected_placeholders=list(expected_placeholders),
+            airborne=dict(airborne or {}),
         )
         return result["report"], result["facts"]
 

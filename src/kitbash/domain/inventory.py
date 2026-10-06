@@ -150,6 +150,7 @@ class InventoryItem:
     user_reference: str | None = None
     search_name: str | None = None
     same_as: str | None = None  # another item this one is an identical copy of (modelled once)
+    support: str = "contact"  # "airborne" deliberately needs no physical support
 
     @property
     def asset_key(self) -> str:
@@ -173,6 +174,7 @@ class InventoryItem:
             "relationships": [{"type": r.kind, "target": r.target} for r in self.relationships],
             "materials_hint": list(self.materials_hint),
             "confidence": self.confidence,
+            "support": self.support,
             "reuse_backlot_id": self.reuse_backlot_id,
             "user_reference": self.user_reference,
             "search_name": self.search_name,
@@ -241,6 +243,9 @@ class Inventory:
 
 def _parse_item(raw: Mapping[str, Any], taken: set[str]) -> InventoryItem:
     name = str(raw.get("name") or raw.get("id") or "item").strip()
+    support = raw.get("support", "contact")
+    if support not in ("contact", "airborne"):
+        raise InventoryError(f"Invalid support policy {support!r} for {name!r}; use contact or airborne")
     return InventoryItem(
         id=unique_slug(str(raw.get("id") or name), taken),
         name=name,
@@ -255,6 +260,7 @@ def _parse_item(raw: Mapping[str, Any], taken: set[str]) -> InventoryItem:
         user_reference=raw.get("user_reference") or None,
         search_name=raw.get("search_name") or None,
         same_as=raw.get("same_as") or None,
+        support=support,
     )
 
 

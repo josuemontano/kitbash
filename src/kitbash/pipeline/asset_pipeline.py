@@ -74,7 +74,7 @@ class AssetPipeline:
         asset = self._board.get(asset_id)
         message = f"{type(error).__name__}: {error}"
         if asset.state is S.QUEUED:
-            asset = self._board.transition(asset_id, S.REFERENCING)
+            asset = self._board.transition(asset_id, S.BUILDING if asset.modelling_method == "procedural" else S.REFERENCING)
         if asset.state is S.NEEDS_REWORK:
             asset = self._board.transition(asset_id, S.BUILDING)
         if S.AWAITING_REVIEW in TRANSITIONS[asset.state]:
@@ -87,6 +87,8 @@ class AssetPipeline:
     # -- steps -------------------------------------------------------------------------------------
 
     def _start(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
+        if asset.modelling_method == "procedural":
+            return self._board.transition(asset.id, S.BUILDING, "procedural geometry")
         return self._board.transition(asset.id, S.REFERENCING)
 
     def _reference(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
@@ -165,6 +167,11 @@ class AssetPipeline:
         )
 
     def _rework(self, asset: AssetRecord, item: InventoryItem) -> AssetRecord:
+        if asset.modelling_method == "procedural" and asset.rework_entry in (ReworkEntry.REGENERATE, ReworkEntry.REFERENCE):
+            return self._board.transition(
+                asset.id, S.BUILDING, "rebuild procedural geometry", attempt=asset.attempt + 1,
+                extra={**asset.extra, "fresh_script": True},
+            )
         match asset.rework_entry:
             case ReworkEntry.REGENERATE:
                 return self._board.transition(

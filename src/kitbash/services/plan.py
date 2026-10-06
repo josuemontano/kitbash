@@ -51,14 +51,19 @@ class Planner:
         cfg = self._config
         analysis_role = Role.IMAGE_ANALYSIS if self._input.mode is InputMode.IMAGE else Role.PROMPT_ANALYSIS
         B, M, L = PhaseName.BREAKDOWN, PhaseName.MODELLING, PhaseName.LAYOUT
+        reconstruction = []
+        if cfg.modelling.method == "trellis":
+            reconstruction = [
+                PlanRow("modelling", "per asset: reference image", f"{', '.join(cfg.reference.providers)} + 1 call to {self._model(Role.REFERENCE_SELECTION, M)}"),
+                PlanRow("modelling", "per asset: Trellis", f"1 run (<= {cfg.trellis.retries} retries), {cfg.trellis.steps} steps, pipeline {cfg.trellis.pipeline_type}"),
+                PlanRow("modelling", "per asset: retopology", self._retopology_estimate()),
+            ]
         return [
             PlanRow("breakdown", f"analyze the {self._input.mode.value}", f"1 call to {self._model(analysis_role, B)}"),
             PlanRow("breakdown", "critic loop (blockout render vs reference)", f"<= {c} cycles x (2 Blender runs, 2 critics: {self._critics(B)})"),
             PlanRow("breakdown", "patches", f"<= {c - 1} calls to {self._model(Role.CODE, B)}"),
             PlanRow("breakdown", "backlot lookup, unrecognized items, user gate", "embedding search per item"),
-            PlanRow("modelling", "per asset: reference image", f"{', '.join(cfg.reference.providers)} + 1 call to {self._model(Role.REFERENCE_SELECTION, M)}"),
-            PlanRow("modelling", "per asset: Trellis", f"1 run (<= {cfg.trellis.retries} retries), {cfg.trellis.steps} steps, pipeline {cfg.trellis.pipeline_type}"),
-            PlanRow("modelling", "per asset: retopology", self._retopology_estimate()),
+            *reconstruction,
             PlanRow("modelling", "per asset: build script", f"1 call to {self._model(Role.CODE, M)}"),
             PlanRow("modelling", "per asset: critic loop", f"<= {c} cycles x (7 Blender runs incl. USD export + round trip, 2 critics: {self._critics(M)})"),
             PlanRow("modelling", "per asset: patches", f"<= {c - 1} calls to {self._model(Role.CODE, M)}"),
@@ -80,7 +85,7 @@ class Planner:
 
     def _retopology_paths(self) -> list[tuple[str, str, str]]:
         cfg = self._config
-        if cfg.retopology.method_enum is RetopologyMethod.DECIMATE:
+        if cfg.modelling.method == "procedural" or cfg.retopology.method_enum is RetopologyMethod.DECIMATE:
             return []
         try:
             self._retopology_factory(cfg, NullRecorder()).check()
@@ -99,13 +104,16 @@ class Planner:
             ("output", str(self._layout.root), "exists" if self._layout.root.exists() else "will be created"),
             ("input", self._input.describe(), ""),
             ("backlot", str(cfg.paths.backlot), "exists" if cfg.paths.backlot.exists() else "will be created"),
-            ("trellis", str(cfg.paths.trellis), "ok" if (cfg.paths.trellis / "generate.py").is_file() else "MISSING generate.py"),
-            ("trellis python", cfg.tools.resolved_trellis_python(cfg.paths.trellis), ""),
-            *self._retopology_paths(),
+            *([
+                ("trellis", str(cfg.paths.trellis), "ok" if (cfg.paths.trellis / "generate.py").is_file() else "MISSING generate.py"),
+                ("trellis python", cfg.tools.resolved_trellis_python(cfg.paths.trellis), ""),
+                *self._retopology_paths(),
+            ] if cfg.modelling.method == "trellis" else []),
             ("blender", cfg.tools.blender, "found" if _found(cfg.tools.blender) else "NOT FOUND"),
             ("omp", cfg.tools.omp, "found" if _found(cfg.tools.omp) else "NOT FOUND"),
             ("rubric", self._rubric.source, f"{len(self._rubric.criteria)} criteria"),
             ("style", cfg.pipeline.style, cfg.style.render_engine),
+            ("modelling", cfg.modelling.method, ""),
         ]
 
 

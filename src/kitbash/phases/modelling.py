@@ -107,6 +107,7 @@ class ModellingPhase:
             seed=self._config.trellis.seed,
             reused=bool(reuse_backlot_id),
             backlot_id=reuse_backlot_id,
+            modelling_method=self._config.modelling.method,
         )
 
     # -- producer / consumer -------------------------------------------------------------------------

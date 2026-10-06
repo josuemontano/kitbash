@@ -172,7 +172,8 @@ class LayoutSubject:
         counts = Counter(item.asset_key for item in self._inventory.items)
         for key, spec in assets.items():
             spec["instances"] = counts[key]
-        return {"output_blend": str(output_blend), "assets": assets, "asset_mode": asset_mode}
+        airborne = Counter(item.asset_key for item in self._inventory.items if item.support == "airborne")
+        return {"output_blend": str(output_blend), "assets": assets, "asset_mode": asset_mode, "airborne": dict(airborne)}
 
     def evaluate(self, script: Path, cycle_dir: Path, cycle: int) -> Evaluation:
         blend = cycle_dir / "layout.blend"
@@ -186,7 +187,9 @@ class LayoutSubject:
         images = [render]
         if self._input.image is not None:
             images.append(side_by_side([self._input.image, render], ["reference", "layout"], renders / f"cycle_{cycle:02d}_compare.png"))
-        report, facts = self._toolkit.inspect_scene(blend, args["assets"], [i.id for i in self._skipped], cycle_dir, "inspect")
+        report, facts = self._toolkit.inspect_scene(
+            blend, args["assets"], [i.id for i in self._skipped], cycle_dir, "inspect", airborne=args["airborne"]
+        )
         return Evaluation(ok=True, images=tuple(images), facts=facts, report=report, artifacts={"blend": str(blend), "render": str(render)})
 
 
@@ -203,6 +206,7 @@ def _inventory_for_layout(inventory: Inventory) -> list[dict[str, Any]]:
             "dimensions_m": item.dimensions.as_tuple(),
             "location_m": item.position.location,
             "rotation_deg": item.position.rotation_deg,
+            "support": item.support,
             "relationships": [
                 {"type": r.kind, "target": r.target}
                 for r in sorted(item.relationships, key=lambda r: (r.kind, r.target))

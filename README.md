@@ -2,11 +2,11 @@
 
 `kitbash` turns a reference image or a text prompt into a complete, human-editable Blender scene
 (plus USD). It breaks the shot down into individual objects, models each one (reference image →
-Trellis mesh → Blender build script with node-based PBR materials), lays the scene out for a chosen
-style, and exports everything. Every approved asset goes into a reusable global library, the
+Trellis mesh by default, or explicit description-driven procedural geometry), builds node-based PBR
+materials in Blender, lays the scene out for a chosen style, and exports everything. Every approved asset goes into a reusable global library, the
 **backlot**, so later scenes can reuse it instead of modelling it again.
 
-Everything runs headless: Blender (`blender -b`), the `omp` agent (all LLM calls) and Trellis.
+Everything runs headless: Blender (`blender -b`), the `omp` agent (all LLM calls), and Trellis when selected.
 
 ```
 image or prompt
@@ -30,8 +30,8 @@ image or prompt
 - Blender 4.2 or newer on `PATH` (developed against Blender 5.2.2). MaterialX export is detected at
   startup, never assumed.
 - `omp` on `PATH`, already configured with the models you use (kitbash never manages API keys).
-- A [trellis-mac](https://github.com/shivampkumar/trellis-mac) checkout with its `.venv` set up and model
-  weights downloaded.
+- For the default `modelling.method = "trellis"`: a [trellis-mac](https://github.com/shivampkumar/trellis-mac)
+  checkout with its `.venv` set up and model weights downloaded. Procedural mode does not require Trellis or TriFlow.
 
 ## Setup
 
@@ -73,6 +73,19 @@ Ctrl+C and fatal model-access errors stop subprocess groups and wait for modelli
 before closing HTTP or SQLite. Interrupted assets keep their checkpoints; cancellation does not turn
 them into failed assets or start tool retries. A second Ctrl+C during teardown is deferred until cleanup
 finishes.
+
+For stylized or geometric scenes without suitable reference photographs, select procedural modelling
+explicitly in the file passed to `--config`:
+
+```toml
+[modelling]
+method = "procedural"
+```
+
+The code model constructs editable geometry from each inventory description. Reference search,
+Trellis and retopology are not invoked; build evaluation, visual/technical critique, USD validation,
+asset approval and final assembly remain unchanged. This is not an automatic fallback after a failed
+reference search. Keep `method = "trellis"` (the default) for reference-driven reconstruction.
 
 ### `build` options
 
@@ -128,6 +141,7 @@ Main sections:
 - `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
   optional `vision_fallback`. Defaults: `input_crop`, `wikimedia`, `openverse`; no model search.
   Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
+- `[modelling]`: `method = "trellis"` (default) or `"procedural"` (description-driven Blender geometry).
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
 - `[retopology]`: `method` (`triflow` or `decimate`), `face_count = 4000`, `qem_threshold = 12.0`,
@@ -145,9 +159,9 @@ Main sections:
 
 ### Startup checks
 
-Before doing any work, `build` and `resume` check that `omp`, Blender and the Trellis checkout exist,
-and that every configured model (including per-phase overrides) appears in `omp models --json`. They
-also check that roles which send images use models that accept them. Blender's USD exporter options
+Before doing any work, `build` and `resume` check that `omp` and Blender exist (and the Trellis checkout
+in Trellis mode), and that every configured model, including per-phase overrides, appears in
+`omp models --json`. They also check that roles which send images use models that accept them. Blender's USD exporter options
 are probed to detect MaterialX support. The Blender, Blender Python and omp versions are recorded in
 the analytics. With `omp.preflight_ping = true` (the default), each model also gets one tiny prompt, so rejected
 credentials or an exhausted budget stop the run in seconds rather than mid-phase. During a run, those
@@ -252,6 +266,10 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
                  └──────────┴──→ input_needed (no reference found, Trellis failed) → queued | skipped
 ```
 
+Procedural assets enter `building` directly from `queued`. The modelling method is checkpointed per
+asset and recorded in analytics/backlot provenance; resume does not silently convert approved assets.
+Regenerate/new-reference rework on a procedural asset rebuilds its geometry without reconstruction tools.
+
 - **Producers:** `--threads` workers take assets through reference search, Trellis
   (`python generate.py <ref> --output <asset> --steps 64 --no-texture --pipeline-type 1024`, with up to 2
   retries), retopology, the build script and the critic loop. A worker never waits on you: a finished asset goes
@@ -294,6 +312,8 @@ and stdout are terminals, including runs with `--no-interactive`:
 - Preview paths appear in the review pane. **F2** or **Open previews** opens them in the system viewer,
   without emitting terminal image escape sequences over the dashboard. `ui.show_previews = false`
   disables previews.
+- Terminal capture supports lazy local embeddings and multiprocessing resources: descriptorless capture
+  streams report `UnsupportedOperation`, not an invalid negative file descriptor.
 
 Redirected output or input uses plain tables and stdin prompts instead of a full-screen UI, so scripts
 and pipes keep working. Help, `--dry-run`, library commands and the final run summary remain ordinary
@@ -450,14 +470,24 @@ certify arbitrary shader graphs or every unlinked Principled value; the render c
 The comparison is `score = min(SSIM, 1 − 2·mean color delta)`. The rung used for each material, and
 the score, are stored in the backlot (`usd_material_mode`, `usd_roundtrip_score`) and in the analytics.
 
+For simple Background worlds, the exported USD dome preserves world strength and constant color or
+environment-map illumination. Scene exports also retain Blender's `view_transform`, `look`, `exposure`
+and `gamma` in `customLayerData.kitbash.view_settings`; Kitbash restores them for the round-trip render.
+Other USD viewers must select an equivalent display transform themselves. The comparison does not
+replace missing lighting with the source scene's lighting.
+
 ### Final acceptance
 
 Assembly inspects the **rebuilt, localized `scene.blend`**, not just its earlier layout preview, and
 inspects the **actual re-imported USD**. Both must contain the expected number of each approved asset
 instance (including inventory `same_as` copies) and skipped-item placeholders, with no missing or
-extra placements, a valid camera, available textures and grounded geometry. Inspection includes
+extra placements, a valid camera, available textures and supported geometry. Inspection includes
 EMPTY-root hierarchies and linked collection instances. Support must be external geometry within
-3 cm of the placement base; the object's own geometry and an imaginary floor at z=0 do not count.
+3 cm of the placement base or actual side-surface contact/intersection (for example a wall-mounted window);
+the object's own geometry and an imaginary floor at z=0 do not count. Inventory items may declare
+`support = "airborne"` for intentionally floating objects such as clouds. Only the inventory's expected
+instance count permits unsupported geometry; scene-authored exemption tags do not. Empty or invalid
+geometry still fails. Both Blender and USD inspections use that same policy.
 The USD comparison uses the selected scene camera, not whichever camera imports first.
 
 Automatic publication requires the final rubric to pass with every applicable criterion scored,
