@@ -1,6 +1,7 @@
 """The backlot: a global, reusable asset library with semantic search (SQLite + sqlite-vec)."""
 
 import fcntl
+import hashlib
 import json
 import shutil
 import time
@@ -8,6 +9,7 @@ import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from attrs import field, frozen
@@ -16,6 +18,7 @@ from kitbash.domain.inventory import embedding_text
 from kitbash.errors import BacklotError
 from kitbash.infra.embeddings import Embedder
 from kitbash.naming import slugify
+from kitbash.services.artifacts import snapshot
 from kitbash.store.database import Database
 from kitbash.store.vectors import VectorIndex
 
@@ -40,7 +43,8 @@ CREATE TABLE IF NOT EXISTS assets (
     created_at REAL NOT NULL,
     version INTEGER NOT NULL,
     metadata TEXT NOT NULL,
-    publication_status TEXT NOT NULL DEFAULT 'ready' CHECK(publication_status IN ('pending', 'ready'))
+    publication_status TEXT NOT NULL DEFAULT 'ready' CHECK(publication_status IN ('pending', 'ready')),
+    artifact_manifest TEXT
 );
 CREATE INDEX IF NOT EXISTS assets_slug ON assets(slug);
 """
@@ -49,12 +53,14 @@ VECTOR_TABLE = "asset_vec"
 
 @frozen
 class AssetBundle:
-    """Files of a finished asset. ``root`` holds the .blend, its textures and the USD tree."""
+    """Evaluated asset bytes: the complete root tree and a separately hashed preview."""
 
     root: Path
     blend: Path
     usd: Path
     preview: Path
+    hashes: Mapping[str, str] = field(converter=lambda hashes: MappingProxyType(dict(hashes)))
+    preview_hash: str
 
 
 @frozen
@@ -136,6 +142,8 @@ class Backlot:
                 columns = {row["name"] for row in self._db.query("PRAGMA table_info(assets)")}
                 if "publication_status" not in columns:
                     self._db.execute("ALTER TABLE assets ADD COLUMN publication_status TEXT NOT NULL DEFAULT 'pending'")
+                if "artifact_manifest" not in columns:
+                    self._db.execute("ALTER TABLE assets ADD COLUMN artifact_manifest TEXT")
             self._index = VectorIndex(self._db, VECTOR_TABLE, embedder.dimensions, embedder.name, rebuild=rebuild_index)
             with self._publication_lock(blocking=False) as acquired:
                 if acquired:
@@ -154,11 +162,13 @@ class Backlot:
             return self._add(draft, bundle)
 
     def _add(self, draft: BacklotDraft, bundle: AssetBundle) -> BacklotEntry:
+        blend_relative, usd_relative = self._check_source(bundle)
         slug = slugify(draft.name)
         asset_id = f"{slug}-{uuid.uuid4().hex}"
         destination = self.assets_dir / asset_id
         staging = self._staging_dir / asset_id
         preview = destination / f"preview{bundle.preview.suffix}"
+        hashes = {**bundle.hashes, preview.name: bundle.preview_hash}
         row = {
             "id": asset_id,
             "slug": slug,
@@ -169,8 +179,8 @@ class Backlot:
             "dimensions": json.dumps(list(draft.dimensions)),
             "style": draft.style,
             "source_reference": draft.source_reference,
-            "blend_path": str((destination / bundle.blend.relative_to(bundle.root)).relative_to(self.root)),
-            "usd_path": str((destination / bundle.usd.relative_to(bundle.root)).relative_to(self.root)),
+            "blend_path": str((destination / blend_relative).relative_to(self.root)),
+            "usd_path": str((destination / usd_relative).relative_to(self.root)),
             "preview_path": str(preview.relative_to(self.root)),
             "usd_material_mode": draft.usd_material_mode,
             "usd_roundtrip_score": draft.usd_roundtrip_score,
@@ -178,21 +188,39 @@ class Backlot:
             "metadata": json.dumps(dict(draft.metadata), default=str),
         }
         try:
-            shutil.copytree(bundle.root, staging)
-            shutil.copy2(bundle.preview, staging / preview.name)
+            shutil.copytree(bundle.root, staging, symlinks=True)
+            for name in ("metadata.json", preview.name):
+                if (staging / name).exists() or (staging / name).is_symlink():
+                    raise BacklotError(f"Staged asset collides with publisher-created {name!r}")
+            shutil.copy2(bundle.preview, staging / preview.name, follow_symlinks=False)
+            self._check_source(bundle)
+            try:
+                if snapshot(staging, (staging,)) != hashes:
+                    raise ValueError("copied files do not match evaluated content")
+            except (OSError, ValueError) as exc:
+                raise BacklotError(f"Invalid staged backlot bundle for {draft.name!r}: {exc}") from exc
             text = embedding_text(draft.name, draft.category, draft.description)
             vector = self._embedder.embed([f"{text} {' '.join(draft.tags)}".strip()])[0]
             with self._db.transaction():
                 row["version"] = self._next_version(slug)
                 row["embedding"] = json.dumps(vector)
-                (staging / "metadata.json").write_text(json.dumps({**row, "embedding": None}, indent=2), encoding="utf-8")
+                metadata = json.dumps(self._metadata(row), indent=2)
+                if (staging / "metadata.json").exists() or (staging / "metadata.json").is_symlink():
+                    raise BacklotError("Staged asset collides with publisher-created 'metadata.json'")
+                (staging / "metadata.json").write_text(metadata, encoding="utf-8")
+                hashes["metadata.json"] = hashlib.sha256(metadata.encode("utf-8")).hexdigest()
+                row["artifact_manifest"] = json.dumps({
+                    "id": asset_id, "root": destination.relative_to(self.root).as_posix(), "hashes": hashes,
+                })
                 if not self._bundle_complete(staging, row):
-                    raise BacklotError(f"Incomplete backlot bundle for {draft.name!r}")
+                    raise BacklotError(f"Invalid staged backlot bundle for {draft.name!r}")
                 row["publication_status"] = "pending"
                 cursor = self._db.execute(
                     f"INSERT INTO assets({', '.join(row)}) VALUES ({', '.join('?' for _ in row)})", tuple(row.values())
                 )
                 self._index.upsert(int(cursor.lastrowid), vector)
+            if not self._bundle_complete(staging, row):
+                raise BacklotError(f"Changed pending backlot bundle for {draft.name!r}")
             staging.rename(destination)
             self._mark_ready(asset_id)
         except BaseException:
@@ -274,23 +302,69 @@ class Backlot:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    @staticmethod
+    def _check_source(bundle: AssetBundle) -> tuple[Path, Path]:
+        try:
+            if any(".." in path.parts for path in (bundle.root, bundle.blend, bundle.usd, bundle.preview)):
+                raise ValueError("bundle paths must not contain '..'")
+            blend = bundle.blend.absolute().relative_to(bundle.root.absolute())
+            usd = bundle.usd.absolute().relative_to(bundle.root.absolute())
+            if snapshot(bundle.root, (bundle.root,)) != bundle.hashes:
+                raise ValueError("asset tree does not match evaluated content")
+            for relative in (blend, usd):
+                if relative.as_posix() not in bundle.hashes or (bundle.root / relative).stat().st_size == 0:
+                    raise ValueError("blend and USD paths must select nonempty evaluated files")
+            if (
+                snapshot(bundle.preview.parent, (bundle.preview,)) != {bundle.preview.name: bundle.preview_hash}
+                or bundle.preview.stat().st_size == 0
+            ):
+                raise ValueError("preview does not match evaluated content")
+            for name in ("metadata.json", f"preview{bundle.preview.suffix}"):
+                if (bundle.root / name).exists() or (bundle.root / name).is_symlink():
+                    raise ValueError(f"asset tree collides with publisher-created {name!r}")
+        except (OSError, ValueError) as exc:
+            raise BacklotError(f"Invalid or changed backlot bundle: {exc}") from exc
+        return blend, usd
+
+    @staticmethod
+    def _metadata(row: Any) -> dict[str, Any]:
+        # Publication state and digest evidence live only in SQLite; metadata cannot hash itself.
+        return {
+            **{key: value for key, value in dict(row).items() if key not in {
+                "rowid", "embedding", "publication_status", "artifact_manifest",
+            }},
+            "embedding": None,
+        }
+
     def _mark_ready(self, asset_id: str) -> None:
+        row = self._db.one("SELECT * FROM assets WHERE id = ? AND publication_status = 'pending'", (asset_id,))
+        if row is None or not self._bundle_complete(self.assets_dir / asset_id, row):
+            raise BacklotError(f"Invalid pending backlot bundle {asset_id!r}")
         self._db.execute("UPDATE assets SET publication_status = 'ready' WHERE id = ?", (asset_id,))
 
     def _bundle_complete(self, directory: Path, row: Any) -> bool:
         try:
+            asset_id = row["id"]
+            if not asset_id or asset_id in {".", ".."} or Path(asset_id).name != asset_id:
+                return False
+            owner = Path("assets") / asset_id
+            if directory not in (self.assets_dir / asset_id, self._staging_dir / asset_id):
+                return False
+            manifest = json.loads(row["artifact_manifest"])
+            if manifest["id"] != asset_id or manifest["root"] != owner.as_posix():
+                return False
+            if snapshot(directory, (directory,)) != manifest["hashes"]:
+                return False
             metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-            if metadata["id"] != row["id"]:
+            if metadata != self._metadata(row):
                 return False
             for key in ("blend_path", "usd_path", "preview_path"):
-                relative = Path(row[key]).relative_to(Path("assets") / row["id"])
+                relative = Path(row[key]).relative_to(owner)
                 artifact = directory / relative
                 if (
                     ".." in relative.parts
-                    or metadata[key] != row[key]
-                    or not artifact.is_file()
+                    or relative.as_posix() not in manifest["hashes"]
                     or artifact.stat().st_size == 0
-                    or not artifact.resolve().is_relative_to(directory.resolve())
                 ):
                     return False
         except (OSError, ValueError, KeyError, TypeError):
@@ -300,28 +374,39 @@ class Backlot:
     def _recover(self) -> None:
         """Reconcile only under the publication lock, so live writers' staging is untouched."""
         for row in self._db.query("SELECT * FROM assets WHERE publication_status = 'pending'"):
-            destination = self.assets_dir / row["id"]
-            staging = self._staging_dir / row["id"]
-            if not destination.exists() and self._bundle_complete(staging, row):
-                staging.rename(destination)
-            if self._bundle_complete(destination, row):
-                self._mark_ready(row["id"])
-            else:
-                with self._db.transaction():
-                    self._index.delete(int(row["rowid"]))
-                    self._db.execute("DELETE FROM assets WHERE id = ?", (row["id"],))
-                shutil.rmtree(destination, ignore_errors=True)
+            asset_id = row["id"]
+            valid_id = bool(asset_id) and asset_id not in {".", ".."} and Path(asset_id).name == asset_id
+            if valid_id:
+                destination = self.assets_dir / asset_id
+                staging = self._staging_dir / asset_id
+                if not destination.exists() and self._bundle_complete(staging, row):
+                    staging.rename(destination)
+                try:
+                    self._mark_ready(asset_id)
+                except BacklotError:
+                    pass
+                else:
+                    continue
+            with self._db.transaction():
+                self._index.delete(int(row["rowid"]))
+                self._db.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
+            if valid_id:
+                self._remove_directory(destination)
         # Anything left here either predates the pending commit, or is redundant after publication.
         for staging in self._staging_dir.iterdir():
-            if staging.is_dir():
-                shutil.rmtree(staging)
-            else:
-                staging.unlink()
+            self._remove_directory(staging)
         # Deletion may have committed just before process death interrupted directory cleanup.
         owned = {row["id"] for row in self._db.query("SELECT id FROM assets")}
         for destination in self.assets_dir.iterdir():
-            if destination.name not in owned and destination.is_dir():
-                shutil.rmtree(destination)
+            if destination.name not in owned:
+                self._remove_directory(destination)
+
+    @staticmethod
+    def _remove_directory(directory: Path) -> None:
+        if directory.is_dir() and not directory.is_symlink():
+            shutil.rmtree(directory)
+        else:
+            directory.unlink(missing_ok=True)
 
     def _next_version(self, slug: str) -> int:
         row = self._db.one("SELECT COALESCE(MAX(version), 0) + 1 AS v FROM assets WHERE slug = ?", (slug,))

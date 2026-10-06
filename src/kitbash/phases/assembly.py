@@ -22,6 +22,7 @@ from kitbash.interaction.protocols import GateAction, PhaseSummary, UserChannel
 from kitbash.paths import OutputLayout
 from kitbash.phases.base import run_gate
 from kitbash.phases.scene_assets import SceneCast
+from kitbash.services.artifacts import file_hash, snapshot
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.usd_fidelity import UsdFidelityChecker
 from kitbash.store.state import StateDB
@@ -70,14 +71,15 @@ class AssemblyPhase:
                     + f". Rejected outputs are in {rejected}; the published scene is unchanged. "
                     "Fix the layout and resume from layout, or explicitly publish degraded in interactive mode.",
                 )
+            self._verify_content(scene, report)
             report = self._relocate_reports(scene, self._layout.scene_dir, report)
+            if self._published_report(scene) != report:
+                raise StateError("Final assembly publication evidence is invalid or changed.")
             previous = self._layout.root / ".scene-previous"
             if self._layout.scene_dir.exists():
                 self._layout.scene_dir.rename(previous)
             scene.rename(self._layout.scene_dir)
             self._record(report)
-            if previous.exists():
-                shutil.rmtree(previous)
         card_passed = report["scorecard"]["passed"]
         label = "Scene passed final validation" if card_passed else "Degraded scene published by human override (validation failed)"
         self._user.notify(
@@ -180,6 +182,10 @@ class AssemblyPhase:
             "scorecard": card.to_dict(),
             "acceptance": acceptance,
         }
+        report["integrity"] = {
+            "owner": str(self._layout.root.resolve()),
+            "manifest": self._content_manifest(scene),
+        }
         if not card.passed and self._user.interactive and outputs_exist:
             try:
                 decision = run_gate(self._user, self._tracker, PhaseSummary(
@@ -212,7 +218,10 @@ class AssemblyPhase:
         for path in (scene / "renders").rglob("*.json"):
             data = json.loads(path.read_text(encoding="utf-8"))
             path.write_text(json.dumps(self._relocated_paths(data, scene, destination), indent=2), encoding="utf-8")
-        (scene / "assembly.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            report["integrity"]["manifest"][path.relative_to(scene).as_posix()] = file_hash(path)
+        # Assembly owns this journal, never generated scripts or copied asset bundles.
+        with (scene / "assembly.json").open("x", encoding="utf-8") as journal:
+            journal.write(json.dumps(report, indent=2))
         return report
 
     @contextmanager
@@ -226,12 +235,11 @@ class AssemblyPhase:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise StateError("Another process is publishing this scene.") from exc
-            self._recover_previous(previous)
-            published = layout.scene_dir / "assembly.json"
-            if published.is_file():
-                report = json.loads(published.read_text(encoding="utf-8"))
-                if report.get("acceptance", {}).get("published"):
-                    self._record(report)
+            report = self._recover_previous(previous)
+            if report is not None:
+                self._record(report)
+            else:
+                self._state.meta.set("published_assembly", None)
             if scene.exists():
                 shutil.rmtree(scene)
             self._state.meta.set("assembly", {
@@ -243,16 +251,79 @@ class AssemblyPhase:
             try:
                 yield scene
             finally:
-                self._recover_previous(previous)
+                if previous.exists():
+                    self._recover_previous(previous)
                 if scene.exists():
                     shutil.rmtree(scene)
 
-    def _recover_previous(self, previous: Path) -> None:
+    def _recover_previous(self, previous: Path) -> dict[str, Any] | None:
+        report = self._published_report(self._layout.scene_dir)
         if previous.exists():
-            if self._layout.scene_dir.exists():
+            if report is not None:
                 shutil.rmtree(previous)
             else:
-                previous.rename(self._layout.scene_dir)
+                scene = self._layout.scene_dir
+                if scene.is_symlink() or (scene.exists() and not scene.is_dir()):
+                    scene.unlink()
+                elif scene.exists():
+                    shutil.rmtree(scene)
+                previous.rename(scene)
+                report = self._published_report(scene)
+        return report
+
+    def _content_manifest(self, scene: Path) -> dict[str, str]:
+        return snapshot(scene, (path for path in scene.iterdir() if path.name != "assembly.json"))
+
+    def _verify_content(self, scene: Path, report: dict[str, Any]) -> None:
+        integrity = report.get("integrity")
+        if not isinstance(integrity, dict) or integrity.get("owner") != str(self._layout.root.resolve()):
+            raise StateError("Final assembly has no matching workspace owner.")
+        try:
+            manifest = self._content_manifest(scene)
+        except (OSError, ValueError) as exc:
+            raise StateError("Final assembly content cannot be verified.") from exc
+        if integrity.get("manifest") != manifest:
+            raise StateError("Final assembly content changed after inspection.")
+
+    def _published_report(self, scene: Path) -> dict[str, Any] | None:
+        """Recover only an accepted journal belonging to this workspace and these exact bytes."""
+        journal = scene / "assembly.json"
+        try:
+            if journal.is_symlink() or not journal.is_file():
+                return None
+            report = json.loads(journal.read_text(encoding="utf-8"))
+            if not isinstance(report, dict):
+                return None
+            self._verify_content(scene, report)
+            acceptance = report.get("acceptance")
+            card = report.get("scorecard")
+            if not isinstance(acceptance, dict) or not isinstance(card, dict) or acceptance.get("published") is not True:
+                return None
+            passed = (
+                acceptance.get("status") == "passed" and acceptance.get("automatic_pass") is True
+                and card.get("passed") is True and acceptance.get("issues") == []
+            )
+            overridden = (
+                acceptance.get("status") == "overridden" and acceptance.get("automatic_pass") is False
+                and card.get("passed") is False and acceptance.get("override") == "publish_degraded"
+            )
+            if not (passed or overridden):
+                return None
+            required = ["scene.blend", "scene.usd"]
+            for key, name in (("scene_blend", "scene.blend"), ("scene_usd", "scene.usd")):
+                if report.get(key) != str(self._layout.scene_dir / name):
+                    return None
+            final = report.get("final_render")
+            if final is not None:
+                required.append(Path(final).relative_to(self._layout.scene_dir).as_posix())
+            elif passed:
+                return None
+            manifest = report["integrity"]["manifest"]
+            if any(name not in manifest or (scene / name).stat().st_size == 0 for name in required):
+                return None
+            return report
+        except (OSError, ValueError, TypeError, StateError):
+            return None
 
     def _record(self, report: dict[str, Any]) -> None:
         usd = report.get("usd", {})

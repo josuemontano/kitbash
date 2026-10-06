@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from attrs import define, field, frozen
@@ -11,6 +12,7 @@ from kitbash.critique.subject import Evaluation, LoopSubject
 from kitbash.domain.critique import Critique, Edit, ScoreCard, scorecard_from_dict
 from kitbash.domain.phases import PhaseName
 from kitbash.paths import OutputLayout
+from kitbash.services.artifacts import snapshot
 from kitbash.store.state import CycleRepository, CycleRow, DiffRow
 
 PENDING = "pending"
@@ -24,6 +26,53 @@ REQUIRED_ARTIFACTS = {
 
 
 @frozen
+class CycleEvidence:
+    """The owner and bytes evaluated before critic review; never resealed on resume."""
+
+    workspace: Path
+    phase: PhaseName
+    subject_id: str
+    cycle: int
+    hashes: Mapping[str, str]
+
+    @property
+    def root(self) -> Path:
+        layout = OutputLayout.at(self.workspace)
+        return layout.asset_dir(self.subject_id) if self.subject_id else layout.phase_dir(self.phase)
+
+    def capture(self, script: Path, evaluation: Evaluation) -> dict[str, str]:
+        layout = OutputLayout.at(self.workspace)
+        expected = layout.cycle_dir(self.phase, self.cycle, self.subject_id) / "script.py"
+        if (
+            script.absolute() != expected or self.root.resolve() != self.root
+            or not self.root.is_relative_to(layout.phase_dir(self.phase))
+        ):
+            raise ValueError("Cycle script does not belong to its workspace, subject and cycle")
+        for key in REQUIRED_ARTIFACTS[self.phase]:
+            path = Path(evaluation.artifacts[key])
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError(f"Missing or empty required artifact: {key}")
+        return snapshot(self.root, [
+            script, *(Path(path) for path in evaluation.artifacts.values() if path), *evaluation.images,
+        ])
+
+    def matches(self, result: CycleResult) -> bool:
+        try:
+            return (
+                self.phase is result.phase and self.cycle == result.cycle and bool(self.hashes)
+                and self.capture(result.script_path, result.evaluation) == self.hashes
+            )
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def to_dict(self) -> dict:
+        return {
+            "workspace": str(self.workspace), "phase": self.phase.value,
+            "subject": self.subject_id, "cycle": self.cycle, "hashes": dict(self.hashes),
+        }
+
+
+@frozen
 class CycleResult:
     cycle: int
     script_path: Path
@@ -32,6 +81,7 @@ class CycleResult:
     evaluation: Evaluation
     status: DiffStatus
     phase: PhaseName
+    evidence: CycleEvidence | None = None
 
     @property
     def score(self) -> float:
@@ -39,17 +89,14 @@ class CycleResult:
 
     @property
     def eligible(self) -> bool:
-        """A kept, fully evaluated result whose required files are still available."""
+        """A kept, fully evaluated result still owned by the same task with unchanged bytes."""
         return (
             self.status is DiffStatus.KEPT
             and self.evaluation.ok
             and bool(self.scorecard.entries)
             and all(entry.score is not None and entry.passed is not None for entry in self.scorecard.entries)
-            and self.script_path.is_file()
-            and all(
-                (path := self.evaluation.artifacts.get(key)) and Path(path).is_file()
-                for key in REQUIRED_ARTIFACTS[self.phase]
-            )
+            and self.evidence is not None
+            and self.evidence.matches(self)
         )
 
     @property
@@ -103,6 +150,16 @@ class CycleStore:
 
     def cycle_dir(self, subject: LoopSubject, cycle: int) -> Path:
         return self._layout.cycle_dir(subject.phase, cycle, subject.subject_id)
+
+    def seal(self, subject: LoopSubject, cycle: int, script: Path, evaluation: Evaluation) -> CycleEvidence | None:
+        if not evaluation.ok:
+            return None
+        evidence = CycleEvidence(self._layout.root, subject.phase, subject.subject_id, cycle, {})
+        try:
+            hashes = evidence.capture(script, evaluation)
+        except (OSError, ValueError, KeyError):
+            return None
+        return CycleEvidence(evidence.workspace, evidence.phase, evidence.subject_id, cycle, hashes)
 
     def write_cycle(
         self, subject: LoopSubject, state: LoopState, cycle: int, script: str, diff: str, *, score_before: float | None, initial: bool = False
@@ -159,6 +216,7 @@ class CycleStore:
                     "scorecard": result.scorecard.to_dict(),
                     "critiques": [c.to_dict() for c in result.critiques],
                     "evaluation": result.evaluation.to_dict(),
+                    "evidence": result.evidence.to_dict() if result.evidence else None,
                 },
                 indent=2,
                 default=str,
@@ -200,7 +258,7 @@ class CycleStore:
             if row.status == PENDING or not row.critique_path:
                 state.pending = (row.cycle, Path(row.script_path))
                 continue
-            state.results[row.cycle] = _result_from_files(row)
+            state.results[row.cycle] = _result_from_files(row, self._layout)
         for diff in self._cycles.diffs(subject.phase, subject.subject_id):
             path = Path(diff.diff_path)
             text = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -215,7 +273,7 @@ class CycleStore:
         return state
 
 
-def _result_from_files(row: CycleRow) -> CycleResult:
+def _result_from_files(row: CycleRow, layout: OutputLayout) -> CycleResult:
     data = json.loads(Path(row.critique_path).read_text(encoding="utf-8"))
     evaluation_data = data.get("evaluation", {})
     report_path = Path(row.script_path).parent / "report.json"
@@ -228,6 +286,14 @@ def _result_from_files(row: CycleRow) -> CycleResult:
         artifacts=evaluation_data.get("artifacts", {}),
     )
     critiques = tuple(Critique.parse(c["critic"], c, model=c.get("model", "")) for c in data.get("critiques", []))
+    evidence = None
+    saved = data.get("evidence")
+    if isinstance(saved, dict) and (
+        saved.get("workspace") == str(layout.root) and saved.get("phase") == row.phase
+        and saved.get("subject") == row.subject and saved.get("cycle") == row.cycle
+        and isinstance(saved.get("hashes"), dict)
+    ):
+        evidence = CycleEvidence(layout.root, PhaseName(row.phase), row.subject, row.cycle, saved["hashes"])
     return CycleResult(
         cycle=row.cycle,
         script_path=Path(row.script_path),
@@ -236,4 +302,5 @@ def _result_from_files(row: CycleRow) -> CycleResult:
         evaluation=evaluation,
         status=DiffStatus(row.status),
         phase=PhaseName(row.phase),
+        evidence=evidence,
     )

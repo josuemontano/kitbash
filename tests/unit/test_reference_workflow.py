@@ -18,7 +18,7 @@ from kitbash.backlot.library import Backlot
 from kitbash.config import load_config
 from kitbash.critique.history import DiffStatus
 from kitbash.critique.loop import LoopOutcome, LoopReason
-from kitbash.critique.store import CycleResult
+from kitbash.critique.store import CycleResult, CycleStore
 from kitbash.critique.subject import Evaluation
 from kitbash.domain.assets import AssetState
 from kitbash.domain.critique import CardEntry, ScoreCard
@@ -110,17 +110,21 @@ def test_terminal_selection_survives_retry_and_commit_with_remote_rights(workflo
     mesh = tmp_path / "mesh.obj"
     mesh.write_text("mesh")
     env.agent.generate_mesh.return_value = SimpleNamespace(mesh_path=mesh, duration_s=1.0, retries=0)
-    build = tmp_path / "build"
-    build.mkdir()
+    cycle_dir = env.layout.cycle_dir(PhaseName.MODELLING, 1, asset.id)
+    build = cycle_dir / "build"
+    build.mkdir(parents=True)
     artifacts = {"build_dir": str(build)}
     for key, name in (("blend", "asset.blend"), ("usd", "asset.usd"), ("preview", "preview.png")):
-        path = build / name
+        path = (cycle_dir if key == "preview" else build) / name
         path.write_bytes(b"artifact")
         artifacts[key] = str(path)
-    script = build / "script.py"
+    script = cycle_dir / "script.py"
     script.write_text("# built")
     card = ScoreCard((CardEntry("geometry", "Geometry", 1.0, 1.0, True),), 1.0, True, 0.8)
-    best = CycleResult(1, script, card, (), Evaluation(ok=True, artifacts=artifacts), DiffStatus.KEPT, PhaseName.MODELLING)
+    evaluation = Evaluation(ok=True, artifacts=artifacts)
+    subject = SimpleNamespace(phase=PhaseName.MODELLING, subject_id=asset.id)
+    evidence = CycleStore(env.state.cycles, env.layout).seal(subject, 1, script, evaluation)
+    best = CycleResult(1, script, card, (), evaluation, DiffStatus.KEPT, PhaseName.MODELLING, evidence)
 
     def run_loop(subject, **kwargs):
         kwargs["observer"].critiquing(1)

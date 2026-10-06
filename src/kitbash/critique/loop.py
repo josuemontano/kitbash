@@ -25,6 +25,7 @@ from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, LLM
 from kitbash.infra.patching import apply_diff, make_diff
 from kitbash.infra.process import current_registry, defer_interrupts
 from kitbash.llm.parsing import check_python
+from kitbash.services.artifacts import file_hash
 
 
 class LoopObserver(Protocol):
@@ -238,11 +239,15 @@ class CriticLoop:
         parent = session.head(state)
         with self._tracker.span(SpanKind.STEP, f"{subject.phase.value}.cycle", cycle=cycle) as span:
             session.observer.building(cycle)
+            script_digest = file_hash(script_path)
             try:
                 evaluation = subject.evaluate(script_path, cycle_dir, cycle)
             except KitbashError as exc:
                 detail = exc.traceback_text if isinstance(exc, BlenderScriptError) else ""
                 evaluation = Evaluation(ok=False, error=f"{exc}\n{detail}".strip())
+            evidence = self._store.seal(subject, cycle, script_path, evaluation)
+            if evidence is not None and evidence.hashes.get(script_path.relative_to(evidence.root).as_posix()) != script_digest:
+                evidence = None
             review = ReviewRequest(
                 brief=subject.brief(),
                 evaluation=evaluation,
@@ -260,7 +265,7 @@ class CriticLoop:
                 threshold=self._config.pass_threshold,
                 require_all_pass=self._config.require_all_pass,
             )
-            result = CycleResult(cycle, script_path, card, critiques, evaluation, DiffStatus.KEPT, subject.phase)
+            result = CycleResult(cycle, script_path, card, critiques, evaluation, DiffStatus.KEPT, subject.phase, evidence)
             # The first cycle is the feedback baseline. Otherwise, protect an eligible parent from
             # broken patches and score regressions, but never revert a pass in favour of a failure.
             worse = (

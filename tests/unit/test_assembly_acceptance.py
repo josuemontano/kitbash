@@ -193,6 +193,49 @@ def test_explicit_degraded_override_can_publish_without_a_camera(assembly_env):
     assert env.layout.scene_blend.stat().st_size > 0 and env.layout.scene_usd.stat().st_size > 0
 
 
+@pytest.mark.parametrize("prior_scene", [False, True])
+@pytest.mark.parametrize("mutation", ["blend", "usd", "render", "added", "removed", "symlink"])
+def test_human_override_cannot_publish_changed_inspected_bytes(assembly_env, prior_scene, mutation):
+    env = assembly_env
+    if prior_scene:
+        env.run(env.make_phase())
+    original = {
+        path.relative_to(env.layout.scene_dir): path.read_bytes()
+        for path in env.layout.scene_dir.rglob("*") if path.is_file()
+    }
+    published = env.state.meta.get("published_assembly")
+
+    class MutatingHuman(Human):
+        def confirm(self, summary):
+            staged = env.layout.root / ".scene-staging"
+            if mutation == "added":
+                (staged / "uninspected.txt").write_text("new content")
+            elif mutation == "removed":
+                (staged / "renders" / "final.png").unlink()
+            elif mutation == "symlink":
+                (staged / "scene.usd").unlink()
+                (staged / "scene.usd").symlink_to(staged / "scene.blend")
+            else:
+                name = {"blend": "scene.blend", "usd": "scene.usd", "render": "renders/final.png"}[mutation]
+                (staged / name).write_bytes(b"changed after inspection")
+            return super().confirm(summary)
+
+    env.fidelity.score = 0.2
+    with pytest.raises(StateError):
+        env.run(env.make_phase(user=MutatingHuman(GateAction.PUBLISH_DEGRADED)), from_phase=PhaseName.ASSEMBLY)
+
+    assert {
+        path.relative_to(env.layout.scene_dir): path.read_bytes()
+        for path in env.layout.scene_dir.rglob("*") if path.is_file()
+    } == original
+    assert env.layout.scene_dir.exists() is prior_scene
+    assert env.state.meta.get("published_assembly") == published
+    assert not env.state.meta.get("assembly")["acceptance"]["published"]
+    assert env.state.phases.status(PhaseName.ASSEMBLY) is not PhaseStatus.DONE
+    assert env.state.meta.get("run_finished_at") is None
+    assert not (env.layout.root / ".scene-staging").exists()
+
+
 @pytest.mark.parametrize("action, error", [(GateAction.APPROVE, StateError), (GateAction.ABORT, UserAbort)])
 def test_ordinary_approval_or_abort_cannot_override_failed_acceptance(assembly_env, action, error):
     env = assembly_env

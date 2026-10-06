@@ -12,6 +12,7 @@ from kitbash.backlot.library import AssetBundle, Backlot, BacklotDraft
 from kitbash.config import load_config
 from kitbash.infra.blender import BlenderRunner
 from kitbash.infra.embeddings import HashingEmbedder
+from kitbash.services.artifacts import file_hash, snapshot
 from kitbash.services.blender_toolkit import BlenderToolkit
 from kitbash.services.usd_fidelity import UsdFidelityChecker
 from tests.fakes.trellis.generate import cylinder_obj
@@ -176,7 +177,10 @@ def test_texture_paths_stay_relative_after_copying_into_a_scene(toolkit, tmp_pat
     backlot = Backlot(tmp_path / "backlot", HashingEmbedder(32))
     entry = backlot.add(
         BacklotDraft("Labelled can", "Tin can with a red label", "prop", (0.3, 0.3, 0.4), "photorealistic", asset_usd.mode, asset_usd.score),
-        AssetBundle(root=blend.parent, blend=blend, usd=asset_usd.usd_path, preview=texture),
+        AssetBundle(
+            root=blend.parent, blend=blend, usd=asset_usd.usd_path, preview=texture,
+            hashes=snapshot(blend.parent, (blend.parent,)), preview_hash=file_hash(texture),
+        ),
     )
     texture.unlink()  # the source is gone: only the copies may be referenced now
 
