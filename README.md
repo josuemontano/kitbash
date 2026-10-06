@@ -62,6 +62,13 @@ poetry run kitbash resume --output out/
 poetry run kitbash resume --output out/ --from-phase layout
 ```
 
+`build` starts a new run. If the output directory already contains `state.db`,
+`config.snapshot.toml`, or `rubric.snapshot.md`, it refuses to overwrite the run, even when the
+prompt or image is unchanged. Use `resume --output <dir>` to continue with the saved snapshots,
+or choose a different `--output` for new settings or a different rubric. This also protects partial
+run snapshots from an interrupted setup. `build --dry-run` remains read-only and can preview a plan
+against an existing output directory.
+
 Ctrl+C and fatal model-access errors stop subprocess groups and wait for modelling workers to unwind
 before closing HTTP or SQLite. Interrupted assets keep their checkpoints; cancellation does not turn
 them into failed assets or start tool retries. A second Ctrl+C during teardown is deferred until cleanup
