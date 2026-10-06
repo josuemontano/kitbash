@@ -7,7 +7,7 @@ from collections.abc import Callable
 from kitbash.analytics import context
 from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
 from kitbash.errors import LLMAccessError
-from kitbash.infra.process import ProcessCancelled, ProcessRegistry, defer_interrupts
+from kitbash.infra.process import ProcessCancelled, current_registry, defer_interrupts
 from kitbash.pipeline.scheduler import Scheduler
 
 type WorkFn[T] = Callable[[str], T]
@@ -40,21 +40,25 @@ class WorkerPool[T]:
         self._threads: list[threading.Thread] = []
         self.fatal: BaseException | None = None  # an error that must stop the whole run
         self._fatal_lock = threading.Lock()
-        self._processes = ProcessRegistry()
+        self._processes = current_registry()
 
     def start(self) -> None:
         with defer_interrupts():
             for index in range(self._size):
                 if self._stop.is_set():
                     break
-                thread = threading.Thread(target=self._loop, name=f"worker-{index + 1}", args=(f"worker-{index + 1}",))
+                thread = threading.Thread(
+                    target=context.propagate(self._loop), name=f"worker-{index + 1}", args=(f"worker-{index + 1}",),
+                )
                 self._threads.append(thread)
                 thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, cancel: bool = True) -> None:
+        """Wake idle workers; cancel active work unless the phase has completed normally."""
         self._stop.set()
         self._scheduler.close()
-        self._processes.terminate_all()
+        if cancel:
+            self._processes.terminate_all()
 
     def join(self) -> None:
         """Do not release the services workers use until every worker has unwound."""

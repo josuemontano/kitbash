@@ -15,7 +15,7 @@ from kitbash.domain.assets import AssetRecord, AssetState
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import LLMAccessError
 from kitbash.infra.blender import BlenderRunner
-from kitbash.infra.process import run_process
+from kitbash.infra.process import ProcessCancelled, ProcessRegistry, run_process
 from kitbash.infra.trellis import TrellisRunner
 from kitbash.phases.modelling import ModellingPhase
 from kitbash.pipeline.board import AssetBoard
@@ -26,12 +26,13 @@ from tests.helpers import requires_blender, wait_for, write_test_config
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(60)]
 
 
-@pytest.mark.parametrize("trigger", ["fatal", "interrupt"])
+@pytest.mark.parametrize("trigger", ["fatal", "interrupt", "cancel"])
 @pytest.mark.parametrize("tool", ["trellis", pytest.param("blender", marks=[pytest.mark.blender, requires_blender])])
 def test_modelling_joins_children_before_application_teardown(tmp_path, monkeypatch, trigger, tool):
     config_path = write_test_config(tmp_path, pipeline={"threads": 3, "review_buffer": 3})
     config, layout, run_input = create_workspace(tmp_path / "out", RunInput.create(None, "shutdown probe"), config_path, None, {})
     application = Application(config, layout, run_input, interactive=False, console=Console(quiet=True))
+    registry = ProcessRegistry()
     board = AssetBoard(application.state.assets)
     assets = ["active", "waiting", "fatal"] if tool == "trellis" else ["active", "fatal"]
     board.ensure(AssetRecord(id=name, name=name, state=AssetState.GENERATING) for name in assets)
@@ -76,7 +77,10 @@ def test_modelling_joins_children_before_application_teardown(tmp_path, monkeypa
                 raise LLMAccessError(f"child startup failed: {exc}") from exc
             if trigger == "fatal":
                 raise original
-            os.kill(os.getpid(), signal.SIGINT)
+            if trigger == "interrupt":
+                os.kill(os.getpid(), signal.SIGINT)
+            else:
+                registry.terminate_all()
             assert active_finished.wait(15)
             return board.get(asset_id)
         if asset_id == "waiting":
@@ -123,9 +127,11 @@ def test_modelling_joins_children_before_application_teardown(tmp_path, monkeypa
 
         monkeypatch.setattr(resource, "close", observed_close)
     try:
-        with pytest.raises(LLMAccessError if trigger == "fatal" else KeyboardInterrupt) as caught:
+        expected_error = {"fatal": LLMAccessError, "interrupt": KeyboardInterrupt, "cancel": ProcessCancelled}[trigger]
+        with pytest.raises(expected_error) as caught:
             try:
-                phase._execute(board, SimpleNamespace(advance=advance, fail=fail))
+                with registry.bind():
+                    phase._execute(board, SimpleNamespace(advance=advance, fail=fail))
             finally:
                 application.close()
         if trigger == "fatal":
@@ -243,3 +249,63 @@ def test_simultaneous_worker_fatals_join_nested_critics_before_close(tmp_path):
         application.close()
         if pid_path.exists() and not gone(int(pid_path.read_text())):
             os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+
+
+def test_completed_modelling_keeps_shared_run_launch_gate_open(tmp_path):
+    config_path = write_test_config(tmp_path)
+    config, layout, run_input = create_workspace(tmp_path / "out", RunInput.create(None, "completed phase"), config_path, None, {})
+    application = Application(config, layout, run_input, interactive=False, console=Console(quiet=True))
+    board = AssetBoard(application.state.assets)
+    board.ensure([AssetRecord(id="crate", name="Crate", state=AssetState.SKIPPED)])
+    phase = ModellingPhase(
+        None, None, None, application.state, application.user, application.dashboard, application.tracker, config,
+    )
+    try:
+        with application._processes.bind():
+            phase._execute(board, SimpleNamespace(advance=pytest.fail, fail=pytest.fail))
+            result = run_process([sys.executable, "-c", "print('layout can start')"], timeout_s=5)
+        assert result.ok and result.stdout.strip() == "layout can start"
+    finally:
+        application.close()
+
+
+def test_worker_fatal_wins_when_review_observes_cancellation_first(tmp_path, monkeypatch):
+    config_path = write_test_config(tmp_path, pipeline={"threads": 1, "review_buffer": 1})
+    config, layout, run_input = create_workspace(tmp_path / "out", RunInput.create(None, "fatal race"), config_path, None, {})
+    application = Application(config, layout, run_input, interactive=False, console=Console(quiet=True))
+    board = AssetBoard(application.state.assets)
+    board.ensure([AssetRecord(id="crate", name="Crate", state=AssetState.GENERATING)])
+    phase = ModellingPhase(
+        None, None, None, application.state, application.user, application.dashboard, application.tracker, config,
+    )
+    registry = application._processes
+    original_check = registry.check_cancelled
+    original_error = LLMAccessError("provider credentials rejected")
+    release_fatal = threading.Event()
+    review_thread = threading.get_ident()
+    checks = 0
+
+    def check_cancelled():
+        nonlocal checks
+        if threading.get_ident() == review_thread:
+            checks += 1
+            if checks == 2:
+                # The review loop already checked pool.fatal; make the worker fail immediately
+                # before that loop discovers the resulting shared-registry cancellation.
+                release_fatal.set()
+                wait_for(registry._cancelled.is_set)
+        original_check()
+
+    def advance(asset_id):
+        assert release_fatal.wait(10)
+        raise original_error
+
+    monkeypatch.setattr(registry, "check_cancelled", check_cancelled)
+    try:
+        with registry.bind(), pytest.raises(LLMAccessError) as caught:
+            phase._execute(board, SimpleNamespace(advance=advance, fail=pytest.fail))
+        assert caught.value is original_error
+        assert not any(thread.name.startswith("worker-") for thread in threading.enumerate())
+    finally:
+        release_fatal.set()
+        application.close()

@@ -7,10 +7,93 @@ import time
 
 import pytest
 
+from kitbash.analytics import context
 from kitbash.infra import process as processes
-from kitbash.infra.process import ProcessCancelled, ProcessRegistry, current_registry, run_process
+from kitbash.infra.process import ProcessCancelled, ProcessRegistry, current_registry, observe_processes, run_process
 from tests.helpers import process_gone as gone
 from tests.helpers import wait_for
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_partial_streams_arrive_before_exit_and_decode_incrementally(tmp_path, logged):
+    stdout_seen, stderr_seen, unicode_seen = (tmp_path / name for name in ("stdout", "stderr", "unicode"))
+    log_path = tmp_path / "stream.log" if logged else None
+    code = (
+        "import os,time\nfrom pathlib import Path\n"
+        "os.write(1, b'out-\\xe2')\nos.write(2, b'err-')\n"
+        f"while not (Path({str(stdout_seen)!r}).exists() and Path({str(stderr_seen)!r}).exists()): time.sleep(.01)\n"
+        "os.write(1, b'\\x82\\xac\\r')\n"
+        f"while not Path({str(unicode_seen)!r}).exists(): time.sleep(.01)\n"
+        "os.write(1, b'\\nend\\xff')\nos.write(2, b'done\\n')\n"
+    )
+    events = []
+
+    def observe(event):
+        events.append(event)
+        if event.kind == "output":
+            if "out-" in event.text:
+                if log_path is not None:
+                    assert b"out-\xe2" in log_path.read_bytes()
+                stdout_seen.touch()
+            if "err-" in event.text:
+                stderr_seen.touch()
+            if "\u20ac" in event.text:
+                unicode_seen.touch()
+
+    command = [sys.executable, "-c", code]
+    with context.bind(phase="modelling", asset_id="crate", worker="worker-1"), observe_processes(observe):
+        result = run_process(command, timeout_s=10, log_path=log_path)
+    assert result.ok
+    assert events[0].kind == "started" and events[-1].kind == "finished"
+    assert len({event.job_id for event in events}) == 1
+    assert all(event.args == tuple(command) and event.log_path == log_path for event in events)
+    assert all((event.trace.phase, event.trace.asset_id, event.trace.worker) == ("modelling", "crate", "worker-1") for event in events)
+    assert "".join(event.text for event in events if event.kind == "output" and event.stream == "stdout") == "out-\u20ac\nend\ufffd"
+    assert "".join(event.text for event in events if event.kind == "output" and event.stream == "stderr") == "err-done\n"
+    assert events[-1].returncode == 0 and not events[-1].timed_out and not events[-1].cancelled
+    if logged:
+        assert result.stderr == "" and result.stdout == log_path.read_text(encoding="utf-8", errors="replace")
+        assert b"end\xff" in log_path.read_bytes() and "# exit 0" in result.stdout
+    else:
+        assert (result.stdout, result.stderr) == ("out-\u20ac\nend\ufffd", "err-done\n")
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_verbose_streams_are_drained_in_bounded_chunks(tmp_path, logged):
+    events = []
+    size = 1_048_576
+    code = f"import sys; sys.stdout.write('o' * {size}); sys.stdout.flush(); sys.stderr.write('e' * {size}); sys.stderr.flush()"
+    with observe_processes(events.append):
+        result = run_process([sys.executable, "-c", code], timeout_s=10, log_path=tmp_path / "verbose.log" if logged else None)
+    assert result.ok
+    chunks = [event for event in events if event.kind == "output"]
+    assert all(0 < len(event.text) <= processes._OUTPUT_CHUNK for event in chunks)
+    assert "".join(event.text for event in chunks if event.stream == "stdout") == "o" * size
+    assert "".join(event.text for event in chunks if event.stream == "stderr") == "e" * size
+    if logged:
+        # Separate pipes can become readable together: only per-stream order is defined.
+        payload = result.stdout.split("\n\n", 1)[1].rsplit("\n#", 1)[0]
+        assert len(payload) == 2 * size and payload.count("o") == size and payload.count("e") == size
+        assert result.stderr == ""
+        assert result.stdout == result.log_path.read_text()
+    else:
+        assert (result.stdout, result.stderr) == ("o" * size, "e" * size)
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["failure", "timeout"])
+def test_finished_event_reports_failure_and_timeout(tmp_path, timed_out):
+    events = []
+    code = "import os,time; os.write(2, b'last partial'); " + ("time.sleep(60)" if timed_out else "raise SystemExit(7)")
+    with observe_processes(events.append):
+        result = run_process([sys.executable, "-c", code], timeout_s=1, log_path=tmp_path / "failed.log")
+    assert not result.ok and result.timed_out is timed_out
+    assert "last partial" in result.stdout
+    finished = events[-1]
+    assert finished.kind == "finished" and finished.returncode == result.returncode
+    assert finished.timed_out is timed_out and not finished.cancelled
+    assert any(event.kind == "output" and event.stream == "stderr" and event.text == "last partial" for event in events)
+    if not timed_out:
+        assert result.returncode == 7
 
 
 @pytest.mark.parametrize("repeat_interrupt", [False, True], ids=["term", "repeated-interrupt-and-kill"])
@@ -94,6 +177,7 @@ def test_shutdown_racing_spawn_closes_launch_gate_and_reaps(tmp_path, monkeypatc
     stopping = threading.Event()
     child = []
     errors = []
+    events = []
     popen = subprocess.Popen
 
     def paused_spawn(*args, **kwargs):
@@ -105,7 +189,8 @@ def test_shutdown_racing_spawn_closes_launch_gate_and_reaps(tmp_path, monkeypatc
 
     def run():
         try:
-            run_process([sys.executable, "-c", "import time; time.sleep(60)"], timeout_s=90, registry=registry)
+            with observe_processes(events.append):
+                run_process([sys.executable, "-c", "import time; time.sleep(60)"], timeout_s=90, registry=registry)
         except BaseException as exc:
             errors.append(exc)
 
@@ -129,6 +214,9 @@ def test_shutdown_racing_spawn_closes_launch_gate_and_reaps(tmp_path, monkeypatc
         assert child[0].returncode is not None
         assert child[0].stdout.closed and child[0].stderr.closed
         assert gone(child[0].pid)
+        assert events[0].kind == "started" and events[-1].kind == "finished"
+        assert events[-1].cancelled and not events[-1].timed_out
+        assert events[-1].returncode == child[0].returncode
         with pytest.raises(ProcessCancelled):
             run_process([sys.executable, "-c", "raise SystemExit(99)"], timeout_s=5, registry=registry)
         monkeypatch.setattr(processes.subprocess, "Popen", popen)
@@ -143,6 +231,7 @@ def test_shutdown_racing_spawn_closes_launch_gate_and_reaps(tmp_path, monkeypatc
 
 def test_spawn_failure_closes_log(tmp_path, monkeypatch):
     handles = []
+    events = []
     open_log = processes._open_log
 
     def remember_log(*args):
@@ -151,27 +240,29 @@ def test_spawn_failure_closes_log(tmp_path, monkeypatch):
         return handle
 
     monkeypatch.setattr(processes, "_open_log", remember_log)
-    with pytest.raises(FileNotFoundError):
+    with observe_processes(events.append), pytest.raises(FileNotFoundError):
         run_process([str(tmp_path / "missing-executable")], timeout_s=5, log_path=tmp_path / "spawn.log")
     assert handles[0].closed
+    assert [event.kind for event in events] == ["started", "finished"]
+    assert events[-1].returncode is None and not events[-1].cancelled
+    assert "missing-executable" in events[-1].text
 
 
-def test_unexpected_communication_error_reaps_and_closes_pipes(monkeypatch):
+def test_unexpected_stream_error_reaps_and_closes_pipes(monkeypatch):
     children = []
     original = RuntimeError("communication interrupted")
     popen = subprocess.Popen
 
-    def broken_communication(*args, **kwargs):
+    def remember_child(*args, **kwargs):
         child = popen(*args, **kwargs)
         children.append(child)
-
-        def fail(*args, **kwargs):
-            raise original
-
-        child.communicate = fail
         return child
 
-    monkeypatch.setattr(processes.subprocess, "Popen", broken_communication)
+    def fail(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(processes.subprocess, "Popen", remember_child)
+    monkeypatch.setattr(processes, "_stream_output", fail)
     with pytest.raises(RuntimeError) as caught:
         run_process([sys.executable, "-c", "import time; time.sleep(60)"], timeout_s=90)
     assert caught.value is original
@@ -281,3 +372,111 @@ def test_preflight_fatal_cancels_earlier_ping_without_masking_original(tmp_path,
         if watchdog.ident is not None:
             watchdog.join()
         registry.terminate_all()
+
+
+def test_parallel_workers_share_observer_and_owner_with_distinct_job_context(tmp_path):
+    from kitbash.analytics.tracker import Tracker
+    from kitbash.pipeline.scheduler import Scheduler
+    from kitbash.pipeline.workers import WorkerPool
+    from kitbash.store.state import StateDB
+
+    state = StateDB(tmp_path / "state.db")
+    tracker = Tracker(state.spans)
+    registry = ProcessRegistry()
+    scheduler = Scheduler(2, tracker)
+    release = tmp_path / "release"
+    completed = threading.Event()
+    lock = threading.Lock()
+    events, delivered = [], []
+    live = set()
+
+    def observe(event):
+        with lock:
+            events.append(event)
+            if event.kind == "output":
+                live.add(event.trace.asset_id)
+                if len(live) == 2:
+                    release.touch()
+
+    def work(asset_id):
+        assert current_registry() is registry
+        result = run_process([
+            sys.executable, "-c",
+            "import time\nfrom pathlib import Path\n"
+            f"print({asset_id!r}, flush=True)\n"
+            f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n",
+        ], timeout_s=10)
+        assert result.ok and result.stdout.strip() == asset_id
+        return asset_id
+
+    def failed(asset_id, error):
+        raise error
+
+    def deliver(asset_id):
+        with lock:
+            delivered.append(asset_id)
+            if len(delivered) == 2:
+                completed.set()
+
+    for asset_id in ("crate", "mug"):
+        scheduler.submit(asset_id)
+    with registry.bind(), context.bind(agent="builder"), observe_processes(observe):
+        pool = WorkerPool(2, scheduler, work, failed, deliver, tracker, "modelling")
+        try:
+            pool.start()
+            assert completed.wait(15), pool.fatal
+            pool.stop(cancel=False)
+            pool.join()
+            registry.check_cancelled()
+            assert pool.fatal is None
+            assert sorted(delivered) == ["crate", "mug"]
+            started = [event for event in events if event.kind == "started"]
+            assert len(started) == 2 and len({event.job_id for event in started}) == 2
+            assert {event.trace.worker for event in started} == {"worker-1", "worker-2"}
+            for event in started:
+                own = [item for item in events if item.job_id == event.job_id]
+                assert own[-1].kind == "finished" and own[-1].returncode == 0 and not own[-1].cancelled
+                assert all(item.trace == event.trace for item in own)
+                assert event.trace.phase == "modelling" and event.trace.agent == "builder"
+                assert "".join(item.text for item in own if item.kind == "output") == event.trace.asset_id + "\n"
+        finally:
+            release.touch()
+            pool.stop()
+            pool.join()
+            state.close()
+
+
+@pytest.mark.parametrize("during_timeout", [False, True])
+def test_observer_failure_reaps_child_and_finished_error_cannot_mask_original(during_timeout):
+    original = RuntimeError("output observer failed")
+    events = []
+
+    def observe(event):
+        events.append(event)
+        if event.kind == "output":
+            raise original
+        if event.kind == "finished":
+            raise ValueError("finished observer also failed")
+
+    code = "import os,signal,time\n"
+    if during_timeout:
+        code += (
+            "def stopped(signum, frame):\n"
+            "    os.write(2, str(os.getpid()).encode())\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stopped)\n"
+        )
+    else:
+        code += "os.write(1, str(os.getpid()).encode())\n"
+    code += "time.sleep(60)\n"
+
+    with observe_processes(observe), pytest.raises(RuntimeError) as caught:
+        run_process([sys.executable, "-c", code], timeout_s=1 if during_timeout else 10)
+    assert caught.value is original
+    pid = int(next(event.text for event in events if event.kind == "output"))
+    assert gone(pid)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+    assert events[-1].kind == "finished" and events[-1].returncode is not None
+    assert not events[-1].cancelled and events[-1].text == str(original)
+    assert events[-1].timed_out is during_timeout

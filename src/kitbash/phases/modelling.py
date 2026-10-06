@@ -3,6 +3,7 @@ critique; a single review loop (consumer) presents finished assets to the user i
 generation continues. The phase ends at the barrier: every asset approved or skipped."""
 
 import logging
+import sys
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from kitbash.domain.assets import AssetRecord, AssetState, ReworkEntry
 from kitbash.domain.inventory import Inventory, InventoryItem
 from kitbash.domain.phases import PhaseName
 from kitbash.errors import KitbashError, StateError
-from kitbash.infra.process import defer_interrupts
+from kitbash.infra.process import ProcessCancelled, current_registry, defer_interrupts
 from kitbash.interaction.protocols import AssetReview, GateAction, PhaseSummary, ReviewAction, ReviewDecision, UserChannel
 from kitbash.phases.base import ask_user, run_gate
 from kitbash.pipeline.asset_pipeline import AssetPipeline
@@ -120,30 +121,42 @@ class ModellingPhase:
             log.exception("Asset %s failed", asset_id, exc_info=error)
             return pipeline.fail(asset_id, error)
 
-        pool = WorkerPool(
-            self._config.pipeline.threads, scheduler, pipeline.advance, failed,
-            lambda record: self._route(record, scheduler, queue), self._tracker, self.name.value,
-        )
-        try:
-            pool.start()
-            with self._dashboard.showing(ModellingView(board, scheduler, queue, self._since)):
-                while not board.all_resolved():
-                    if pool.fatal is not None:
-                        raise pool.fatal
-                    entry = queue.get(timeout=POLL_S)
-                    if entry is None:
-                        self._recover_lost(board, scheduler, queue)
-                        continue
-                    try:
-                        self._handle(entry, board, pipeline, scheduler, queue)
-                    finally:
-                        queue.done()
-        finally:
-            with defer_interrupts():
-                pool.stop()
-                pool.join()
-        if pool.fatal is not None:
-            raise pool.fatal
+        registry = current_registry()
+        with registry.bind():
+            pool = WorkerPool(
+                self._config.pipeline.threads, scheduler, pipeline.advance, failed,
+                lambda record: self._route(record, scheduler, queue), self._tracker, self.name.value,
+            )
+            try:
+                try:
+                    registry.check_cancelled()
+                    pool.start()
+                    with self._dashboard.showing(ModellingView(board, scheduler, queue, self._since)):
+                        while not board.all_resolved():
+                            if pool.fatal is not None:
+                                raise pool.fatal
+                            registry.check_cancelled()
+                            entry = queue.get(timeout=POLL_S)
+                            if entry is None:
+                                self._recover_lost(board, scheduler, queue)
+                                continue
+                            try:
+                                self._handle(entry, board, pipeline, scheduler, queue)
+                            finally:
+                                queue.done()
+                finally:
+                    with defer_interrupts():
+                        pool.stop(cancel=sys.exception() is not None or pool.fatal is not None)
+                        pool.join()
+            except ProcessCancelled:
+                # Fatal workers close the shared launch gate. Their original error wins even if
+                # cancellation reached the review loop between its fatal check and queue poll.
+                if pool.fatal is not None:
+                    raise pool.fatal from None
+                raise
+            if pool.fatal is not None:
+                raise pool.fatal
+            registry.check_cancelled()
 
     def _route(self, record: AssetRecord, scheduler: Scheduler, queue: ReviewQueue, *, initial: bool = False) -> None:
         match record.state:

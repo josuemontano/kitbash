@@ -244,7 +244,8 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 - **Consumer:** one review loop shows finished assets in completion order, while generation continues.
   For each asset you can approve it, give feedback, regenerate it (new Trellis seed and a new script)
   or skip it. "Input needed" entries show a ranked reference contact sheet when available: select a
-  candidate number, give another search name or image path, or skip. Prompts run on the main thread.
+  candidate number, give another search name or image path, or skip. Textual handles input on the main
+  thread while the pipeline and modelling workers continue in background threads.
 - **Backpressure:** at most `--review-buffer` assets are in flight or waiting for review. When the
   buffer is full, workers finish their current asset and then idle. The idle time is reported.
 - **Barrier:** layout starts when every asset is approved or skipped. Skipped assets become labelled
@@ -253,9 +254,26 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
   matches found during the breakdown are proposed for reuse; `--no-interactive` accepts matches above
   `backlot.match_threshold`.
 
-The terminal shows a single `rich.Live` display: a progress table for every asset and a pinned review
-panel. The display pauses while you answer a prompt. Previews appear inline in kitty, Ghostty, iTerm2
-and WezTerm. Elsewhere kitbash prints the path and opens the file.
+`build` and `resume` use a full-screen [Textual](https://textual.textualize.io/) interface when stdin
+and stdout are terminals, including runs with `--no-interactive`:
+
+- A scrollable phase/asset overview keeps states, scores, worker activity and review backpressure visible.
+- Each concurrent command has its own labelled, scrollable output pane: asset/phase, worker, tool,
+  invocation ID, elapsed time and running/done/failed/timed-out/cancelled state. stdout and stderr stream
+  as the child flushes them; stderr is labelled. Live history is bounded, while existing command log
+  files retain the output.
+- Reviews, phase gates and feedback stay in the same screen; they do not pause job output. Type an
+  answer and press **Enter** (an empty answer uses the displayed default). **Tab** moves focus between
+  controls; narrow terminals stack the review below the monitor.
+- The pinned bottom status bar shows run/input/stopping state, running command count, recent failures
+  and elapsed time. **Ctrl+C** stops the run and waits for children and workers to unwind before exit.
+- Preview paths appear in the review pane. **F2** or **Open previews** opens them in the system viewer,
+  without emitting terminal image escape sequences over the dashboard. `ui.show_previews = false`
+  disables previews.
+
+Redirected output or input uses plain tables and stdin prompts instead of a full-screen UI, so scripts
+and pipes keep working. Help, `--dry-run`, library commands and the final run summary remain ordinary
+CLI output. Interrupted runs can be continued with `kitbash resume --output <dir>`.
 
 ### Retopology
 
