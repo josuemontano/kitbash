@@ -1,5 +1,6 @@
 """Layout agent: places the approved assets, then sets camera, lighting and world for the chosen style."""
 
+import hashlib
 import json
 from collections import Counter
 from collections.abc import Sequence
@@ -88,7 +89,7 @@ class LayoutAgent:
                     "placeholders": _table([
                         {"key": i.id, "name": i.name, "dimensions_m": i.dimensions.as_tuple()} for i in skipped
                     ]) or "(none)",
-                    "inventory": _inventory_for_layout(inventory),
+                    "inventory": _table(_inventory_for_layout(inventory)),
                     "hdris": _table(hdris) or "(none: use kb.color_world)",
                     "feedback": "(none)",
                     "api": blender_api_reference(),
@@ -121,6 +122,28 @@ class LayoutSubject:
         self._config = config
         self._layout = layout
         self._input = run_input
+
+    def dependency_fingerprint(self) -> str:
+        """Canonical inputs for layout generation, placement and style evaluation."""
+        dependencies = {
+            "scene": self._inventory.scene.to_dict(),
+            "instances": sorted(_inventory_for_layout(self._inventory), key=lambda item: item["id"]),
+            "assets": {
+                asset.key: {**asset.spec(), "display_name": asset.name, "description": asset.description[:160]}
+                for asset in self._assets
+            },
+            "placeholders": {
+                item.id: {"name": item.name, "dimensions_m": item.dimensions.as_tuple()}
+                for item in self._skipped
+            },
+            "style": {
+                "name": self._config.pipeline.style,
+                "guidance": self._config.style.guidance.strip(),
+                "render_engine": self._config.style.render_engine,
+            },
+        }
+        text = json.dumps(dependencies, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode()).hexdigest()
 
     def brief(self) -> CriticBrief:
         scene = self._inventory.scene
@@ -171,8 +194,8 @@ def _table(rows: Sequence[dict[str, Any]]) -> str:
     return "\n".join(json.dumps(row) for row in rows)
 
 
-def _inventory_for_layout(inventory: Inventory) -> str:
-    return _table([
+def _inventory_for_layout(inventory: Inventory) -> list[dict[str, Any]]:
+    return [
         {
             "id": item.id,
             "asset_key": item.asset_key,
@@ -180,7 +203,10 @@ def _inventory_for_layout(inventory: Inventory) -> str:
             "dimensions_m": item.dimensions.as_tuple(),
             "location_m": item.position.location,
             "rotation_deg": item.position.rotation_deg,
-            "relationships": [{"type": r.kind, "target": r.target} for r in item.relationships],
+            "relationships": [
+                {"type": r.kind, "target": r.target}
+                for r in sorted(item.relationships, key=lambda r: (r.kind, r.target))
+            ],
         }
         for item in inventory.items
-    ])
+    ]

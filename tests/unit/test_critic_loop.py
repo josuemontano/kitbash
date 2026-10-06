@@ -244,6 +244,21 @@ def test_fresh_session_rewrites_the_script(env):
     assert diffs[-1].reason == "initial" and diffs[-1].status == DiffStatus.KEPT.value
 
 
+def test_interrupted_fresh_session_does_not_expose_the_previous_result(env):
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([])), LoopSessions(env[0].meta))
+    subject = FakeSubject()
+    loop.run(subject, request="old", initial_script=lambda: script(0.9))
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        loop.run(subject, request="changed-inputs", initial_script=interrupt, fresh=True)
+    assert loop.best(subject) is None
+    outcome = loop.run(subject, request="changed-inputs", initial_script=lambda: script(0.85))
+    assert outcome.best.cycle == 2 and outcome.best.score == 0.85
+
+
 def test_a_new_request_replaces_a_crashed_session(env):
     """Feedback given after a crash must not be swallowed by the unfinished old session."""
     state = env[0]

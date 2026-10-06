@@ -73,7 +73,7 @@ class ResumableLoop:
         else:
             if session is not None and not session.done:
                 self._loop.abandon_pending(subject)
-            previous = self._best(subject, session) if session else None
+            previous = self._best(subject, session) if session and not fresh else None
             session = self._sessions.save(
                 subject,
                 LoopSession(
