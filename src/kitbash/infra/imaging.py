@@ -40,6 +40,27 @@ def open_rgb(path: Path, size: tuple[int, int] | None = None) -> Image.Image:
         return image.copy()
 
 
+def dominant_color(path: Path, fallback: tuple[float, float, float] = (0.7, 0.7, 0.7)) -> tuple[float, float, float]:
+    """Median color of the object in a reference, as linear RGB (0..1) for a Principled base color.
+
+    The object is its alpha channel, or else everything that differs from the border color."""
+    with Image.open(path) as original:
+        rgba = ImageOps.exif_transpose(original).convert("RGBA")
+    rgba.thumbnail((256, 256))
+    pixels = np.asarray(rgba, dtype=np.float32) / 255
+    rgb, alpha = pixels[..., :3], pixels[..., 3]
+    if np.any(alpha < 0.95):
+        mask = alpha > 0.5
+    else:
+        border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]))
+        mask = np.max(np.abs(rgb - np.median(border, axis=0)), axis=2) > 0.12
+    if mask.sum() < 16:
+        return fallback
+    srgb = np.array([np.median(rgb[..., i][mask]) for i in range(3)])
+    linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
+    return (round(float(linear[0]), 4), round(float(linear[1]), 4), round(float(linear[2]), 4))
+
+
 def compare_images(first: Path, second: Path, size: tuple[int, int] = (256, 256)) -> ImageComparison:
     a = np.asarray(open_rgb(first, size), dtype=np.float64) / 255.0
     b = np.asarray(open_rgb(second, size), dtype=np.float64) / 255.0

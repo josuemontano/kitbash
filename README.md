@@ -2,7 +2,7 @@
 
 `kitbash` turns a reference image or a text prompt into a complete, human-editable Blender scene
 (plus USD). It breaks the shot down into individual objects, models each one (reference image →
-Trellis mesh by default, or explicit description-driven procedural geometry), builds node-based PBR
+Trellis mesh and retopology, always; description-driven procedural geometry only when you explicitly choose it), builds node-based PBR
 materials in Blender, lays the scene out for a chosen style, and exports everything. Every approved asset goes into a reusable global library, the
 **backlot**, so later scenes can reuse it instead of modelling it again.
 
@@ -54,6 +54,9 @@ poetry run kitbash build --image room.jpg --output out/ --no-interactive
 poetry run kitbash build --prompt "a cosy reading corner with an armchair and a floor lamp" \
     --style 2d --output out/corner
 
+# Validate the image-to-model pipeline on one reference image (the Kitbash flow, see below):
+poetry run kitbash model --image mug.png --name "Ceramic mug" --height 0.1 --output out/mug
+
 # See the plan (phases, models, paths, estimated steps) without running anything:
 poetry run kitbash build --image room.jpg --output out/ --dry-run
 
@@ -74,18 +77,60 @@ before closing HTTP or SQLite. Interrupted assets keep their checkpoints; cancel
 them into failed assets or start tool retries. A second Ctrl+C during teardown is deferred until cleanup
 finishes.
 
-For stylized or geometric scenes without suitable reference photographs, select procedural modelling
-explicitly in the file passed to `--config`:
+### Trellis first, procedural only on request
+
+Every asset is reconstructed from a reference image with Trellis and then **always** retopologized.
+Programmatic (procedural) modelling is never a fallback: a failed reference search, Trellis run or
+retopology never turns into a procedural build on its own. It happens in exactly two cases, both
+explicit:
+
+- **Per asset.** When no usable reference is found (or Trellis/retopology fails), the asset waits for
+  your input and the request offers: provide a reference image path (preferred), give another item
+  name to search for, or choose programmatic modelling (`m` in the terminal). With `--no-interactive`
+  the asset is skipped instead; it is never modelled procedurally.
+- **Whole run.** For stylized or geometric scenes without suitable reference photographs, select it
+  in the file passed to `--config`:
 
 ```toml
 [modelling]
 method = "procedural"
 ```
 
-The code model constructs editable geometry from each inventory description. Reference search,
+The code model then constructs editable geometry from each inventory description. Reference search,
 Trellis and retopology are not invoked; build evaluation, visual/technical critique, USD validation,
-asset approval and final assembly remain unchanged. This is not an automatic fallback after a failed
-reference search. Keep `method = "trellis"` (the default) for reference-driven reconstruction.
+asset approval and final assembly remain unchanged. Procedural assets are recorded as such in
+analytics and backlot provenance.
+
+### The Kitbash flow: one image to a backlot asset
+
+```
+1 reference image -> Trellis -> retopology -> USD/Blender model -> backlot
+```
+
+`kitbash model` validates the image-to-model pipeline and nothing else: it starts from exactly one
+reference image, reconstructs it with Trellis, always retopologizes the mesh, builds the `.blend` with
+a fixed script, exports and validates the USD, and adds the asset to the backlot. There is no
+breakdown, layout, critic, evaluation loop or LLM call (`omp` is not even required), no reference
+search, and no procedural fallback. Any failing step stops the run with its error.
+
+```sh
+poetry run kitbash model --image mug.png --name "Ceramic mug" --category drinkware --height 0.1 --output out/mug
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--image PATH` | required | the one reference image: the object alone, on no or a plain neutral background |
+| `--output DIR` | required | run directory (never reuses an existing run) |
+| `--name TEXT` | image file name | asset name in the backlot |
+| `--category`, `--description` | `object`, the name | backlot metadata |
+| `--height M` | `1.0` | real-world height; the mesh is scaled to it |
+| `--retopology` | `triflow` | `triflow` or `decimate`, as in `build` |
+| `--config PATH` | packaged `config.toml` | paths (`trellis`, `backlot`) and tool settings |
+
+The flow always uses Trellis, whatever `modelling.method` says. Output: `phases/02_modelling/<slug>/`
+(`trellis/`, `retopo/`, `build/asset.blend`, `build/usd/asset.usd`, `previews/`), `model.json` (backlot id,
+reference hash, Trellis and retopology records, step timings) and the backlot entry. The model gets
+one flat material colored from the reference; textures and materials are out of scope here.
 
 ### `build` options
 
@@ -141,11 +186,11 @@ Main sections:
 - `[reference]`: deterministic image providers, rights allow-list, quality thresholds, cache TTL and
   optional `vision_fallback`. Defaults: `input_crop`, `wikimedia`, `openverse`; no model search.
   Remove `omp_web` from older config files/run snapshots; model web search is no longer supported.
-- `[modelling]`: `method = "trellis"` (default) or `"procedural"` (description-driven Blender geometry).
+- `[modelling]`: `method = "trellis"` (default) or `"procedural"` (description-driven Blender geometry; an explicit whole-run opt-in, never a fallback).
 - `[trellis]`: `steps = 64`, `pipeline_type = "1024"`, `no_texture = true`, retries and timeouts.
   `mesh_up_axis = "Z"`: Trellis writes raw Z-up vertices, even inside its `.glb`.
 - `[retopology]`: `method` (`triflow` or `decimate`), `face_count = 4000`, `qem_threshold = 12.0`,
-  `quad_ratio = 0.95`, `flow_steps = 50`, `device` (`auto`, `cuda` or `mps`) and `fallback_on_error`.
+  `quad_ratio = 0.95`, `flow_steps = 50` and `device` (`auto`, `cuda` or `mps`).
   `--retopology` overrides `method`; `resume` reuses the method stored in the run's config snapshot.
 - `[blender]`, `[usd]`: render sizes and samples, bake resolution, round-trip threshold, MaterialX switch.
   Saved scenes retain `blender.final_resolution`, `final_samples` and `cycles_device` (always `GPU`; CPU rendering is not supported), while preserving
@@ -266,12 +311,15 @@ Each asset follows a checkpointed state machine:
 
 ```
 queued → referencing → generating → building ⇄ critiquing → awaiting_review → approved | skipped | needs_rework
-                 └──────────┴──→ input_needed (no reference found, Trellis failed) → queued | skipped
+                 └──────────┴──→ input_needed (no isolated reference found, Trellis or retopology failed) → queued | skipped
 ```
 
-Procedural assets enter `building` directly from `queued`. The modelling method is checkpointed per
+`generating` includes the mandatory retopology of the Trellis mesh. Procedural assets (an explicit choice,
+see above) enter `building` directly from `queued`. The modelling method is checkpointed per
 asset and recorded in analytics/backlot provenance; resume does not silently convert approved assets.
-Regenerate/new-reference rework on a procedural asset rebuilds its geometry without reconstruction tools.
+Regenerate rework on a procedural asset rebuilds its geometry without reconstruction tools. If you
+chose procedural modelling for one asset for lack of a reference, a new-reference rework switches it
+back to Trellis.
 
 - **Producers:** `--threads` workers take assets through reference search, Trellis
   (`python generate.py <ref> --output <asset> --steps 64 --no-texture --pipeline-type 1024`, with up to 2
@@ -324,8 +372,8 @@ CLI output. Interrupted runs can be continued with `kitbash resume --output <dir
 
 ### Retopology
 
-After Trellis, each asset's mesh goes through the configured retopology method before the build script
-imports it. Both methods hand the build script a Z-up mesh, so `trellis.mesh_up_axis` applies unchanged.
+After Trellis, each asset's mesh always goes through the configured retopology method before the build
+script imports it; nothing builds from a mesh that skipped this step. Both methods hand the build script a Z-up mesh, so `trellis.mesh_up_axis` applies unchanged.
 
 - `triflow` (default): learned retopology that produces a low-poly triangle mesh of about
   `retopology.face_count` faces. Output goes to `phases/02_modelling/<asset>/retopo/attempt_NN/`. The
@@ -336,7 +384,7 @@ imports it. Both methods hand the build script a Z-up mesh, so `trellis.mesh_up_
 
 For TriFlow output, `kb.decimate` leaves the mesh unchanged even if Blender's face budget is lower.
 `kb.clean_mesh` updates normals and shading without welding vertices or removing small components.
-The decimate path, including fallback after a TriFlow failure, retains ordinary cleanup and reduction.
+The decimate path retains ordinary cleanup and reduction.
 
 #### TriFlow
 
@@ -380,11 +428,12 @@ component has no root below the threshold, its minimum-displacement vertex seeds
   dependency MeshLib is not open source. See `src/kitbash/retopology/triflow/NOTICE.md`. Use
   `--retopology decimate` to avoid both.
 
-With `retopology.fallback_on_error = true` (the default), a failed `triflow` run logs a warning, keeps the
-Trellis mesh and continues on the `decimate` path. The reason is stored as `fallback_reason` in the
-asset's `retopology` record. With `false`, a retopology failure is handled like a Trellis failure: the
-asset asks you for another item name or reference image. The analytics report retopology time next to
-Trellis time.
+Retopology always runs on a Trellis mesh and has no silent fallback: a failed `triflow` run fails the
+asset like a Trellis failure, so it asks you for another reference image (or offers procedural modelling)
+instead of continuing with the raw mesh. `retopology.fallback_on_error`, which used to keep the raw
+Trellis mesh, was removed; old configs and run snapshots that still set it keep loading, and the key is
+ignored. `--retopology decimate` is the explicit, in-Blender alternative. The analytics report retopology
+time next to Trellis time.
 
 ### Reference acquisition: deterministic first
 
@@ -392,20 +441,26 @@ Trellis time.
 2. An explicit user image wins next (JPEG, PNG or WebP, subject to decode/size limits). Otherwise,
    an input-image crop is reused only with at least `reference.min_crop_side_px = 384` pixels on its
    **original, unpadded shorter side**, plus the automatic quality gates below. Crops are never upscaled.
-3. Commons and Openverse queries are cached and ranked deterministically. Rights are checked before
+3. Only **isolated** images are accepted: the object alone on no background (transparent) or on a flat
+   neutral one (white, grey or black). Candidates with a scene, surface or colored backdrop are dropped
+   before ranking, so they can be neither selected automatically nor offered for review, and a human
+   choice from the contact sheet is rechecked for it too. Your own image is used as given; its
+   isolation is recorded in the provenance.
+4. Commons and Openverse queries are cached and ranked deterministically. Rights are checked before
    downloading; title/category overlap and provider rank bound download work. Decoded pixel hashes
    deduplicate identical images across URLs; sharpness, border clipping, approximate foreground
    occupancy/background uniformity and decoded/native dimensions determine the final ranking.
-4. Automatic selection requires supported rights, `auto_select_threshold = 0.88` and a lead of
+5. Automatic selection requires supported rights, `auto_select_threshold = 0.88` and a lead of
    `ambiguity_margin = 0.08` over the next candidate. Hard gates also require native/decoded shorter
    sides of at least 384 pixels, token overlap ≥ 0.65, normalized sharpness ≥ 0.2, estimated occupancy
-   between 0.08 and 0.75, edge clipping ≤ 0.02 and border uniformity ≥ 0.9. A lone candidate is not
+   between 0.08 and 0.75, edge clipping ≤ 0.02 and border uniformity ≥ 0.9 on a neutral (or transparent) backdrop. A lone candidate is not
    automatically trusted, and does not trigger a model call.
 
 These are **screening heuristics, not proof of the correct object, completeness or lack of occlusion**.
 Ambiguous/low-quality results produce `contact_sheet.png` and `review.json`, then `input_needed` before
-mesh generation. Interactive review can explicitly accept a rights-eligible, decodable candidate below
-the heuristic threshold. `--no-interactive` skips unresolved assets; they remain placeholders/partial
+mesh generation. If no isolated candidate exists at all, the request asks for a reference image or
+offers procedural modelling. Interactive review can explicitly accept a rights-eligible, decodable,
+isolated candidate below the heuristic threshold. `--no-interactive` skips unresolved assets; they remain placeholders/partial
 input, subject to final acceptance—not an expensive mesh run on the top lexical hit.
 Set `reference.vision_fallback = true` to let OMP judge ambiguous candidates when at least one passes
 the automatic quality threshold. Visual fallback cannot override rights or the quality gates; its
@@ -640,6 +695,8 @@ The integration tests use a fake `omp` (`tests/fakes/fake_omp.py`, which answers
 headless Blender. They cover:
 
 - the full pipeline, then backlot reuse on a similar image;
+- the Kitbash flow (`kitbash model`): Trellis, retopology, build, USD and backlot with no LLM call or critic cycle,
+  and no procedural fallback when Trellis or retopology fails;
 - generation continuing during review;
 - resume;
 - the MaterialX and baked-fallback export paths;
@@ -658,7 +715,8 @@ src/kitbash/
   domain/                   inventory, asset state machine, rubric, critiques, phases, roles
   agents/                   scene (orchestrator), breakdown, modelling, layout agents
   phases/                   one class per phase: gates, persistence, coordination
-  pipeline/                 asset board, scheduler (backpressure), review queue, workers, per-asset steps
+  pipeline/                 asset board, scheduler (backpressure), review queue, workers, per-asset steps,
+                            the Kitbash flow (image_to_model.py)
   critique/                 critic loop, resumable sessions, critics, patch writer, diff history
   llm/                      provider-neutral client types, prompt library, typed calls, parsing
   retopology/               retopology methods behind one protocol: decimate (pass-through) and triflow

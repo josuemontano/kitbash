@@ -52,10 +52,11 @@ from kitbash.phases.layout import LayoutPhase
 from kitbash.phases.modelling import ModellingPhase
 from kitbash.phases.scene_assets import SceneCast
 from kitbash.pipeline.commit import BacklotCommitter
+from kitbash.pipeline.image_to_model import ImageToModelFlow, ModelRequest, ModelResult
 from kitbash.retopology import make_retopologizer
 from kitbash.retopology.base import Retopologizer
 from kitbash.services.blender_toolkit import BlenderToolkit
-from kitbash.services.preflight import PreflightReport, run_preflight
+from kitbash.services.preflight import PreflightReport, run_model_preflight, run_preflight
 from kitbash.services.references import ReferenceFinder
 from kitbash.services.usd_fidelity import UsdFidelityChecker
 from kitbash.store.state import StateDB
@@ -89,6 +90,17 @@ def create_workspace(
     state.meta.set("input", local_input.to_dict())
     state.close()
     return config, layout, local_input
+
+
+def create_model_workspace(output: Path, config_path: Path | None, overrides: Mapping[str, Any]) -> tuple[Config, OutputLayout]:
+    """Validate and snapshot a new Kitbash flow run; like ``create_workspace`` it never reuses an existing run."""
+    layout = OutputLayout.at(output)
+    if any(path.exists() for path in (layout.state_db, layout.config_snapshot)):
+        raise ConfigError(f"{layout.root} already contains kitbash run files", hint="Choose another --output.")
+    config = load_config(config_path, overrides)
+    layout.create()
+    layout.config_snapshot.write_text(config.snapshot_toml(), encoding="utf-8")
+    return config, layout
 
 
 def open_workspace(output: Path, overrides: Mapping[str, Any]) -> tuple[Config, OutputLayout, RunInput]:
@@ -270,3 +282,51 @@ class Application:
         if unknown:
             raise ConfigError(f"Unknown reference providers: {', '.join(unknown)}", hint=f"Use {', '.join(factories)}.")
         return [factories[name]() for name in self.config.reference.providers]
+
+
+class ModelApplication:
+    """Everything the Kitbash flow needs: Trellis, retopology, Blender and the backlot. No omp, models, critics or agents.
+
+    The flow always uses Trellis, whatever ``modelling.method`` says: programmatic modelling is not part of it."""
+
+    def __init__(
+        self,
+        config: Config,
+        layout: OutputLayout,
+        *,
+        retopology_factory: Callable[[Config, SpanRecorder], Retopologizer] = make_retopologizer,
+    ) -> None:
+        configure_logging(layout)
+        self.config, self.layout = config, layout
+        self._processes = ProcessRegistry()
+        self.state = StateDB(layout.state_db)
+        self.tracker = Tracker(self.state.spans)
+        self.backlot = Backlot(config.paths.backlot, make_embedder(config.embedding))
+        self.retopologizer = retopology_factory(config, self.tracker)
+
+    def run(self, request: ModelRequest) -> ModelResult:
+        self._processes = ProcessRegistry()
+        config, layout, tracker = self.config, self.layout, self.tracker
+        with self._processes.bind():
+            try:
+                self._processes.check_cancelled()
+                trellis_python = run_model_preflight(config, self.retopologizer)
+                trellis = TrellisRunner(
+                    config.paths.trellis, python=trellis_python, steps=config.trellis.steps, pipeline_type=config.trellis.pipeline_type,
+                    no_texture=config.trellis.no_texture, timeout_s=config.trellis.timeout_s, retries=config.trellis.retries,
+                    max_concurrent=1, recorder=tracker,
+                )
+                runner = BlenderRunner(config.tools.blender, timeout_s=config.blender.timeout_s, recorder=tracker)
+                toolkit = BlenderToolkit(runner, config.blender, config.usd, config.naming, config.paths.downloads)
+                flow = ImageToModelFlow(
+                    trellis, self.retopologizer, toolkit, UsdFidelityChecker(toolkit), self.backlot, config, layout, tracker
+                )
+                return flow.run(request)
+            finally:
+                self._processes.terminate_all()
+
+    def close(self) -> None:
+        with defer_interrupts():
+            self._processes.terminate_all()
+            self.backlot.close()
+            self.state.close()

@@ -64,6 +64,10 @@ class BlenderToolkit:
         )
         return [Path(p) for p in result["images"]]
 
+    def build_trellis_model(self, args: Mapping[str, Any], log_dir: Path) -> dict[str, Any]:
+        """The fixed build for the Kitbash flow: the retopologized Trellis mesh becomes the saved asset .blend."""
+        return self.run_script(blender_script("build_trellis_model.py"), args, log_dir / "build.log")
+
     def inspect_asset(self, blend: Path, slug: str, expected_dimensions: Sequence[float], log_dir: Path, log_name: str) -> tuple[dict, dict]:
         result = self._fixed("inspect_asset.py", blend, log_dir, log_name, slug=slug, expected_dimensions=list(expected_dimensions))
         return result["report"], result["facts"]
