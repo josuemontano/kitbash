@@ -58,16 +58,24 @@ style = "photorealistic"
 threads = 2
 review_buffer = 6
 
+# Local Ollama >= 0.35.1, with `ollama pull clef-flash` completed.
+[evaluation]
+model = "clef-flash"
+base_url = "http://localhost:11434"
+timeout_s = 120
+
 [critic]
 max_cycles = 4
 # Weighted rubric score needed to pass, in [0, 1].
 pass_threshold = 0.8
 # Also require every applicable criterion to pass.
 require_all_pass = true
+# Distribution concentration, not calibrated correctness. Lower confidence escalates to the critic.
+confidence_threshold = 0.7
 # Stop early when the best score has not improved by `stall_epsilon` for `stall_cycles` cycles.
 stall_cycles = 2
 stall_epsilon = 0.01
-# Revert a patch whose score drops by more than this.
+# Revert a patch if any normalized criterion drops by more than this (or loses a pass).
 revert_epsilon = 0.02
 # Attempts at producing a patch that applies cleanly, per cycle.
 patch_attempts = 2

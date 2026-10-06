@@ -213,6 +213,7 @@ def test_simultaneous_worker_fatals_join_nested_critics_before_close(tmp_path):
                 unwound.append("critic")
 
     loop = CriticLoop(
+        evaluator=None,
         critics=(RunningCritic(),), patch_writer=None, rubric=None, config=config.critic, store=None, tracker=application.tracker,
     )
 

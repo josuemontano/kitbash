@@ -1,21 +1,27 @@
 # kitbash rubric
 
-Critics assess every criterion assigned to their role and the current phase. With evidence,
-they give a score from 0 to 1 and a pass/fail verdict. Without evidence, they explicitly return
-null score and verdict plus a reason; the scorecard marks the criterion **unassessed**, not failed.
-Strict scoring (`require_all_pass`) cannot pass an unassessed criterion. When assigned to both
-critics, both must supply evidence to pass unless a measured machine check decides the result.
-Edit this file (or pass `--rubric my_rubric.md`) to change critic behavior. No code changes are needed.
+This rubric is the canonical evaluation specification. Available machine checks decide measured
+criteria; otherwise Clef-Flash makes a bounded decision from existing evidence. Criteria without
+explicit ordinal levels use the probability that their pass condition is met, not an invented scale.
+Kitbash applies score/confidence thresholds. Missing evidence or low confidence is **unassessed**
+and cannot automatically pass. Generative critics explain failures and propose edits; they do not score.
+Edit this file (or pass `--rubric my_rubric.md`) to change evaluation behavior without code changes.
 
 Columns:
 
 - **criterion**: what is judged. Its slug (lowercase, underscores) is the criterion id.
 - **weight**: relative weight in the phase score.
-- **pass condition**: what the critics must verify. A condition in backticks is also
+- **pass condition**: what the evidence must establish. A condition in backticks is also
   checked by machine against measured facts, for example `usd_roundtrip_score >= 0.85`.
   When every fact it names is available, the machine check decides pass or fail.
 - **applies to**: comma-separated phases: `breakdown`, `modelling`, `layout`, `assembly` or `all`.
-- **critic** (optional): `visual`, `technical` or `both` (default `both`).
+- **critic** (optional): `visual`, `technical` or `both` (default `both`); evidence requirements and feedback role.
+- **levels** (optional): JSON object of 2–26 numeric values and explicit definitions, ordered numerically,
+  e.g. `{"1":"severe errors", "2":"major errors", "3":"acceptable", "4":"strong", "5":"excellent"}`.
+  Without levels, false means the pass condition is not met and true means it is met.
+- **threshold** (optional): minimum raw value (0–1 for binary criteria); otherwise the normalized
+  `critic.pass_threshold` is mapped to the raw scale. The aggregate threshold still applies.
+  Scores and probabilities are preserved; `critic.confidence_threshold` gates uncertainty, not correctness.
 
 | criterion | weight | pass condition | applies to | critic |
 |---|---|---|---|---|

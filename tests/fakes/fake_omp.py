@@ -12,7 +12,6 @@ import sys
 
 MODELS = ["claude-opus-5", "claude-sonnet-5", "gemini-3.8-flash", "gpt-6-sol"]
 TASK = re.compile(r"<!-- kitbash-task: ([\w.]+) -->")
-CRITERION_ROW = re.compile(r"^\| ([a-z0-9_]+) \|", re.MULTILINE)
 
 INVENTORY = {
     "scene": {
@@ -155,12 +154,6 @@ def layout_script(prompt: str) -> str:
     return LAYOUT_SCRIPT.format(placements=repr(placements), placeholders=repr(placeholders))
 
 
-def critique(prompt: str) -> dict:
-    section = prompt.split("## Rubric criteria to score", 1)[1].split("\n## ", 1)[0]
-    ids = [cid for cid in CRITERION_ROW.findall(section) if cid != "id"]
-    return {"summary": "Looks good.", "scores": {cid: {"score": 0.95, "pass": True, "notes": "fine"} for cid in ids}, "edits": []}
-
-
 def respond(task: str, prompt: str) -> str:
     if task == "preflight.ping":
         return "pong"
@@ -170,7 +163,7 @@ def respond(task: str, prompt: str) -> str:
             inventory = {**INVENTORY, "items": [{**item, "user_reference": reference} for item in INVENTORY["items"]]}
         return "```json\n" + json.dumps(inventory) + "\n```"
     if ".critic." in task:
-        return json.dumps(critique(prompt))
+        return json.dumps({"summary": "Inspect the supplied rubric results and evidence.", "edits": []})
     if task == "modelling.reference.select":
         return json.dumps({"choice": 1, "reason": "the crop shows the whole object", "background": "other"})
     if task == "modelling.script":

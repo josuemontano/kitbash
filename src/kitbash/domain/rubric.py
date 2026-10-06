@@ -1,20 +1,22 @@
-"""Rubric: parsed from an editable Markdown table, used to prompt critics and to score their answers.
+"""Editable criteria and application-owned decisions over bounded assessments.
 
-Table columns (header names are case-insensitive): ``criterion | weight | pass condition | applies to``
-and an optional ``critic`` column (``visual``, ``technical`` or ``both``). Text in backticks inside the
-pass condition is a machine check over measured facts, e.g. ``usd_roundtrip_score >= 0.85``.
+Required columns: ``criterion | weight | pass condition | applies to``. Optional
+``critic``, JSON ``levels`` and raw-scale ``threshold`` columns preserve explicit
+rubric meanings. Backtick expressions are authoritative checks over measured facts.
 """
 
 import ast
+import json
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from statistics import fmean
 from typing import Any
 
-from attrs import frozen
+from attrs import evolve, frozen
 
-from kitbash.domain.critique import CardEntry, CriticKind, Critique, ScoreCard
+from kitbash.domain.critique import CardEntry, CriticKind, ScoreCard
+from kitbash.domain.evaluation import CriterionAssessment
 from kitbash.domain.phases import PhaseName
 from kitbash.errors import KitbashError
 from kitbash.naming import slugify
@@ -54,7 +56,10 @@ class Check:
         """True/False, or None when a fact it needs was not measured."""
         if any(facts.get(name) is None for name in self.names):
             return None
-        return bool(_eval(self.tree.body, facts))
+        try:
+            return bool(_eval(self.tree.body, facts))
+        except (TypeError, ValueError, ArithmeticError):
+            return None
 
 
 @frozen
@@ -66,6 +71,8 @@ class Criterion:
     applies_to: frozenset[PhaseName]
     critics: frozenset[CriticKind]
     check: Check | None = None
+    levels: tuple[tuple[float, str], ...] = ()
+    threshold: float | None = None
 
     def applies(self, phase: PhaseName, critic: CriticKind | None = None) -> bool:
         return phase in self.applies_to and (critic is None or critic in self.critics)
@@ -95,62 +102,103 @@ class Rubric:
             raise RubricError(f"Duplicate rubric criteria: {', '.join(duplicates)}")
         if not criteria:
             raise RubricError("Rubric has no criteria")
+        for phase in PhaseName:
+            applicable = [c for c in criteria if c.applies(phase)]
+            if applicable and sum(c.weight for c in applicable) <= 0:
+                raise RubricError(f"Rubric requires positive total applicable weight for {phase.value}")
         return cls(criteria=tuple(criteria), source=source)
 
     def for_phase(self, phase: PhaseName, critic: CriticKind | None = None) -> tuple[Criterion, ...]:
         return tuple(c for c in self.criteria if c.applies(phase, critic))
 
     def render(self, phase: PhaseName, critic: CriticKind | None = None) -> str:
-        """Markdown table of the criteria a critic must score, for prompts."""
-        lines = ["| id | criterion | weight | pass condition |", "|---|---|---|---|"]
-        lines += [f"| {c.id} | {c.name} | {c.weight:g} | {c.pass_condition} |" for c in self.for_phase(phase, critic)]
+        """Criteria and explicit scale meanings for feedback prompts."""
+        lines = ["| id | criterion | weight | pass condition | levels | threshold |", "|---|---|---|---|---|---|"]
+        lines += [
+            f"| {c.id} | {c.name} | {c.weight:g} | {c.pass_condition} | "
+            f"{json.dumps(dict(c.levels)) if c.levels else ''} | {c.threshold if c.threshold is not None else ''} |"
+            for c in self.for_phase(phase, critic)
+        ]
         return "\n".join(lines)
 
     def score(
         self,
         phase: PhaseName,
-        critiques: Sequence[Critique],
+        assessments: Sequence[CriterionAssessment],
         facts: Mapping[str, Any],
         *,
         threshold: float,
         require_all_pass: bool,
+        confidence_threshold: float = 0.7,
+        previous: ScoreCard | None = None,
+        regression_epsilon: float = 0.02,
     ) -> ScoreCard:
-        entries = tuple(_score_criterion(c, critiques, facts, threshold) for c in self.for_phase(phase))
+        if not _in_range(threshold, 0.0, 1.0) or not _in_range(confidence_threshold, 0.0, 1.0):
+            raise RubricError("Score and confidence thresholds must be finite numbers in [0, 1]")
+        if not _in_range(regression_epsilon, 0.0, 1.0):
+            raise RubricError("Regression epsilon must be a finite number in [0, 1]")
+        criteria = self.for_phase(phase)
+        if any(not _in_range(c.weight, 0.0, math.inf) for c in criteria) or sum(c.weight for c in criteria) <= 0:
+            raise RubricError(f"Rubric requires finite nonnegative weights and positive total applicable weight for {phase.value}")
+        by_id: dict[str, CriterionAssessment] = {}
+        for assessment in assessments:
+            if assessment.criterion_id in by_id:
+                by_id[assessment.criterion_id] = CriterionAssessment(assessment.criterion_id, None, error="Duplicate assessment")
+            else:
+                by_id[assessment.criterion_id] = assessment
+        old = {e.criterion_id: e for e in previous.entries} if previous else {}
+        entries = []
+        for criterion in criteria:
+            entry = _score_criterion(criterion, by_id.get(criterion.id), facts, threshold, confidence_threshold)
+            prior = old.get(criterion.id)
+            delta = entry.score - prior.score if prior and entry.score is not None and prior.score is not None else None
+            regressed = bool(prior and (
+                (prior.passed is not None and delta is not None and delta < -regression_epsilon)
+                or (prior.passed is True and entry.passed is not True)
+            ))
+            entries.append(evolve(entry, delta=delta, regressed=regressed))
         scored = [e for e in entries if e.score is not None]
         weight = sum(e.weight for e in scored)
         overall = sum(e.weight * e.score for e in scored) / weight if weight else 0.0
+        certain = all(e.passed is not None for e in entries)
         all_pass = all(e.passed is True for e in entries)
-        passed = bool(scored) and overall >= threshold and (all_pass or not require_all_pass)
-        return ScoreCard(entries=entries, overall=overall, passed=passed, threshold=threshold, facts=dict(facts))
+        passed = bool(scored) and certain and overall >= threshold and (all_pass or not require_all_pass)
+        passed = passed and not any(e.regressed for e in entries)
+        return ScoreCard(entries=tuple(entries), overall=overall, passed=passed, threshold=threshold, facts=dict(facts))
 
 
-def _score_criterion(criterion: Criterion, critiques: Sequence[Critique], facts: Mapping[str, Any], threshold: float) -> CardEntry:
-    opinions = [
-        (critique.critic, score)
-        for critique in critiques
-        if (score := critique.score_for(criterion.id)) is not None and CriticKind(critique.critic) in criterion.critics
-    ]
-    notes = tuple(f"{critic}: {s.notes}" for critic, s in opinions if s.notes)
-    base = dict(criterion_id=criterion.id, name=criterion.name, weight=criterion.weight, notes=notes)
+def _in_range(value: Any, low: float, high: float) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and low <= value <= high
+
+
+def _score_criterion(
+    criterion: Criterion,
+    assessment: CriterionAssessment | None,
+    facts: Mapping[str, Any],
+    threshold: float,
+    confidence_threshold: float,
+) -> CardEntry:
+    low, high = (criterion.levels[0][0], criterion.levels[-1][0]) if criterion.levels else (0.0, 1.0)
+    raw_threshold = criterion.threshold if criterion.threshold is not None else low + threshold * (high - low)
+    base = dict(criterion_id=criterion.id, name=criterion.name, weight=criterion.weight, threshold=raw_threshold)
     verdict = criterion.check.evaluate(facts) if criterion.check else None
     if verdict is not None:
-        return CardEntry(**base, score=1.0 if verdict else 0.0, passed=verdict, decided_by="check")
-    assessed = [(critic, s) for critic, s in opinions if s.score is not None]
-    missing = criterion.critics - {CriticKind(critic) for critic, _ in assessed}
-    reported = {CriticKind(critic): s for critic, s in opinions}
-    base["notes"] = notes + tuple(
-        f"{critic.value}: criterion unassessed (no score provided)"
-        for critic in sorted(missing)
-        if critic not in reported or not reported[critic].notes
+        return CardEntry(
+            **base, score=float(verdict), raw_score=high if verdict else low, passed=verdict,
+            confidence=1.0, decided_by="check",
+        )
+    if assessment is None:
+        return CardEntry(**base, score=None, passed=None, notes=("Criterion assessment unavailable",))
+    details = dict(confidence=assessment.confidence, probabilities=dict(assessment.probabilities), decided_by=assessment.source)
+    if assessment.error or not _in_range(assessment.value, low, high):
+        return CardEntry(**base, **details, score=None, passed=None, notes=(assessment.error or "Invalid or missing raw score",))
+    score = (assessment.value - low) / (high - low)
+    confident = _in_range(assessment.confidence, confidence_threshold, 1.0)
+    return CardEntry(
+        **base, **details, score=score, raw_score=assessment.value,
+        passed=assessment.value >= raw_threshold if confident else None,
+        notes=() if confident else ("Confidence unavailable or below threshold",),
     )
-    if not assessed:
-        return CardEntry(**base, score=None, passed=None)
-    score = fmean(s.score for _, s in assessed)
-    flags = [s.passed if s.passed is not None else s.score >= threshold for _, s in assessed]
-    # A known failure remains a failure; missing evidence must never become either a pass or
-    # an invented negative assessment. Machine checks above remain authoritative.
-    passed = False if not all(flags) else (None if missing else True)
-    return CardEntry(**base, score=score, passed=passed, decided_by="critics")
 
 
 def _find_table(text: str) -> tuple[list[str], list[tuple[int, list[str]]]]:
@@ -191,6 +239,18 @@ def _parse_row(row: list[str], columns: Mapping[str, int], line: int) -> Criteri
         weight = float(cell("weight"))
     except ValueError:
         raise RubricError(f"Rubric line {line}: weight must be a number") from None
+    if not _in_range(weight, 0.0, math.inf):
+        raise RubricError(f"Rubric line {line}: weight must be finite and nonnegative")
+    levels = _levels(cell("levels"), line)
+    threshold = None
+    if cell("threshold"):
+        try:
+            threshold = float(cell("threshold"))
+        except ValueError:
+            raise RubricError(f"Rubric line {line}: threshold must be a number") from None
+        low, high = (levels[0][0], levels[-1][0]) if levels else (0.0, 1.0)
+        if not _in_range(threshold, low, high):
+            raise RubricError(f"Rubric line {line}: threshold must be finite and within the raw scale")
     condition = cell("pass condition")
     checks = _BACKTICKS.findall(condition)
     return Criterion(
@@ -201,7 +261,30 @@ def _parse_row(row: list[str], columns: Mapping[str, int], line: int) -> Criteri
         applies_to=_phases(cell("applies to"), line),
         critics=_critics(cell("critic", "both"), line),
         check=Check.compile(checks[0]) if checks else None,
+        levels=levels,
+        threshold=threshold,
     )
+
+
+def _levels(text: str, line: int) -> tuple[tuple[float, str], ...]:
+    if not text:
+        return ()
+    try:
+        # Preserve pairs so duplicate JSON keys cannot silently replace meanings.
+        pairs = json.loads(text, object_pairs_hook=lambda pairs: pairs)
+        if not text.lstrip().startswith("{") or not isinstance(pairs, list) or not 2 <= len(pairs) <= 26:
+            raise ValueError
+        levels = []
+        for key, description in pairs:
+            value = float(key)
+            if not math.isfinite(value) or not isinstance(description, str) or not description.strip():
+                raise ValueError
+            levels.append((value, description))
+        if len({value for value, _ in levels}) != len(levels):
+            raise ValueError
+        return tuple(sorted(levels))
+    except (ValueError, TypeError):
+        raise RubricError(f"Rubric line {line}: levels must be a JSON object with 2..26 unique finite numeric keys and nonempty descriptions") from None
 
 
 def _phases(text: str, line: int) -> frozenset[PhaseName]:

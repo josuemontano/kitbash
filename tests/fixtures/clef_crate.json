@@ -1,0 +1,29 @@
+{
+  "subject": "asset 'wooden_crate' (Wooden crate)",
+  "description": "Slatted pine storage crate with dark nail heads, 0.6 x 0.4 x 0.35 meters. Pine wood, matching the crate and mug studio reference used by test_pipeline.",
+  "facts": {
+    "scale_error": 0.01,
+    "origin_offset_m": 0.0,
+    "up_axis_ok": true,
+    "naming_violations": 0,
+    "non_principled_materials": 0,
+    "missing_textures": 0,
+    "usd_roundtrip_score": 0.96,
+    "usd_broken_materials": 0
+  },
+  "report": {
+    "asset": {
+      "objects": [{"name": "wooden_crate", "dimensions_m": [0.6, 0.4, 0.35]}],
+      "materials": [{"name": "wooden_crate_pine", "roughness": 0.6, "metallic": 0.0}]
+    },
+    "usd": {"roundtrip_score": 0.96, "missing_textures": []}
+  },
+  "responses": [
+    {"model": "clef-flash", "answers": {"matches_the_reference_shape_proportions_color": {"type": "noul", "noul": 0.01}}, "usage": {"input_tokens": 912, "output_tokens": 0}},
+    {"model": "clef-flash", "answers": {"matches_the_reference_shape_proportions_color": {"type": "noul", "noul": 0.995}}, "usage": {"input_tokens": 1088, "output_tokens": 0}}
+  ],
+  "feedback": {
+    "summary": "The pine color is too saturated red; the measured scale, origin, naming and USD checks already pass.",
+    "edits": [{"target": "pine material", "issue": "reference color mismatch", "instruction": "Set PINE_COLOR to (0.55, 0.36, 0.2), preserving dimensions and all other materials.", "priority": "high"}]
+  }
+}

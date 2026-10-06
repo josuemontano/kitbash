@@ -6,8 +6,10 @@ import types
 import typing
 from collections.abc import Mapping
 from importlib import resources
+from math import isfinite
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import attrs
 import tomli_w
@@ -93,6 +95,13 @@ class PipelineConfig:
 
 
 @frozen
+class EvaluationConfig:
+    model: str
+    base_url: str
+    timeout_s: float
+
+
+@frozen
 class CriticConfig:
     max_cycles: int
     pass_threshold: float
@@ -101,6 +110,7 @@ class CriticConfig:
     stall_epsilon: float
     revert_epsilon: float
     patch_attempts: int
+    confidence_threshold: float
 
 
 @frozen
@@ -230,6 +240,7 @@ class Config:
     omp: OmpConfig
     pipeline: PipelineConfig
     critic: CriticConfig
+    evaluation: EvaluationConfig
     breakdown: BreakdownConfig
     backlot: BacklotConfig
     embedding: EmbeddingConfig
@@ -381,6 +392,22 @@ def _validate(config: Config) -> None:
         raise ConfigError("--threads and --review-buffer must be at least 1")
     if config.critic.max_cycles < 1:
         raise ConfigError("--max-cycles must be at least 1")
+    for name in ("pass_threshold", "confidence_threshold", "revert_epsilon"):
+        value = getattr(config.critic, name)
+        if not isfinite(value) or not 0 <= value <= 1:
+            raise ConfigError(f"critic.{name} must be finite and in [0, 1]")
+    evaluation = config.evaluation
+    if not evaluation.model.strip():
+        raise ConfigError("evaluation.model must name a local Clef-Flash model")
+    endpoint = urlsplit(evaluation.base_url)
+    if (
+        endpoint.scheme not in {"http", "https"} or not endpoint.hostname
+        or endpoint.username is not None or endpoint.password is not None
+        or endpoint.query or endpoint.fragment
+    ):
+        raise ConfigError("evaluation.base_url must be an HTTP(S) server URL without credentials, query or fragment")
+    if not isfinite(evaluation.timeout_s) or evaluation.timeout_s <= 0:
+        raise ConfigError("evaluation.timeout_s must be finite and positive")
     if config.modelling.method not in {"trellis", "procedural"}:
         raise ConfigError("modelling.method must be 'trellis' or 'procedural'")
     methods = [m.value for m in RetopologyMethod]

@@ -1,7 +1,8 @@
 import pytest
 
 from kitbash.config import default_rubric_path
-from kitbash.domain.critique import CriterionScore, CriticKind, Critique, scorecard_from_dict
+from kitbash.domain.critique import CriticKind, Critique, scorecard_from_dict
+from kitbash.domain.evaluation import CriterionAssessment
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Check, Rubric, RubricError
 
@@ -14,14 +15,6 @@ TABLE = """
 | Looks right | 3 | matches the reference | breakdown, modelling | visual |
 | Lighting | 1 | balanced exposure | layout | both |
 """
-
-
-def critique(critic: CriticKind, **scores: tuple[float | None, bool | None]) -> Critique:
-    return Critique(
-        critic=critic.value,
-        summary="",
-        scores=tuple(CriterionScore(cid, score, passed) for cid, (score, passed) in scores.items()),
-    )
 
 
 def test_default_rubric_has_every_required_criterion():
@@ -82,124 +75,199 @@ def test_check_expressions():
     check = Check.compile("usd_roundtrip_score >= 0.85 and missing_textures == 0 and not broken")
     assert check.evaluate({"usd_roundtrip_score": 0.9, "missing_textures": 0, "broken": False}) is True
     assert check.evaluate({"usd_roundtrip_score": 0.8, "missing_textures": 0, "broken": False}) is False
-    assert check.evaluate({"usd_roundtrip_score": 0.9}) is None  # unmeasured facts leave it to critics
+    assert check.evaluate({"usd_roundtrip_score": 0.9}) is None
     assert Check.compile("0 <= x < 1").evaluate({"x": 0.5}) is True
     assert Check.compile("up_axis_ok or -x > 1").evaluate({"up_axis_ok": True, "x": 0}) is True
 
 
-def test_machine_check_decides_over_critics():
+def assess(criterion_id, value, confidence=0.95, **kwargs):
+    return CriterionAssessment(criterion_id, value, confidence, **kwargs)
+
+
+def score(rubric, assessments=(), facts=None, **kwargs):
+    options = {"threshold": 0.8, "require_all_pass": True, **kwargs}
+    return rubric.score(PhaseName.MODELLING, assessments, facts or {}, **options)
+
+
+def ordinal_rubric(threshold=""):
+    return Rubric.parse(
+        "| criterion | weight | pass condition | applies to | levels | threshold |\n"
+        "|---|---|---|---|---|---|\n"
+        '| Shape | 1 | matches reference | modelling | {"5":"excellent", "1":"poor", "3":"adequate"} | '
+        + threshold + " |"
+    )
+
+
+def test_machine_check_is_authoritative_over_provider_and_available_without_provider():
     rubric = Rubric.parse(TABLE)
-    critics = [critique(CriticKind.TECHNICAL, scale_is_plausible=(1.0, True)), critique(CriticKind.VISUAL, looks_right=(0.9, True))]
-    card = rubric.score(PhaseName.MODELLING, critics, {"scale_error": 0.4}, threshold=0.8, require_all_pass=True)
-    scale = next(e for e in card.entries if e.criterion_id == "scale_is_plausible")
-    assert scale.decided_by == "check" and scale.passed is False and scale.score == 0.0
-    assert not card.passed
-    card = rubric.score(PhaseName.MODELLING, critics, {"scale_error": 0.1}, threshold=0.8, require_all_pass=True)
-    assert card.passed and card.overall == pytest.approx((2 * 1.0 + 3 * 0.9) / 5)
+    assessments = [assess("scale_is_plausible", 1.0), assess("looks_right", 0.9)]
+    failed = score(rubric, assessments, {"scale_error": 0.4})
+    assert failed.entries[0].decided_by == "check"
+    assert failed.entries[0].score == 0.0 and failed.entries[0].passed is False
+    assert not failed.passed
+    passed = score(rubric, [assess("looks_right", 0.9)], {"scale_error": 0.1})
+    assert passed.passed and passed.overall == pytest.approx((2 + 3 * 0.9) / 5)
+    assert passed.entries[0].confidence == 1.0
 
 
-def test_scores_from_critics_that_are_not_assigned_are_ignored():
+def test_binary_rubric_does_not_invent_an_ordinal_scale():
     rubric = Rubric.parse(TABLE)
-    card = rubric.score(
-        PhaseName.MODELLING,
-        [critique(CriticKind.TECHNICAL, looks_right=(0.1, False)), critique(CriticKind.VISUAL, looks_right=(0.9, True))],
-        {"scale_error": 0.0},
-        threshold=0.8,
-        require_all_pass=True,
-    )
-    looks = next(e for e in card.entries if e.criterion_id == "looks_right")
-    assert looks.score == 0.9 and looks.passed
+    assert all(not c.levels and c.threshold is None for c in rubric.criteria)
+    card = score(rubric, [assess("looks_right", 0.83)], {"scale_error": 0.0})
+    assert card.entries[1].raw_score == card.entries[1].score == 0.83
+    assert card.entries[1].threshold == 0.8
 
 
-def test_require_all_pass_and_unscored_criteria():
-    rubric = Rubric.parse(TABLE)
-    card = rubric.score(
-        PhaseName.MODELLING,
-        [critique(CriticKind.VISUAL, looks_right=(0.95, False))],
-        {"scale_error": 0.0},
-        threshold=0.5,
-        require_all_pass=True,
-    )
-    assert not card.passed and [e.criterion_id for e in card.failing()] == ["looks_right"]
-    lenient = rubric.score(PhaseName.MODELLING, [critique(CriticKind.VISUAL, looks_right=(0.95, False))], {"scale_error": 0.0}, threshold=0.5, require_all_pass=False)
-    assert lenient.passed
-    nothing = rubric.score(PhaseName.LAYOUT, [], {}, threshold=0.5, require_all_pass=True)
-    assert not nothing.passed and nothing.entries[0].score is None
-
-
-def test_editing_the_rubric_changes_the_verdict():
-    critics = [critique(CriticKind.VISUAL, looks_right=(0.7, None))]
-    strict = Rubric.parse(TABLE)
-    relaxed = Rubric.parse(TABLE.replace("`scale_error <= 0.25`", "`scale_error <= 0.5`"))
-    facts = {"scale_error": 0.4}
-    assert not strict.score(PhaseName.MODELLING, critics, facts, threshold=0.6, require_all_pass=False).entries[0].passed
-    assert relaxed.score(PhaseName.MODELLING, critics, facts, threshold=0.6, require_all_pass=False).entries[0].passed
-
-
-def test_required_unknown_criterion_blocks_an_otherwise_perfect_score():
-    card = Rubric.parse(TABLE).score(
-        PhaseName.MODELLING, [], {"scale_error": 0.0}, threshold=0.8, require_all_pass=True,
-    )
-    assert card.overall == 1.0
-    assert not card.passed
-    assert card.entries[1].passed is None
-
-
-def test_lenient_scoring_keeps_unknown_criteria_explicit_without_relabeling_them():
-    card = Rubric.parse(TABLE).score(
-        PhaseName.MODELLING, [], {"scale_error": 0.0}, threshold=0.8, require_all_pass=False,
-    )
+def test_explicit_ordinal_meanings_are_sorted_and_raw_scale_normalized():
+    rubric = ordinal_rubric()
+    assert rubric.criteria[0].levels == ((1.0, "poor"), (3.0, "adequate"), (5.0, "excellent"))
+    card = score(rubric, [assess("shape", 4.6)])
+    entry = card.entries[0]
+    assert entry.raw_score == 4.6
+    assert entry.score == pytest.approx(0.9)
+    assert entry.threshold == pytest.approx(4.2)
     assert card.passed
+
+
+def test_explicit_raw_threshold_overrides_mapped_global_threshold():
+    assessment = [assess("shape", 4.4)]
+    assert score(ordinal_rubric(), assessment).passed
+    card = score(ordinal_rubric("4.5"), assessment)
+    assert card.overall > 0.8 and not card.passed
+    assert card.entries[0].passed is False and card.entries[0].threshold == 4.5
+    assert score(ordinal_rubric("4.5"), assessment, require_all_pass=False).passed
+
+
+@pytest.mark.parametrize("confidence", [None, 0.699, -1.0, 1.1, float("nan"), True])
+@pytest.mark.parametrize("require_all_pass", [False, True])
+def test_uncertainty_blocks_pass_even_when_lenient(confidence, require_all_pass):
+    card = score(Rubric.parse(TABLE), [assess("looks_right", 1.0, confidence)], {"scale_error": 0.0}, require_all_pass=require_all_pass)
+    assert not card.passed and card.status == "uncertain"
+    assert card.entries[1].score == 1.0 and card.entries[1].passed is None
     assert [entry.criterion_id for entry in card.unassessed()] == ["looks_right"]
-    assert card.entries[1].status == "unassessed" and card.entries[1].score is None
-    assert not card.failing()
 
 
-@pytest.mark.parametrize("unavailable", [False, True], ids=["missing-critic", "explicitly-unavailable"])
-def test_one_assigned_critic_cannot_pass_for_an_unavailable_other_critic(unavailable):
-    critics = [critique(CriticKind.TECHNICAL, lighting=(0.95, True))]
-    if unavailable:
-        critics.append(critique(CriticKind.VISUAL, lighting=(None, None)))
-    card = Rubric.parse(TABLE).score(PhaseName.LAYOUT, critics, {}, threshold=0.8, require_all_pass=True)
-    assert card.overall == 0.95 and not card.passed
-    assert card.entries[0].passed is None and card.entries[0].status == "unassessed"
-    assert not card.failing() and card.unassessed() == list(card.entries)
+def test_confidence_boundary_is_inclusive():
+    assert score(ordinal_rubric(), [assess("shape", 5.0, 0.7)]).passed
+    assert not score(ordinal_rubric(), [assess("shape", 5.0, 0.7)], confidence_threshold=0.71).passed
 
 
-def test_known_failure_is_not_erased_by_an_unavailable_second_critic():
-    critics = [
-        critique(CriticKind.TECHNICAL, lighting=(0.95, False)),
-        critique(CriticKind.VISUAL, lighting=(None, None)),
-    ]
-    card = Rubric.parse(TABLE).score(PhaseName.LAYOUT, critics, {}, threshold=0.8, require_all_pass=True)
-    assert not card.passed and card.entries[0].status == "failed"
-    assert card.failing() == list(card.entries) and not card.unassessed()
+@pytest.mark.parametrize("require_all_pass", [False, True])
+def test_missing_assessment_never_passes(require_all_pass):
+    card = score(Rubric.parse(TABLE), facts={"scale_error": 0.0}, require_all_pass=require_all_pass)
+    assert card.overall == 1.0 and not card.passed
+    assert card.entries[1].score is None and card.entries[1].passed is None
 
 
-def test_measured_check_can_assess_a_criterion_when_critic_evidence_is_unavailable():
-    critics = [
-        critique(CriticKind.TECHNICAL, scale_is_plausible=(None, None)),
-        critique(CriticKind.VISUAL, looks_right=(0.95, True)),
-    ]
-    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, critics, {"scale_error": 0.0}, threshold=0.8, require_all_pass=True)
-    assert card.passed and not card.unassessed()
-    assert card.entries[0].decided_by == "check" and card.entries[0].status == "passed"
+@pytest.mark.parametrize("value", [None, -0.01, 1.01, float("nan"), float("inf"), True, "0.9"])
+def test_invalid_binary_values_are_unavailable_not_clamped(value):
+    card = score(Rubric.parse(TABLE), [assess("looks_right", value)], {"scale_error": 0.0})
+    assert card.entries[1].score is None and not card.passed
 
 
-def test_pass_verdict_without_a_score_is_not_evidence():
-    critics = [critique(CriticKind.VISUAL, looks_right=(None, True))]
-    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, critics, {"scale_error": 0.0}, threshold=0.8, require_all_pass=True)
-    assert not card.passed and card.entries[1].status == "unassessed"
+def test_provider_errors_and_duplicate_answers_cannot_establish_pass():
+    rubric = ordinal_rubric()
+    assert score(rubric, [assess("shape", 5.0, error="unavailable")]).status == "uncertain"
+    duplicate = score(rubric, [assess("shape", 5.0), assess("shape", 1.0)])
+    assert duplicate.entries[0].score is None and not duplicate.passed
 
 
-def test_scorecard_roundtrip_preserves_unassessed_versus_failed_criteria():
-    card = Rubric.parse(TABLE).score(PhaseName.MODELLING, [], {"scale_error": 0.4}, threshold=0.8, require_all_pass=True)
+def test_per_dimension_regression_blocks_rising_aggregate():
+    rubric = Rubric.parse(TABLE)
+    previous = score(rubric, [assess("scale_is_plausible", 0.9), assess("looks_right", 0.5)])
+    current = score(rubric, [assess("scale_is_plausible", 0.85), assess("looks_right", 1.0)], previous=previous)
+    assert current.overall > previous.overall
+    assert current.entries[0].passed is True and current.entries[0].delta == pytest.approx(-0.05)
+    assert current.regressions() == [current.entries[0]]
+    assert not current.passed and current.status == "fail"
+
+
+@pytest.mark.parametrize("value, confidence", [(4.199, 0.99), (4.3, 0.1), (None, None)])
+def test_pass_to_fail_or_unknown_is_regression_even_without_large_drop(value, confidence):
+    rubric = ordinal_rubric()
+    previous = score(rubric, [assess("shape", 4.201)])
+    current = score(rubric, [assess("shape", value, confidence)], previous=previous)
+    assert current.regressions() == list(current.entries)
+    assert not current.passed
+
+
+def test_regression_epsilon_and_recovery_from_unavailable():
+    rubric = ordinal_rubric()
+    previous = score(rubric, [assess("shape", 4.8)])
+    current = score(rubric, [assess("shape", 4.76)], previous=previous)
+    assert current.passed and not current.regressions()
+    unavailable = score(rubric)
+    recovered = score(rubric, [assess("shape", 5.0)], previous=unavailable)
+    assert recovered.passed and recovered.entries[0].delta is None
+
+
+def test_scorecard_roundtrip_retains_full_precision_and_decision_fields():
+    rubric = ordinal_rubric("4.123456789")
+    probabilities = {"1.0": 0.0123456789, "3.0": 0.123456789, "5.0": 0.8641975321}
+    previous = score(rubric, [assess("shape", 4.987654321)])
+    card = score(rubric, [assess("shape", 4.7037037064, 0.876543219, probabilities=probabilities)], previous=previous)
     data = card.to_dict()
-    assert data["criteria"]["scale_is_plausible"]["status"] == "failed"
-    assert data["criteria"]["scale_is_plausible"]["pass"] is False
-    assert data["criteria"]["looks_right"]["status"] == "unassessed"
-    assert data["criteria"]["looks_right"]["pass"] is None
     restored = scorecard_from_dict(data)
-    assert not restored.passed
-    assert [entry.criterion_id for entry in restored.failing()] == ["scale_is_plausible"]
-    assert [entry.criterion_id for entry in restored.unassessed()] == ["looks_right"]
+    assert restored == card
+    assert data["overall"] == card.overall
+    assert data["criteria"]["shape"]["score"] == card.entries[0].score
+    assert data["criteria"]["shape"]["raw_score"] == 4.7037037064
+    assert data["criteria"]["shape"]["confidence"] == 0.876543219
+    assert data["criteria"]["shape"]["probabilities"] == probabilities
+    assert restored.regressions() and restored.status == "fail"
+
+
+def test_scorecard_roundtrip_preserves_unassessed_versus_failed():
+    card = score(Rubric.parse(TABLE), facts={"scale_error": 0.4})
+    restored = scorecard_from_dict(card.to_dict())
+    assert restored == card
+    assert [e.criterion_id for e in restored.failing()] == ["scale_is_plausible"]
+    assert [e.criterion_id for e in restored.unassessed()] == ["looks_right"]
+
+
+def test_critique_is_feedback_only_and_ignores_llm_score_claims():
+    critique = Critique.parse("visual", {"summary": "fix shape", "scores": {"shape": {"pass": True, "score": 100}}, "edits": [{"instruction": "Widen base"}]})
+    assert critique.summary == "fix shape" and critique.edits[0].instruction == "Widen base"
+    assert "scores" not in critique.to_dict()
+    assert not hasattr(critique, "scores")
+
+
+@pytest.mark.parametrize("weight", ["-1", "nan", "inf", "-inf"])
+def test_invalid_weights_are_rejected(weight):
+    with pytest.raises(RubricError):
+        Rubric.parse(TABLE.replace("| 2 |", f"| {weight} |"))
+
+
+def test_zero_applicable_weight_is_rejected():
+    with pytest.raises(RubricError):
+        Rubric.parse(TABLE.replace("| 1 |", "| 0 |"))
+
+
+@pytest.mark.parametrize("levels", [
+    '{"1":"only"}', '{"1":"bad", "1":"good"}', '{"1":"bad", "1.0":"good"}',
+    '{"NaN":"bad", "5":"good"}', '{"1":"", "5":"good"}', '{"1":true, "5":"good"}',
+    '["bad", "good"]', '{"bad":"bad", "good":"good"}',
+])
+def test_invalid_ordinal_levels_are_rejected(levels):
+    with pytest.raises(RubricError):
+        Rubric.parse("| criterion | weight | pass condition | applies to | levels |\n|-|-|-|-|-|\n| Shape | 1 | matches | modelling | " + levels + " |")
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "0", "6", "high"])
+def test_invalid_raw_threshold_is_rejected(threshold):
+    with pytest.raises(RubricError):
+        ordinal_rubric(threshold)
+
+
+def test_uncertain_baseline_can_recover_without_hiding_other_dimension_regressions():
+    rubric = Rubric.parse(TABLE)
+    previous = score(rubric, [assess("scale_is_plausible", 0.99), assess("looks_right", 0.99, 0.1)])
+    current = score(rubric, [assess("scale_is_plausible", 0.85), assess("looks_right", 0.85)], previous=previous)
+    assert current.entries[0].delta == pytest.approx(-0.14)
+    assert current.entries[0].regressed
+    assert current.entries[1].delta == pytest.approx(-0.14)
+    assert current.entries[1].passed is True and not current.entries[1].regressed
+    assert current.regressions() == [current.entries[0]]
+    assert not current.passed
+    recovered = score(rubric, [assess("scale_is_plausible", 0.99), assess("looks_right", 0.85)], previous=previous)
+    assert recovered.passed and not recovered.regressions()

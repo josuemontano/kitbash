@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from attrs import define, field, frozen
 
@@ -95,6 +96,7 @@ class CycleResult:
             and self.evaluation.ok
             and bool(self.scorecard.entries)
             and all(entry.score is not None and entry.passed is not None for entry in self.scorecard.entries)
+            and not self.scorecard.regressions()
             and self.evidence is not None
             and self.evidence.matches(self)
         )
@@ -138,6 +140,18 @@ class LoopState:
 
     def session_cycles(self, start: int) -> int:
         return sum(1 for c in self.results if c >= start)
+
+    def previous(self) -> tuple[Mapping[str, Any], ...]:
+        """All completed decisions, including reverted builds, in evaluation order."""
+        return tuple(
+            {"iteration": cycle, "status": result.status.value, "scorecard": result.scorecard.to_dict()}
+            for cycle, result in sorted(self.results.items())
+        )
+
+    def render_history(self) -> str:
+        """Keep decision evidence alongside diffs for evaluators, critics and the patch writer."""
+        decisions = json.dumps(self.previous(), indent=2, default=str)
+        return f"{self.history.render()}\n\n## Previous rubric results\n```json\n{decisions}\n```"
 
 
 

@@ -1,10 +1,11 @@
 """The automatic critic loop shared by breakdown, modelling (per asset) and layout.
 
-Each cycle evaluates a script, asks every critic for rubric scores and edits, and has the code role turn
-those edits into a unified diff against the latest kept script. Everything is checkpointed under
-``cycles/NN/`` and in ``state.db`` so a loop resumes where it stopped.
+Each cycle gathers evidence, evaluates bounded rubric decisions, and asks critics for edits only when
+the result needs attention. The code role turns those edits into a unified diff against the latest kept
+script. Everything is checkpointed under ``cycles/NN/`` and in ``state.db`` for resumption.
 """
 
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import StrEnum
@@ -16,10 +17,12 @@ from kitbash.analytics import context
 from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
 from kitbash.config import CriticConfig
 from kitbash.critique.critics import Critic, PatchRequest, PatchWriter, ReviewRequest
+from kitbash.critique.evaluator import EvaluationCase, Evaluator
 from kitbash.critique.history import DiffStatus, ScoreTrend
 from kitbash.critique.store import CycleResult, CycleStore, LoopState
 from kitbash.critique.subject import Evaluation, LoopSubject
 from kitbash.domain.critique import Critique, Edit
+from kitbash.domain.evaluation import CriterionAssessment, EvaluationResult
 from kitbash.domain.rubric import Rubric
 from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, LLMError, PatchError, StateError
 from kitbash.infra.patching import apply_diff, make_diff
@@ -97,6 +100,7 @@ class CriticLoop:
         self,
         *,
         critics: Sequence[Critic],
+        evaluator: Evaluator,
         patch_writer: PatchWriter,
         rubric: Rubric,
         config: CriticConfig,
@@ -104,6 +108,7 @@ class CriticLoop:
         tracker: Tracker,
     ) -> None:
         self._critics = tuple(critics)
+        self._evaluator = evaluator
         self._patch_writer = patch_writer
         self._rubric = rubric
         self._config = config
@@ -151,11 +156,13 @@ class CriticLoop:
         saved = state.best(start)
         if saved is not None and saved.passed:
             return self._outcome(state, session, LoopReason.PASSED, f"Passed the rubric at cycle {saved.cycle:02d}.")
-        trend = ScoreTrend.of(
-            [state.results[c].score for c in sorted(state.results) if c >= start],
-            self._config.stall_cycles,
-            self._config.stall_epsilon,
-        )
+        trend = ScoreTrend.of([], self._config.stall_cycles, self._config.stall_epsilon)
+        kept_score = session.base.score if session.base is not None else 0.0
+        for cycle, prior in sorted(state.results.items()):
+            if cycle >= start:
+                if prior.status is DiffStatus.KEPT:
+                    kept_score = prior.score
+                trend.add(kept_score)
         started = state.pending is not None or state.session_cycles(start) > 0
         if session.fresh and not started:
             session.observer.building(state.next_cycle)
@@ -172,7 +179,8 @@ class CriticLoop:
                     return self._outcome(state, session, *escalation)
                 pending_feedback = None
             result = self._evaluate(subject, state, session, feedback)
-            trend.add(result.score)
+            head = session.head(state)
+            trend.add(head.score if result.status is DiffStatus.REVERTED and head is not None else result.score)
             if result.passed:
                 return self._outcome(state, session, LoopReason.PASSED, f"Passed the rubric at cycle {result.cycle:02d}.")
             if trend.stalled():
@@ -200,7 +208,7 @@ class CriticLoop:
                 brief=subject.brief(),
                 script=script,
                 edits=tuple(edits),
-                history=state.history.render(),
+                history=state.render_history(),
                 api_reference=subject.api_reference(),
                 error=head.evaluation.error,
                 rejection=rejection,
@@ -238,6 +246,7 @@ class CriticLoop:
         first_of_session = state.session_cycles(session.start) == 0
         parent = session.head(state)
         with self._tracker.span(SpanKind.STEP, f"{subject.phase.value}.cycle", cycle=cycle) as span:
+            current_registry().check_cancelled()
             session.observer.building(cycle)
             script_digest = file_hash(script_path)
             try:
@@ -248,35 +257,87 @@ class CriticLoop:
             evidence = self._store.seal(subject, cycle, script_path, evaluation)
             if evidence is not None and evidence.hashes.get(script_path.relative_to(evidence.root).as_posix()) != script_digest:
                 evidence = None
-            review = ReviewRequest(
+            evaluation_id = f"{subject.phase.value}:{subject.subject_id}:{cycle}"
+            case = EvaluationCase(
+                evaluation_id=evaluation_id,
+                iteration=cycle,
                 brief=subject.brief(),
-                evaluation=evaluation,
                 script=script_path.read_text(encoding="utf-8"),
-                history=state.history.render(),
-                cycle=cycle,
+                history=state.render_history(),
+                previous=state.previous(),
                 feedback=feedback or "",
             )
+            assessed = None
+            diagnostic = None
             session.observer.critiquing(cycle)
-            critiques = self._review(review)
+            with context.bind(agent="clef_flash"):
+                started_at = time.time()
+                try:
+                    assessed = self._evaluator.evaluate(case, self._rubric, evaluation)
+                except KitbashError as exc:
+                    # Provider failures must not become passes or leak provider payloads into analytics.
+                    diagnostic = f"Evaluator unavailable ({type(exc).__name__})"
+                    assessed = EvaluationResult(criteria=tuple(
+                        CriterionAssessment(criterion.id, None, error=diagnostic)
+                        for criterion in self._rubric.for_phase(subject.phase)
+                    ))
+                except BaseException as exc:
+                    diagnostic = type(exc).__name__
+                    raise
+                finally:
+                    self._tracker.record(
+                        SpanKind.LLM if assessed is not None and assessed.model else SpanKind.STEP,
+                        "clef_flash", started_at, time.time(), evaluation_id=evaluation_id, iteration=cycle,
+                        model=assessed.model if assessed is not None else "",
+                        resolved_model=assessed.model if assessed is not None else "",
+                        tokens_in=assessed.input_tokens if assessed is not None else 0,
+                        tokens_out=assessed.output_tokens if assessed is not None else 0,
+                        cost_usd=None, error=diagnostic,
+                    )
+            # Explicit feedback/fresh inputs establish a baseline for changed goals, not a regression.
+            # Compare every known dimension, even when another dimension of the parent is uncertain.
+            baseline = first_of_session and (session.fresh or bool(feedback))
+            previous = parent.scorecard if not baseline and parent is not None else None
             card = self._rubric.score(
                 subject.phase,
-                critiques,
+                assessed.criteria,
                 evaluation.facts,
                 threshold=self._config.pass_threshold,
                 require_all_pass=self._config.require_all_pass,
+                confidence_threshold=self._config.confidence_threshold,
+                previous=previous,
+                regression_epsilon=self._config.revert_epsilon,
             )
-            result = CycleResult(cycle, script_path, card, critiques, evaluation, DiffStatus.KEPT, subject.phase, evidence)
-            # The first cycle is the feedback baseline. Otherwise, protect an eligible parent from
-            # broken patches and score regressions, but never revert a pass in favour of a failure.
-            worse = (
-                not first_of_session
-                and parent is not None
-                and parent.eligible
-                and (not result.eligible or (not result.passed and result.score < parent.score - self._config.revert_epsilon))
+            result = CycleResult(cycle, script_path, card, (), evaluation, DiffStatus.KEPT, subject.phase, evidence)
+            escalation = []
+            if not evaluation.ok or evaluation.error:
+                escalation.append("evaluation_error")
+            if evidence is None or not evidence.matches(result):
+                escalation.append("invalid_evidence")
+            if card.failing():
+                escalation.append("failed_criteria")
+            if card.unassessed():
+                escalation.append("uncertain_criteria")
+            if card.regressions():
+                escalation.append("criterion_regression")
+            if not card.passed and not escalation:
+                escalation.append("below_threshold")
+            if escalation:
+                review = ReviewRequest(
+                    brief=case.brief, evaluation=evaluation, script=case.script,
+                    history=f"{case.history}\n\nCurrent escalation reasons: {', '.join(escalation)}",
+                    cycle=cycle, scorecard=card, feedback=case.feedback,
+                )
+                result = evolve(result, critiques=self._review(review))
+            current_registry().check_cancelled()
+            # A single regressed dimension is sufficient: aggregate improvement cannot hide it.
+            worse = previous is not None and parent is not None and parent.eligible and (
+                not result.eligible or bool(card.regressions())
+                or (not result.passed and result.score < parent.score - self._config.revert_epsilon)
             )
             if worse:
                 result = evolve(result, status=DiffStatus.REVERTED)
-            span.meta.update(score=round(card.overall, 4), passed=result.passed, ok=evaluation.ok)
+            span.meta.update(score=card.overall, passed=result.passed, ok=evaluation.ok, escalation=escalation)
         self._store.save_evaluation(subject, result)
         state.history.settle(cycle, result.status, card.overall)
         state.results[cycle] = result
@@ -284,7 +345,14 @@ class CriticLoop:
         session.observer.evaluated(result)
         self._tracker.event(
             EventKind.CRITIC_CYCLE, subject.phase.value, cycle=cycle, subject=subject.subject_id,
-            score=card.overall, passed=result.passed, status=result.status.value,
+            evaluation_id=evaluation_id, iteration=cycle, model=assessed.model,
+            score=card.overall, passed=result.passed, status=result.status.value, escalation=escalation,
+            criteria={entry.criterion_id: {
+                "score": entry.score, "raw_score": entry.raw_score, "confidence": entry.confidence,
+                "probabilities": dict(entry.probabilities), "threshold": entry.threshold,
+                "passed": entry.passed, "delta": entry.delta, "regressed": entry.regressed,
+                "source": entry.decided_by,
+            } for entry in card.entries},
         )
         return result
 

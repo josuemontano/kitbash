@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import httpx
 from rich.console import Console
 
 from kitbash import __version__
@@ -18,6 +19,7 @@ from kitbash.analytics.tracker import Tracker
 from kitbash.backlot.library import Backlot
 from kitbash.config import Config, default_rubric_path, load_config
 from kitbash.critique.critics import PatchWriter, TechnicalCritic, VisualCritic
+from kitbash.critique.evaluator import ClefFlashEvaluator
 from kitbash.critique.loop import CriticLoop
 from kitbash.critique.sessions import LoopSessions, ResumableLoop
 from kitbash.critique.store import CycleStore
@@ -26,6 +28,7 @@ from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import ConfigError, StateError
 from kitbash.infra.blender import BlenderRunner, SpanRecorder
+from kitbash.infra.clef_flash import ClefFlashAdapter
 from kitbash.infra.embeddings import Embedder, make_embedder
 from kitbash.infra.image_search import (
     CandidateProvider,
@@ -157,6 +160,7 @@ class Application:
         self.user: UserChannel = TerminalUser(console, self.dashboard, images) if interactive else AutoPilot()
         self.backlot = Backlot(config.paths.backlot, self.embedder)
         self._http = make_http_client(config.reference.timeout_s)
+        self._evaluation_http = httpx.Client(base_url=config.evaluation.base_url, timeout=config.evaluation.timeout_s)
         self.retopologizer = retopology_factory(config, self.tracker) if config.modelling.method == "trellis" else None
 
     def preflight(self) -> PreflightReport:
@@ -186,6 +190,7 @@ class Application:
         fidelity = UsdFidelityChecker(toolkit)
         loop = ResumableLoop(
             CriticLoop(
+                evaluator=ClefFlashEvaluator(ClefFlashAdapter(self._evaluation_http, model=config.evaluation.model)),
                 critics=(VisualCritic(llm, self.rubric), TechnicalCritic(llm, self.rubric)),
                 patch_writer=PatchWriter(llm),
                 rubric=self.rubric,
@@ -257,6 +262,7 @@ class Application:
         with defer_interrupts():
             self._processes.terminate_all()
             self._http.close()
+            self._evaluation_http.close()
             self.backlot.close()
             self.state.close()
 

@@ -1,4 +1,4 @@
-"""Critic loop behaviour with a fake subject, fake critics and a scripted patch writer."""
+"""Critic loop behaviour with bounded decisions, feedback critics and a scripted patch writer."""
 
 import json
 import os
@@ -13,17 +13,19 @@ from attrs import evolve
 from kitbash.analytics.tracker import Tracker
 from kitbash.config import load_config
 from kitbash.critique.critics import PatchRequest, ReviewRequest
+from kitbash.critique.evaluator import EvaluationCase
 from kitbash.critique.history import DiffStatus
 from kitbash.critique.loop import CriticLoop, LoopReason
 from kitbash.critique.sessions import LoopSessions, ResumableLoop
 from kitbash.critique.store import CycleStore
 from kitbash.critique.subject import CriticBrief, Evaluation
-from kitbash.domain.critique import CriterionScore, CriticKind, Critique, Edit
+from kitbash.domain.critique import CriticKind, Critique, Edit
+from kitbash.domain.evaluation import CriterionAssessment, EvaluationResult
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
 from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, StateError
 from kitbash.infra.patching import make_diff
-from kitbash.infra.process import ProcessCancelled, current_registry, run_process
+from kitbash.infra.process import ProcessCancelled, ProcessRegistry, current_registry, run_process
 from kitbash.paths import OutputLayout
 from kitbash.store.state import StateDB
 from tests.helpers import process_gone, wait_for
@@ -63,17 +65,30 @@ class FakeSubject:
         return Evaluation(ok=True, facts={"score": score}, report={"cycle": cycle}, artifacts=artifacts)
 
 
+class FakeEvaluator:
+    def __init__(self, results=None) -> None:
+        self.results = results or {}
+        self.cases: list[EvaluationCase] = []
+
+    def evaluate(self, case, rubric, evidence):
+        self.cases.append(case)
+        value = evidence.facts.get("score") if evidence.ok and not evidence.error else None
+        criteria = self.results.get(case.iteration, (
+            CriterionAssessment("quality", value, confidence=1.0),
+        ))
+        return EvaluationResult(criteria=criteria, model="clef-flash-test", input_tokens=12, output_tokens=3)
+
+
 class FakeCritic:
-    def __init__(self, kind: CriticKind, *, fail_on: set[int] | None = None) -> None:
+    def __init__(self, kind: CriticKind) -> None:
         self.kind = kind
-        self.fail_on = fail_on or set()
+        self.requests: list[ReviewRequest] = []
 
     def review(self, request: ReviewRequest) -> Critique:
-        score = request.evaluation.facts.get("score", 0.0)
+        self.requests.append(request)
         return Critique(
             critic=self.kind.value,
-            summary=f"score {score}",
-            scores=(CriterionScore("quality", score, score >= 0.8 and request.cycle not in self.fail_on),),
+            summary="Improve the failed or uncertain criteria.",
             edits=(Edit(instruction="raise the score", source=self.kind.value),),
         )
 
@@ -103,9 +118,10 @@ def env(tmp_path):
     state.close()
 
 
-def make_loop(env, writer: ScriptedPatchWriter, *, rubric=RUBRIC, critics=None) -> CriticLoop:
+def make_loop(env, writer: ScriptedPatchWriter, *, rubric=RUBRIC, critics=None, evaluator=None) -> CriticLoop:
     state, layout, config = env
     return CriticLoop(
+        evaluator=evaluator if evaluator is not None else FakeEvaluator(),
         critics=critics if critics is not None else (FakeCritic(CriticKind.VISUAL), FakeCritic(CriticKind.TECHNICAL)),
         patch_writer=writer,
         rubric=rubric,
@@ -116,8 +132,13 @@ def make_loop(env, writer: ScriptedPatchWriter, *, rubric=RUBRIC, critics=None) 
 
 
 def test_passes_on_the_first_cycle_and_checkpoints_files(env):
-    loop = make_loop(env, ScriptedPatchWriter([]))
+    evaluator = FakeEvaluator()
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    loop = make_loop(env, ScriptedPatchWriter([]), evaluator=evaluator, critics=(critic,))
     outcome = loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+    assert critic.requests == [] and outcome.best.critiques == ()
+    assert evaluator.cases[0].evaluation_id == "modelling:crate:1"
+    assert evaluator.cases[0].iteration == 1 and evaluator.cases[0].previous == ()
     assert outcome.reason is LoopReason.PASSED and outcome.cycles_run == 1 and outcome.best.cycle == 1
     cycle_dir = env[1].cycle_dir(PhaseName.MODELLING, 1, "crate")
     assert {p.name for p in cycle_dir.iterdir()} >= {"script.py", "diff.patch", "critique.json", "report.json"}
@@ -135,6 +156,106 @@ def test_improves_through_patches_until_it_passes(env):
     assert "raise the score" in instructions and instructions[0] == "Make 'Quality' pass."  # failing criteria come first
     diffs = env[0].cycles.diffs(PhaseName.MODELLING, "crate")
     assert [d.status for d in diffs] == ["kept", "kept", "kept"]
+
+
+def test_failed_decision_calls_critic_then_patch_and_skips_critic_on_pass(env):
+    evaluator = FakeEvaluator()
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    writer = ScriptedPatchWriter([0.95])
+    outcome = make_loop(env, writer, evaluator=evaluator, critics=(critic,)).run(
+        FakeSubject(), initial_script=lambda: script(0.4),
+    )
+    assert outcome.passed and outcome.cycles_run == 2
+    assert [request.cycle for request in critic.requests] == [1]
+    assert critic.requests[0].scorecard.entries[0].score == 0.4
+    assert writer.requests[0].edits and '"quality"' in writer.requests[0].history
+    previous = evaluator.cases[1].previous
+    assert len(previous) == 1 and previous[0]["iteration"] == 1 and previous[0]["status"] == "kept"
+    assert previous[0]["scorecard"]["criteria"]["quality"]["raw_score"] == 0.4
+    assert outcome.best.scorecard.entries[0].delta == pytest.approx(0.55)
+    spans = [span for span in env[0].spans.spans() if span["name"] == "clef_flash"]
+    assert len(spans) == 2
+    assert all(span["meta"]["cost_usd"] is None and span["meta"]["model"] == "clef-flash-test" for span in spans)
+    assert sum(span["meta"]["tokens_in"] for span in spans) == 24
+    assert sum(span["meta"]["tokens_out"] for span in spans) == 6
+    events = [event for event in env[0].spans.events() if event["kind"] == "critic_cycle"]
+    assert [event["meta"]["evaluation_id"] for event in events] == ["modelling:crate:1", "modelling:crate:2"]
+    assert events[0]["meta"]["escalation"] == ["failed_criteria"]
+    assert events[1]["meta"]["escalation"] == []
+    entry = events[0]["meta"]["criteria"]["quality"]
+    assert entry["passed"] is False and entry["confidence"] == 1.0 and entry["threshold"] == 0.8
+    assert "notes" not in entry and "facts" not in events[0]["meta"]
+
+
+@pytest.mark.parametrize("value, confidence", [(None, None), (0.99, 0.2)])
+def test_uncertainty_escalates_and_new_evidence_can_recover(env, value, confidence):
+    evaluator = FakeEvaluator({1: (CriterionAssessment("quality", value, confidence=confidence),)})
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    writer = ScriptedPatchWriter([0.9])
+    outcome = make_loop(env, writer, evaluator=evaluator, critics=(critic,)).run(
+        FakeSubject(), initial_script=lambda: script(0.5),
+    )
+    assert outcome.passed and outcome.best.cycle == 2
+    assert len(critic.requests) == 1 and critic.requests[0].scorecard.unassessed()
+    assert any("Provide evidence" in edit.instruction for edit in writer.requests[0].edits)
+    delta = outcome.best.scorecard.entries[0].delta
+    if value is None:
+        assert delta is None
+    else:
+        assert delta == pytest.approx(0.9 - value)
+    assert not outcome.best.scorecard.regressions()
+    first = CycleStore(env[0].cycles, env[1]).load(FakeSubject()).results[1]
+    assert not first.eligible and first.scorecard.status == "uncertain"
+    assert first.scorecard.entries[0].score == value
+
+
+def test_provider_error_escalates_without_exposing_provider_payload(env):
+    class FailingEvaluator(FakeEvaluator):
+        def evaluate(self, case, rubric, evidence):
+            if case.iteration == 1:
+                raise KitbashError("secret-provider-payload")
+            return super().evaluate(case, rubric, evidence)
+
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    outcome = make_loop(env, ScriptedPatchWriter([0.95]), evaluator=FailingEvaluator(), critics=(critic,)).run(
+        FakeSubject(), initial_script=lambda: script(0.9),
+    )
+    assert outcome.passed and len(critic.requests) == 1
+    assert critic.requests[0].scorecard.unassessed()
+    assert "secret-provider-payload" not in json.dumps(env[0].spans.spans())
+    assert "secret-provider-payload" not in json.dumps(env[0].spans.events())
+    spans = [span for span in env[0].spans.spans() if span["name"] == "clef_flash"]
+    assert [span["kind"] for span in spans] == ["step", "llm"]
+    assert spans[0]["meta"]["model"] == "" and spans[0]["meta"]["cost_usd"] is None
+
+
+def test_failed_artifact_escalates_even_when_decisions_pass(env):
+    class MissingArtifact(FakeSubject):
+        def evaluate(self, path, cycle_dir, cycle):
+            evaluation = super().evaluate(path, cycle_dir, cycle)
+            if cycle == 1:
+                return evolve(evaluation, artifacts={key: value for key, value in evaluation.artifacts.items() if key != "usd"})
+            return evaluation
+
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    outcome = make_loop(env, ScriptedPatchWriter([0.95]), critics=(critic,)).run(
+        MissingArtifact(), initial_script=lambda: script(0.9),
+    )
+    assert outcome.passed and [request.cycle for request in critic.requests] == [1]
+    assert critic.requests[0].scorecard.passed
+
+
+def test_evaluator_mutation_cannot_replace_the_sealed_evidence(env):
+    class MutatingEvaluator(FakeEvaluator):
+        def evaluate(self, case, rubric, evidence):
+            Path(evidence.artifacts["blend"]).write_text("different build")
+            return super().evaluate(case, rubric, evidence)
+
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    loop = make_loop(env, ScriptedPatchWriter([]), evaluator=MutatingEvaluator(), critics=(critic,))
+    with pytest.raises(KitbashError, match="No eligible critic result"):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9), max_cycles=1)
+    assert len(critic.requests) == 1 and loop.best(FakeSubject()) is None
 
 
 def test_worse_patches_are_reverted_and_the_best_script_is_patched_next(env):
@@ -298,21 +419,16 @@ def test_a_session_without_its_own_cycles_falls_back_to_its_base(env):
     assert third.best.cycle == second.best.cycle and loop.best(subject).cycle == second.best.cycle
 
 
-@pytest.mark.parametrize("failure", ["criterion", "evaluation"])
-def test_passing_lower_score_replaces_failed_high_score(env, failure):
+def test_passing_lower_score_replaces_failed_evidence(env):
     class Subject(FakeSubject):
         def evaluate(self, path, cycle_dir, cycle):
             evaluation = super().evaluate(path, cycle_dir, cycle)
-            if failure == "evaluation" and cycle == 1:
+            if cycle == 1:
                 return evolve(evaluation, ok=False, error="USD export failed")
             return evaluation
 
-    critics = (
-        FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),
-        FakeCritic(CriticKind.TECHNICAL),
-    )
     writer = ScriptedPatchWriter([0.85])
-    loop = ResumableLoop(make_loop(env, writer, critics=critics), LoopSessions(env[0].meta))
+    loop = ResumableLoop(make_loop(env, writer), LoopSessions(env[0].meta))
     subject = Subject()
     outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
     assert outcome.passed and outcome.best.cycle == 2 and outcome.best.score == 0.85
@@ -348,17 +464,16 @@ def test_interrupted_session_resumes_the_exact_passing_cycle(env, tmp_path, budg
                 raise KeyboardInterrupt
 
     config = evolve(env[2], critic=evolve(env[2].critic, max_cycles=budget))
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
-    loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
+    loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.85])), LoopSessions(env[0].meta))
     subject = Subject()
     with pytest.raises(KeyboardInterrupt):
-        loop.run(subject, request="build", initial_script=lambda: script(0.95), observer=Observer())
+        loop.run(subject, request="build", initial_script=lambda: script(0.75), observer=Observer())
     assert not LoopSessions(env[0].meta).get(subject).done
 
     reopened = StateDB(tmp_path / "state.db")
     try:
         writer = ScriptedPatchWriter([])
-        resumed = ResumableLoop(make_loop((reopened, env[1], config), writer, critics=critics), LoopSessions(reopened.meta))
+        resumed = ResumableLoop(make_loop((reopened, env[1], config), writer), LoopSessions(reopened.meta))
         outcome = resumed.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote initial script"))
         assert outcome.reason is LoopReason.PASSED and outcome.best.cycle == 2
         assert outcome.best.score == 0.85 and outcome.best.passed and outcome.cycles_run == 2
@@ -458,9 +573,8 @@ def test_failed_feedback_session_does_not_fall_back_to_an_old_pass(env):
 
 def test_cached_pass_cannot_transfer_to_a_nonpassing_cycle(env):
     subject = FakeSubject()
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
-    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
-    outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85])), LoopSessions(env[0].meta))
+    outcome = loop.run(subject, request="build", initial_script=lambda: script(0.75))
     Path(outcome.best.evaluation.artifacts["usd"]).unlink()
     assert loop.best(subject).cycle == 1  # the only surviving candidate failed the rubric
     with pytest.raises(StateError, match="not eligible for a passed outcome"):
@@ -488,7 +602,7 @@ def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
     loop._critics = (RunningCritic(CriticKind.VISUAL), FatalCritic(CriticKind.TECHNICAL))
     try:
         with pytest.raises(LLMAccessError) as caught:
-            loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+            loop.run(FakeSubject(), initial_script=lambda: script(0.5))
         assert caught.value is original
         assert process_gone(int(pid_path.read_text()))
         with pytest.raises(ChildProcessError):
@@ -508,11 +622,11 @@ def test_last_critic_cancellation_leaves_cycle_pending_and_next_run_is_fresh(env
 
     loop = make_loop(env, ScriptedPatchWriter([]), critics=(CancellingCritic(CriticKind.VISUAL),))
     with pytest.raises(ProcessCancelled):
-        loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+        loop.run(FakeSubject(), initial_script=lambda: script(0.5))
     pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
     assert pending.status == "pending" and pending.passed is None
-    fresh = make_loop(env, ScriptedPatchWriter([]))
-    assert fresh.run(FakeSubject(), initial_script=lambda: script(0.9)).reason is LoopReason.PASSED
+    fresh = make_loop(env, ScriptedPatchWriter([0.9]))
+    assert fresh.run(FakeSubject(), initial_script=lambda: pytest.fail("rewrote pending script")).reason is LoopReason.PASSED
 
 
 @pytest.mark.parametrize("artifact", ["script", "blend", "usd", "preview"])
@@ -536,7 +650,7 @@ def test_mutation_during_independent_review_cannot_be_sealed_as_a_pass(env):
 
     loop = make_loop(env, ScriptedPatchWriter([]), critics=(MutatingCritic(CriticKind.VISUAL),))
     with pytest.raises(KitbashError, match="No eligible critic result"):
-        loop.run(FakeSubject(), initial_script=lambda: script(0.9), max_cycles=1)
+        loop.run(FakeSubject(), initial_script=lambda: script(0.5), max_cycles=1)
     assert loop.best(FakeSubject()) is None
 
 
@@ -599,3 +713,177 @@ def test_entire_evaluated_bundle_is_bound_including_textures(env, change):
     else:
         (build / "texture.png").unlink()
     assert loop.best(subject) is None
+
+
+REGRESSION_RUBRIC = Rubric.parse(
+    "| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n"
+    "| Quality | 1 | good enough | modelling |\n| Safety | 1 | safe | modelling |"
+)
+
+
+def decisions(quality, safety):
+    return tuple(
+        CriterionAssessment(name, value, confidence=1.0, probabilities={"false": 1.0 - value, "true": value})
+        for name, value in (("quality", quality), ("safety", safety))
+    )
+
+
+def test_regression_with_increased_aggregate_is_reverted_and_restored_after_restart(env, tmp_path):
+    initial_quality = 0.600000000123456
+    results = {
+        1: decisions(initial_quality, 0.94),
+        2: decisions(0.98, 0.85),  # Both pass and the aggregate rises, but safety regresses.
+        3: decisions(0.7, 0.95),
+        4: decisions(0.99, 0.97),
+    }
+
+    class InterruptAfterRegression:
+        def building(self, cycle):
+            pass
+
+        def critiquing(self, cycle):
+            pass
+
+        def evaluated(self, result):
+            if result.cycle == 2:
+                raise KeyboardInterrupt
+
+    subject = FakeSubject()
+    first_critic = FakeCritic(CriticKind.TECHNICAL)
+    loop = ResumableLoop(make_loop(
+        env, ScriptedPatchWriter([0.8]), rubric=REGRESSION_RUBRIC,
+        evaluator=FakeEvaluator(results), critics=(first_critic,),
+    ), LoopSessions(env[0].meta))
+    with pytest.raises(KeyboardInterrupt):
+        loop.run(subject, request="build", initial_script=lambda: script(0.6), observer=InterruptAfterRegression())
+    regressed = first_critic.requests[1].scorecard
+    assert regressed.overall > first_critic.requests[0].scorecard.overall
+    assert all(entry.passed for entry in regressed.entries)
+    assert not regressed.passed and [entry.criterion_id for entry in regressed.regressions()] == ["safety"]
+
+    reopened = StateDB(tmp_path / "state.db")
+    try:
+        restored = CycleStore(reopened.cycles, env[1]).load(subject)
+        assert restored.results[2].status is DiffStatus.REVERTED and not restored.results[2].eligible
+        assert restored.best().cycle == 1
+        assert restored.results[1].scorecard.entries[0].raw_score == initial_quality
+        safety = restored.results[2].scorecard.entries[1]
+        assert safety.regressed and safety.delta == pytest.approx(-0.09)
+        assert safety.confidence == 1.0 and safety.threshold == 0.8
+        assert safety.probabilities == {"false": 1.0 - 0.85, "true": 0.85}
+        evaluator = FakeEvaluator(results)
+        critic = FakeCritic(CriticKind.TECHNICAL)
+        writer = ScriptedPatchWriter([0.7, 0.99])
+        resumed = ResumableLoop(make_loop(
+            (reopened, env[1], env[2]), writer, rubric=REGRESSION_RUBRIC,
+            evaluator=evaluator, critics=(critic,),
+        ), LoopSessions(reopened.meta))
+        outcome = resumed.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote initial build"))
+        assert outcome.passed and outcome.best.cycle == 4 and outcome.cycles_run == 4
+        assert "SCORE = 0.6" in writer.requests[0].script
+        assert "cycle 02: reverted" in writer.requests[0].history and '"regressed": true' in writer.requests[0].history
+        case = evaluator.cases[0]
+        assert case.iteration == 3 and [entry["iteration"] for entry in case.previous] == [1, 2]
+        assert case.previous[1]["status"] == "reverted"
+        assert case.previous[1]["scorecard"]["criteria"]["safety"]["regressed"]
+        assert [request.cycle for request in critic.requests] == [3]
+        assert "cycle 02: reverted" in critic.requests[0].history
+        assert critic.requests[0].scorecard.entries[0].delta == pytest.approx(0.7 - initial_quality)
+        assert subject.evaluated == [1, 2, 3, 4]
+    finally:
+        reopened.close()
+
+
+def test_reverted_aggregate_gains_do_not_extend_the_stall_budget(env):
+    evaluator = FakeEvaluator({
+        1: decisions(0.5, 0.99),
+        2: decisions(0.9, 0.9),
+        3: decisions(0.99, 0.85),
+    })
+    outcome = make_loop(env, ScriptedPatchWriter([0.7, 0.8]), rubric=REGRESSION_RUBRIC, evaluator=evaluator).run(
+        FakeSubject(), initial_script=lambda: script(0.6),
+    )
+    assert outcome.reason is LoopReason.STALLED and outcome.cycles_run == 3 and outcome.best.cycle == 1
+    assert [row.status for row in env[0].cycles.cycles(PhaseName.MODELLING, "crate")] == ["kept", "reverted", "reverted"]
+
+
+def test_feedback_rebaselines_decisions_without_erasing_previous_results(env):
+    evaluator = FakeEvaluator()
+    loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85]), evaluator=evaluator), LoopSessions(env[0].meta))
+    subject = FakeSubject()
+    loop.run(subject, request="first", initial_script=lambda: script(0.95))
+    outcome = loop.run(subject, request="feedback", feedback="make it taller", initial_script=lambda: script(0.95))
+    assert outcome.passed and outcome.best.cycle == 2
+    assert outcome.best.scorecard.entries[0].delta is None and not outcome.best.scorecard.regressions()
+    assert evaluator.cases[1].feedback == "make it taller"
+    assert evaluator.cases[1].previous[0]["scorecard"]["criteria"]["quality"]["raw_score"] == 0.95
+
+
+def test_lenient_aggregate_pass_still_escalates_failed_criterion(env):
+    config = evolve(env[2], critic=evolve(env[2].critic, require_all_pass=False))
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    outcome = make_loop(
+        (*env[:2], config), ScriptedPatchWriter([]), rubric=REGRESSION_RUBRIC,
+        evaluator=FakeEvaluator({1: decisions(0.7, 0.99)}), critics=(critic,),
+    ).run(FakeSubject(), initial_script=lambda: script(0.9))
+    assert outcome.passed and len(critic.requests) == 1
+    assert critic.requests[0].scorecard.passed and critic.requests[0].scorecard.failing()
+
+
+def test_machine_only_evaluation_is_not_counted_as_an_llm_call(env):
+    class MeasuredEvaluator:
+        def evaluate(self, case, rubric, evidence):
+            return EvaluationResult((CriterionAssessment("quality", 1.0, confidence=1.0, source="check"),))
+
+    outcome = make_loop(env, ScriptedPatchWriter([]), evaluator=MeasuredEvaluator()).run(
+        FakeSubject(), initial_script=lambda: script(0.9),
+    )
+    assert outcome.passed
+    spans = [span for span in env[0].spans.spans() if span["name"] == "clef_flash"]
+    assert len(spans) == 1 and spans[0]["kind"] == "step"
+    assert spans[0]["meta"]["tokens_in"] == spans[0]["meta"]["tokens_out"] == 0
+    assert spans[0]["meta"]["model"] == "" and spans[0]["meta"]["cost_usd"] is None
+
+
+def test_cancelled_clean_pass_remains_pending_without_calling_critics(env):
+    registry = ProcessRegistry()
+
+    class CancellingEvaluator(FakeEvaluator):
+        def evaluate(self, case, rubric, evidence):
+            result = super().evaluate(case, rubric, evidence)
+            current_registry().terminate_all()
+            return result
+
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    loop = make_loop(env, ScriptedPatchWriter([]), evaluator=CancellingEvaluator(), critics=(critic,))
+    with registry.bind(), pytest.raises(ProcessCancelled):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+    assert critic.requests == []
+    assert env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0].status == "pending"
+
+
+def test_known_dimension_regresses_even_when_prior_card_is_partial(env):
+    evaluator = FakeEvaluator({
+        1: (CriterionAssessment("quality", 0.94, confidence=1.0), CriterionAssessment("safety", 0.3, confidence=0.1)),
+        2: decisions(0.85, 0.99),
+        3: decisions(0.96, 1.0),
+    })
+    critic = FakeCritic(CriticKind.TECHNICAL)
+    subject = FakeSubject()
+    outcome = make_loop(
+        env, ScriptedPatchWriter([0.7, 0.9]), rubric=REGRESSION_RUBRIC,
+        evaluator=evaluator, critics=(critic,),
+    ).run(subject, initial_script=lambda: script(0.6))
+    assert outcome.passed and outcome.best.cycle == 3
+    assert [request.cycle for request in critic.requests] == [1, 2]
+    first, second = (request.scorecard for request in critic.requests)
+    assert first.unassessed() and second.overall > first.overall
+    assert all(entry.passed for entry in second.entries) and not second.passed
+    assert [entry.criterion_id for entry in second.regressions()] == ["quality"]
+    assert second.entries[0].delta == pytest.approx(-0.09)
+    assert second.entries[1].delta == pytest.approx(0.69)
+    restored = CycleStore(env[0].cycles, env[1]).load(subject)
+    assert not restored.results[1].eligible and not restored.results[2].eligible
+    # A partial prior is not a rollback destination, but its known dimensions still protect selection.
+    assert restored.results[2].status is DiffStatus.KEPT
+    assert evaluator.cases[2].previous[1]["scorecard"]["criteria"]["quality"]["regressed"]
