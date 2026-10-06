@@ -252,6 +252,9 @@ queued → referencing → generating → building ⇄ critiquing → awaiting_r
 - **Reuse:** identical inventory items (for example four matching chairs) are modelled once. Backlot
   matches found during the breakdown are proposed for reuse; `--no-interactive` accepts matches above
   `backlot.match_threshold`.
+  Sending a reused asset back for rework at the modelling gate clears its inventory reuse decision
+  together with the queued asset checkpoint. Resuming after a restart preserves the feedback and
+  models the asset from scratch instead of approving the rejected backlot asset again.
 
 The terminal shows a single `rich.Live` display: a progress table for every asset and a pinned review
 panel. The display pauses while you answer a prompt. Previews appear inline in kitty, Ghostty, iTerm2

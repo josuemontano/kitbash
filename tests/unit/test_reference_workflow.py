@@ -193,6 +193,69 @@ def test_approved_reuse_never_acquires_a_reference_or_generates(workflow):
     env.loop.run.assert_not_called()
 
 
+@pytest.mark.parametrize("feedback", ["", "Use a taller crate"])
+def test_rejected_reuse_survives_sqlite_reopen(workflow, sample_inventory_dict, feedback):
+    env = workflow
+    inventory = Inventory.from_dict(sample_inventory_dict)
+    inventory = evolve(inventory, items=tuple(evolve(item, reuse_backlot_id=f"backlot-{item.id}") for item in inventory.items))
+    env.state.inventory.save(inventory)
+    board = env.phase._board(inventory)
+    board.update(env.item.id, feedback=("Keep the pine material",))
+    env.phase._reopen(board, env.item.id, feedback)
+    expected_notes = ("Keep the pine material", feedback) if feedback else ("Keep the pine material",)
+    queued = board.get(env.item.id)
+    assert queued.state is S.QUEUED and not queued.reused and queued.backlot_id is None
+    assert queued.feedback == expected_notes
+    env.state.close()
+
+    state = StateDB(env.layout.state_db)
+    try:
+        restored = state.inventory.load()
+        assert restored == inventory.replace_item(evolve(inventory.item(env.item.id), reuse_backlot_id=None))
+        tracker = Tracker(state.spans)
+        phase = ModellingPhase(env.agent, env.loop, Mock(), state, AutoPilot(), env.dashboard, tracker, env.config)
+        resumed = phase._board(restored)
+        assert resumed.get(env.item.id) == queued
+        other = resumed.get(inventory.items[1].id)
+        assert other.state is S.APPROVED and other.reused and other.backlot_id == inventory.items[1].reuse_backlot_id
+
+        pipeline = AssetPipeline(resumed, restored, env.agent, env.loop, tracker)
+        pending = pipeline.advance(env.item.id)
+        assert pending.state is S.INPUT_NEEDED and pending.feedback == expected_notes
+        assert not pending.reused and pending.backlot_id is None
+
+        # A later, explicit breakdown decision must still be able to select a new reuse.
+        replacement = restored.replace_item(evolve(restored.item(env.item.id), reuse_backlot_id="replacement-crate"))
+        state.inventory.save(replacement)
+        accepted = phase._board(state.inventory.load()).get(env.item.id)
+        assert accepted.state is S.APPROVED and accepted.reused and accepted.backlot_id == "replacement-crate"
+    finally:
+        state.close()
+
+
+def test_interrupted_reuse_rejection_rolls_back_inventory_and_checkpoint(workflow, monkeypatch):
+    env = workflow
+    inventory = evolve(env.inventory, items=(evolve(env.item, reuse_backlot_id="approved-crate"),))
+    env.state.inventory.save(inventory)
+    board = env.phase._board(inventory)
+    original = board.get(env.item.id)
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(env.state.assets, "add_transition", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        env.phase._reopen(board, env.item.id, "Use a taller crate")
+    env.state.close()
+
+    state = StateDB(env.layout.state_db)
+    try:
+        assert state.inventory.load() == inventory
+        assert state.assets.get(env.item.id) == original
+    finally:
+        state.close()
+
+
 def test_input_prompts_run_on_main_thread(workflow):
     env = workflow
     threads = []

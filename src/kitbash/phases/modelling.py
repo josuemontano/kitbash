@@ -237,7 +237,10 @@ class ModellingPhase:
         asset = board.get(asset_id)
         notes = (*asset.feedback, feedback) if feedback else asset.feedback
         if asset.reused:  # model it from scratch instead of reusing the backlot asset
-            board.reset(evolve(self._fresh_record(asset.id, asset.name, None), feedback=notes), "reuse dropped at the gate")
+            # Resume must see the inventory decision and its checkpoint together.
+            with self._state.db.transaction():
+                self._state.inventory.clear_reuse(asset_id)
+                board.reset(evolve(self._fresh_record(asset.id, asset.name, None), feedback=notes), "reuse dropped at the gate")
         elif asset.state is S.SKIPPED:
             board.transition(asset_id, S.QUEUED, "reopened", feedback=notes, extra={**asset.extra, "fresh_script": True})
         else:
