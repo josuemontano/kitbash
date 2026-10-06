@@ -4,6 +4,7 @@ import shlex
 import threading
 import time
 from collections.abc import Callable
+from io import UnsupportedOperation
 from typing import Any, ClassVar
 
 from rich.console import Group
@@ -17,6 +18,19 @@ from textual.widgets import Button, Footer, Input, RichLog, Static
 from kitbash.analytics.context import propagate
 from kitbash.infra.process import ProcessCancelled, defer_interrupts
 from kitbash.ui.dashboard import Dashboard, JobOutput, Question
+
+
+class _DescriptorlessCapture:
+    """Keep Textual output capture without advertising an invalid OS descriptor."""
+
+    def __init__(self, capture: Any) -> None:
+        self._capture = capture
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._capture, name)
+
+    def fileno(self) -> int:
+        raise UnsupportedOperation("Textual output capture has no file descriptor")
 
 
 class JobCard(Vertical):
@@ -106,6 +120,12 @@ class RunScreen(App):
 
     def __init__(self, dashboard: Dashboard, operation: Callable[[], Any], cancel: Callable[[], None]) -> None:
         super().__init__()
+        # Textual 6 returns -1 from fileno(); multiprocessing's resource tracker
+        # includes it in passfds when a lazy dependency first creates a lock.
+        # Descriptorless streams must raise instead. Leave all writes captured,
+        # without temporarily changing process-global stderr in worker threads.
+        self._capture_stdout = _DescriptorlessCapture(self._capture_stdout)
+        self._capture_stderr = _DescriptorlessCapture(self._capture_stderr)
         self.dashboard = dashboard
         self.operation = operation
         self.cancel = cancel
