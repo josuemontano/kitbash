@@ -37,6 +37,7 @@ from kitbash.infra.image_search import (
 )
 from kitbash.infra.omp import OmpClient
 from kitbash.infra.polyhaven import PolyHavenCatalog
+from kitbash.infra.process import ProcessRegistry, defer_interrupts
 from kitbash.infra.trellis import TrellisRunner
 from kitbash.interaction.autopilot import AutoPilot
 from kitbash.interaction.protocols import UserChannel
@@ -145,6 +146,7 @@ class Application:
         configure_logging(layout)
         self.config, self.layout, self.run_input, self.console = config, layout, run_input, console
         self.embedder: Embedder = make_embedder(config.embedding)
+        self._processes = ProcessRegistry()
         self.state = StateDB(layout.state_db, self.embedder)
         self.tracker = Tracker(self.state.spans)
         self.rubric = Rubric.load(layout.rubric_snapshot)
@@ -231,16 +233,24 @@ class Application:
         return SceneAgent(phases, state, tracker, AnalyticsReport(state, layout))
 
     def run(self, from_phase: PhaseName | None = None) -> dict:
-        report = self.preflight()
-        return self.scene_agent(report).run(from_phase)
+        # Each invocation has its own cancellation gate; resume/re-run in this interpreter is safe.
+        self._processes = ProcessRegistry()
+        with self._processes.bind():
+            try:
+                report = self.preflight()
+                return self.scene_agent(report).run(from_phase)
+            finally:
+                self._processes.terminate_all()
 
     def analytics(self) -> dict:
         return AnalyticsReport(self.state, self.layout).write()
 
     def close(self) -> None:
-        self._http.close()
-        self.backlot.close()
-        self.state.close()
+        with defer_interrupts():
+            self._processes.terminate_all()
+            self._http.close()
+            self.backlot.close()
+            self.state.close()
 
     def _providers(self) -> list[CandidateProvider]:
         factories = {

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from kitbash.analytics import context
 from kitbash.analytics.tracker import EventKind, SpanKind, Tracker
 from kitbash.errors import LLMAccessError
+from kitbash.infra.process import ProcessCancelled, ProcessRegistry, defer_interrupts
 from kitbash.pipeline.scheduler import Scheduler
 
 type WorkFn[T] = Callable[[str], T]
@@ -38,44 +39,65 @@ class WorkerPool[T]:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self.fatal: BaseException | None = None  # an error that must stop the whole run
+        self._fatal_lock = threading.Lock()
+        self._processes = ProcessRegistry()
 
     def start(self) -> None:
-        for index in range(self._size):
-            thread = threading.Thread(target=self._loop, name=f"worker-{index + 1}", args=(f"worker-{index + 1}",), daemon=True)
-            self._threads.append(thread)
-            thread.start()
+        with defer_interrupts():
+            for index in range(self._size):
+                if self._stop.is_set():
+                    break
+                thread = threading.Thread(target=self._loop, name=f"worker-{index + 1}", args=(f"worker-{index + 1}",))
+                self._threads.append(thread)
+                thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._scheduler.close()
+        self._processes.terminate_all()
 
-    def join(self, timeout: float | None = None) -> None:
+    def join(self) -> None:
+        """Do not release the services workers use until every worker has unwound."""
         for thread in self._threads:
-            thread.join(timeout)
+            if thread.ident is not None:
+                thread.join()
 
     def _loop(self, worker: str) -> None:
-        with context.bind(phase=self._phase, worker=worker):
-            while (asset_id := self._scheduler.next(self._stop, worker)) is not None:
-                with context.bind(asset_id=asset_id):
-                    try:
-                        outcome = self._run(asset_id)
-                        if outcome is not None:
-                            self._deliver(outcome)
-                    finally:
-                        self._scheduler.finished(asset_id)
+        try:
+            with self._processes.bind(), context.bind(phase=self._phase, worker=worker):
+                while (asset_id := self._scheduler.next(self._stop, worker)) is not None:
+                    with context.bind(asset_id=asset_id):
+                        try:
+                            self._processes.check_cancelled()
+                            outcome = self._run(asset_id)
+                            self._processes.check_cancelled()
+                            if outcome is not None and not self._stop.is_set():
+                                self._deliver(outcome)
+                        finally:
+                            self._scheduler.finished(asset_id)
+        except ProcessCancelled:
+            pass
+        except BaseException as exc:
+            with self._fatal_lock:
+                if self.fatal is None:
+                    self.fatal = exc
+            self.stop()
 
     def _run(self, asset_id: str) -> T | None:
         try:
             with self._tracker.span(SpanKind.ASSET_WORK, asset_id):
                 return self._work(asset_id)
-        except LLMAccessError as exc:
-            self.fatal = exc
-            self.stop()
-            return None
+        except LLMAccessError:
+            raise
         except Exception as exc:  # one broken asset must not stop the pool
+            self._processes.check_cancelled()
+            if self._stop.is_set():
+                return None
             self._tracker.event(EventKind.WARNING, "worker_failure", asset=asset_id, error=traceback.format_exc()[-2000:])
             try:
                 return self._on_failure(asset_id, exc)
+            except LLMAccessError:
+                raise
             except Exception:
                 self._tracker.event(EventKind.WARNING, "failure_handler_failed", asset=asset_id, error=traceback.format_exc()[-2000:])
                 return None

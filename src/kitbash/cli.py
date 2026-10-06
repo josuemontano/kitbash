@@ -17,7 +17,6 @@ from kitbash.domain.rubric import Rubric
 from kitbash.domain.run_input import RunInput
 from kitbash.errors import ConfigError, KitbashError
 from kitbash.infra.embeddings import make_embedder
-from kitbash.infra.process import REGISTRY
 from kitbash.paths import OutputLayout
 from kitbash.services.plan import Planner
 from kitbash.ui.summary import print_plan, print_summary
@@ -45,7 +44,6 @@ def _guard(action: Callable[[], Any]) -> Any:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
-        REGISTRY.terminate_all()
         console.print("\n[yellow]Interrupted. Progress is checkpointed; continue with `kitbash resume --output <dir>`.[/yellow]")
         raise typer.Exit(130) from None
 

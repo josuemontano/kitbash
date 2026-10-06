@@ -111,7 +111,8 @@ def test_failed_final_scorecard_cannot_complete_noninteractive_run(assembly_env)
         env.run(env.make_phase())
     assert env.state.phases.status(PhaseName.ASSEMBLY) is not PhaseStatus.DONE
     assert env.state.meta.get("run_finished_at") is None
-    report = json.loads((env.layout.scene_dir / "assembly.json").read_text())
+    assert not env.layout.scene_dir.exists()
+    report = json.loads((env.layout.phase_dir(PhaseName.ASSEMBLY) / "rejected" / "assembly.json").read_text())
     assert not report["scorecard"]["passed"]
     assert report["acceptance"]["status"] == "failed"
     assert not report["acceptance"]["published"]
@@ -181,6 +182,17 @@ def test_explicit_human_override_publishes_degraded_not_passed(assembly_env):
     assert report["totals"]["user_interventions"] == 1
 
 
+def test_explicit_degraded_override_can_publish_without_a_camera(assembly_env):
+    env = assembly_env
+    env.toolkit.facts["has_camera"] = False
+    env.fidelity.scene_facts["has_camera"] = False
+    report = env.run(env.make_phase(user=Human(GateAction.PUBLISH_DEGRADED)))
+    assert report["scene"]["acceptance"]["status"] == "overridden"
+    assert report["scene"]["acceptance"]["published"] and not report["scene"]["scorecard"]["passed"]
+    assert report["scene"]["final_render"] is None
+    assert env.layout.scene_blend.stat().st_size > 0 and env.layout.scene_usd.stat().st_size > 0
+
+
 @pytest.mark.parametrize("action, error", [(GateAction.APPROVE, StateError), (GateAction.ABORT, UserAbort)])
 def test_ordinary_approval_or_abort_cannot_override_failed_acceptance(assembly_env, action, error):
     env = assembly_env
@@ -189,6 +201,9 @@ def test_ordinary_approval_or_abort_cannot_override_failed_acceptance(assembly_e
         env.run(env.make_phase(user=Human(action)))
     assert not env.state.meta.get("assembly")["acceptance"]["published"]
     assert env.state.phases.status(PhaseName.ASSEMBLY) is not PhaseStatus.DONE
+    assert env.state.meta.get("assembly")["acceptance"]["status"] == "failed"
+    assert Path(env.state.meta.get("assembly")["scene_blend"]).is_file()
+    assert not env.layout.scene_dir.exists()
 
 
 def test_noninteractive_mode_never_requests_an_override(assembly_env):

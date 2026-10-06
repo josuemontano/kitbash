@@ -118,7 +118,6 @@ class OutputLayout:
         for directory in (
             self.input_dir,
             self.logs_dir,
-            self.scene_dir,
             self.analytics_dir,
             *(self.phase_dir(phase) for phase in PhaseName if phase is not PhaseName.ASSEMBLY),
         ):

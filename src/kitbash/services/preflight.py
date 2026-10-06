@@ -2,16 +2,18 @@
 
 import shutil
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from attrs import frozen
 
+from kitbash.analytics import context
 from kitbash.config import Config
 from kitbash.domain.roles import Role
 from kitbash.errors import LLMError, PreflightError
 from kitbash.infra.blender import BlenderCapabilities, BlenderRunner
 from kitbash.infra.omp import OmpClient, load_catalog, omp_version
+from kitbash.infra.process import current_registry, defer_interrupts
 from kitbash.llm.client import LLMRequest
 from kitbash.llm.prompts import TASK_MARKER
 
@@ -50,8 +52,20 @@ def ping_models(config: Config, omp: str, models: Mapping[str, Role], log_dir: P
             return f"Model {model!r} does not answer through omp: {exc.message}", exc.hint
         return None
 
-    with ThreadPoolExecutor(max_workers=max(1, len(models))) as pool:
-        answers = [a for a in pool.map(lambda pair: ping(*pair), models.items()) if a]
+    registry = current_registry()
+    with registry.bind(), ThreadPoolExecutor(max_workers=max(1, len(models))) as pool:
+        try:
+            registry.check_cancelled()
+            futures = [pool.submit(context.propagate(ping), model, role) for model, role in models.items()]
+            for future in as_completed(futures):
+                future.result()
+            answers = [answer for future in futures if (answer := future.result()) is not None]
+            registry.check_cancelled()
+        except BaseException:
+            with defer_interrupts():
+                registry.terminate_all()
+                pool.shutdown(wait=True, cancel_futures=True)
+            raise
     return [message for message, _ in answers], [hint for _, hint in answers if hint]
 
 

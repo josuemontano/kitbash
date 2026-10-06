@@ -1,13 +1,17 @@
+import sqlite3
 import time
 
 import pytest
+from attrs import evolve
 
 from kitbash.domain.assets import AssetRecord, AssetState, ReworkEntry
 from kitbash.domain.inventory import Inventory
 from kitbash.domain.phases import PhaseName, PhaseStatus
 from kitbash.errors import StateError
 from kitbash.infra.embeddings import HashingEmbedder
+from kitbash.store.database import Database
 from kitbash.store.state import CycleRow, DiffRow, StateDB
+from kitbash.store.vectors import VectorIndex
 
 
 @pytest.fixture
@@ -87,3 +91,145 @@ def test_vector_dimension_mismatch_is_reported(tmp_path):
     StateDB(tmp_path / "state.db", HashingEmbedder(32)).close()
     with pytest.raises(StateError, match="dimensions"):
         StateDB(tmp_path / "state.db", HashingEmbedder(48))
+
+
+def test_inventory_rejects_different_model_at_same_dimensions(tmp_path, sample_inventory_dict):
+    class OtherModel(HashingEmbedder):
+        @property
+        def name(self):
+            return "other-model"
+
+    path = tmp_path / "state.db"
+    state = StateDB(path, HashingEmbedder(64))
+    state.inventory.save(Inventory.from_dict(sample_inventory_dict))
+    state.close()
+    with pytest.raises(StateError):
+        StateDB(path, OtherModel(64))
+    reopened = StateDB(path, HashingEmbedder(64))
+    try:
+        assert reopened.inventory.load() == Inventory.from_dict(sample_inventory_dict)
+        assert reopened.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("failure", ["embedding", "dimensions", "count", "interruption"])
+def test_failed_inventory_save_preserves_metadata_and_search(state, sample_inventory_dict, monkeypatch, failure):
+    original = Inventory.from_dict(sample_inventory_dict)
+    state.inventory.save(original)
+    replacement = evolve(
+        original,
+        scene=evolve(original.scene, description="A different scene"),
+        items=tuple(reversed(original.items)),
+    )
+    embed = state.inventory._embedder.embed
+
+    def broken(texts):
+        if failure == "embedding":
+            raise RuntimeError("embedding unavailable")
+        vectors = embed(texts)
+        if failure == "dimensions":
+            vectors[-1] = [1.0]
+        elif failure == "count":
+            vectors.pop()
+        return vectors
+
+    clear = state.inventory._index.clear
+
+    def interrupt():
+        clear()
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state.inventory._embedder, "embed", broken)
+        if failure == "interruption":
+            patch.setattr(state.inventory._index, "clear", interrupt)
+        with pytest.raises((RuntimeError, StateError, ValueError, KeyboardInterrupt)):
+            state.inventory.save(replacement)
+    assert state.inventory.load() == original
+    assert state.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+    assert state.inventory.search("slatted pine crate", k=1)[0][0] == "wooden_crate"
+
+
+def test_inventory_search_does_not_transfer_scores_to_reused_rowids(state, sample_inventory_dict, monkeypatch):
+    original = Inventory.from_dict(sample_inventory_dict)
+    state.inventory.save(original)
+    writer = StateDB(state.db.path, HashingEmbedder(64))
+    nearest = state.inventory._index.nearest
+
+    def replace_after_nearest(vector, k):
+        result = nearest(vector, k)
+        writer.inventory.save(evolve(original, items=tuple(reversed(original.items))))
+        return result
+
+    monkeypatch.setattr(state.inventory._index, "nearest", replace_after_nearest)
+    try:
+        assert state.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+        assert writer.inventory.search("white coffee mug", k=1)[0][0] == "ceramic_mug"
+    finally:
+        writer.close()
+
+
+def test_nested_vector_savepoint_rolls_back_without_losing_outer_work(tmp_path):
+    db = Database(tmp_path / "vectors.db")
+    try:
+        index = VectorIndex(db, "test_vec", 2, "original")
+        index.upsert(1, [1.0, 0.0])
+        with db.transaction():
+            index.upsert(2, [0.0, 1.0])
+            with pytest.raises(KeyboardInterrupt), db.transaction():
+                index.upsert(1, [0.0, 1.0])
+                raise KeyboardInterrupt
+        hits = index.nearest([1.0, 0.0], 2)
+        assert [(hit.rowid, hit.similarity) for hit in hits] == [(1, 1.0), (2, 0.0)]
+    finally:
+        db.close()
+
+
+def test_failed_vector_replacement_keeps_live_index_usable(tmp_path):
+    db = Database(tmp_path / "vectors.db")
+    try:
+        original = VectorIndex(db, "test_vec", 2, "original")
+        original.upsert(1, [1.0, 0.0])
+        replacement = VectorIndex(db, "test_vec", 3, "replacement", rebuild=True)
+        with pytest.raises(StateError):
+            replacement.replace([(1, [0.0, 1.0, 0.0]), (2, [1.0])])
+        assert original.nearest([1.0, 0.0], 1)[0].similarity == 1.0
+        original.upsert(2, [0.0, 1.0])
+        assert original.nearest([0.0, 1.0], 1)[0].rowid == 2
+        with pytest.raises(StateError):
+            replacement.nearest([0.0, 1.0, 0.0], 1)
+    finally:
+        db.close()
+
+
+def test_nested_transaction_preserves_sqlite_rollback_error(tmp_path):
+    db = Database(tmp_path / "rollback.db")
+    try:
+        db.execute("CREATE TABLE items (id INTEGER UNIQUE ON CONFLICT ROLLBACK)")
+        with pytest.raises(sqlite3.IntegrityError), db.transaction():
+            db.execute("INSERT INTO items VALUES (1)")
+            with db.transaction():
+                db.execute("INSERT INTO items VALUES (1)")
+        assert db.query("SELECT id FROM items") == []
+        with db.transaction():
+            db.execute("INSERT INTO items VALUES (2)")
+        assert db.one("SELECT id FROM items")["id"] == 2
+    finally:
+        db.close()
+
+
+def test_database_constructor_closes_connection_on_extension_failure(tmp_path, monkeypatch):
+    import kitbash.store.database as module
+
+    connections = []
+
+    def fail(connection):
+        connections.append(connection)
+        raise sqlite3.OperationalError("extension unavailable")
+
+    monkeypatch.setattr(module.sqlite_vec, "load", fail)
+    with pytest.raises(StateError):
+        Database(tmp_path / "failed.db")
+    with pytest.raises(sqlite3.ProgrammingError):
+        connections[0].execute("SELECT 1")

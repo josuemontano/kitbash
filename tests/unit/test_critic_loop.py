@@ -1,7 +1,10 @@
 """Critic loop behaviour with a fake subject, fake critics and a scripted patch writer."""
 
 import json
+import os
 import re
+import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,10 +21,12 @@ from kitbash.critique.subject import CriticBrief, Evaluation
 from kitbash.domain.critique import CriterionScore, CriticKind, Critique, Edit
 from kitbash.domain.phases import PhaseName
 from kitbash.domain.rubric import Rubric
-from kitbash.errors import BlenderScriptError, KitbashError, StateError
+from kitbash.errors import BlenderScriptError, KitbashError, LLMAccessError, StateError
 from kitbash.infra.patching import make_diff
+from kitbash.infra.process import ProcessCancelled, current_registry, run_process
 from kitbash.paths import OutputLayout
 from kitbash.store.state import StateDB
+from tests.helpers import process_gone, wait_for
 
 RUBRIC = Rubric.parse("| criterion | weight | pass condition | applies to |\n|-|-|-|-|\n| Quality | 1 | good enough | modelling |")
 SCORE = re.compile(r"^SCORE = ([0-9.]+)$", re.MULTILINE)
@@ -287,7 +292,10 @@ def test_passing_lower_score_replaces_failed_high_score(env, failure):
                 return evolve(evaluation, ok=False, error="USD export failed")
             return evaluation
 
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),)
+    critics = (
+        FakeCritic(CriticKind.VISUAL, fail_on={1} if failure == "criterion" else set()),
+        FakeCritic(CriticKind.TECHNICAL),
+    )
     writer = ScriptedPatchWriter([0.85])
     loop = ResumableLoop(make_loop(env, writer, critics=critics), LoopSessions(env[0].meta))
     subject = Subject()
@@ -325,7 +333,7 @@ def test_interrupted_session_resumes_the_exact_passing_cycle(env, tmp_path, budg
                 raise KeyboardInterrupt
 
     config = evolve(env[2], critic=evolve(env[2].critic, max_cycles=budget))
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}),)
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
     loop = ResumableLoop(make_loop((*env[:2], config), ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
     subject = Subject()
     with pytest.raises(KeyboardInterrupt):
@@ -434,10 +442,58 @@ def test_failed_feedback_session_does_not_fall_back_to_an_old_pass(env):
 
 def test_cached_pass_cannot_transfer_to_a_nonpassing_cycle(env):
     subject = FakeSubject()
-    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}),)
+    critics = (FakeCritic(CriticKind.VISUAL, fail_on={1}), FakeCritic(CriticKind.TECHNICAL))
     loop = ResumableLoop(make_loop(env, ScriptedPatchWriter([0.85]), critics=critics), LoopSessions(env[0].meta))
     outcome = loop.run(subject, request="build", initial_script=lambda: script(0.95))
     Path(outcome.best.evaluation.artifacts["usd"]).unlink()
     assert loop.best(subject).cycle == 1  # the only surviving candidate failed the rubric
     with pytest.raises(StateError, match="not eligible for a passed outcome"):
         loop.run(subject, request="build", initial_script=lambda: pytest.fail("rewrote completed session"))
+
+
+def test_fatal_critic_cancels_earlier_running_critic_before_join(env, tmp_path):
+    pid_path = tmp_path / "critic-pid"
+    original = LLMAccessError("provider budget exhausted")
+
+    class RunningCritic(FakeCritic):
+        def review(self, request):
+            run_process([
+                sys.executable, "-c",
+                f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(60)",
+            ], timeout_s=90)
+            raise AssertionError("cancelled critic continued")
+
+    class FatalCritic(FakeCritic):
+        def review(self, request):
+            wait_for(lambda: pid_path.exists() and pid_path.stat().st_size)
+            raise original
+
+    loop = make_loop(env, ScriptedPatchWriter([]))
+    loop._critics = (RunningCritic(CriticKind.VISUAL), FatalCritic(CriticKind.TECHNICAL))
+    try:
+        with pytest.raises(LLMAccessError) as caught:
+            loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+        assert caught.value is original
+        assert process_gone(int(pid_path.read_text()))
+        with pytest.raises(ChildProcessError):
+            os.waitpid(int(pid_path.read_text()), os.WNOHANG)
+        pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+        assert pending.status == "pending" and pending.passed is None
+    finally:
+        if pid_path.exists() and not process_gone(int(pid_path.read_text())):
+            os.killpg(int(pid_path.read_text()), signal.SIGKILL)
+
+
+def test_last_critic_cancellation_leaves_cycle_pending_and_next_run_is_fresh(env):
+    class CancellingCritic(FakeCritic):
+        def review(self, request):
+            current_registry().terminate_all()
+            return super().review(request)
+
+    loop = make_loop(env, ScriptedPatchWriter([]), critics=(CancellingCritic(CriticKind.VISUAL),))
+    with pytest.raises(ProcessCancelled):
+        loop.run(FakeSubject(), initial_script=lambda: script(0.9))
+    pending = env[0].cycles.cycles(PhaseName.MODELLING, "crate")[0]
+    assert pending.status == "pending" and pending.passed is None
+    fresh = make_loop(env, ScriptedPatchWriter([]))
+    assert fresh.run(FakeSubject(), initial_script=lambda: script(0.9)).reason is LoopReason.PASSED
