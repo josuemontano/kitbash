@@ -27,6 +27,42 @@ def test_ids_are_unique_slugs_and_bad_documents_fail():
         Inventory.from_dict({"objects": []})
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_relationship_ids_take_priority_over_names(reverse_order):
+    items = [
+        {"id": "chair", "name": "Seat", "relationships": [{"type": "next_to", "target": "chair"}]},
+        {"id": "chair_02", "name": "Chair"},
+        {"id": "lamp", "relationships": [{"type": "next_to", "target": "chair"}]},
+    ]
+    inventory = Inventory.from_dict({"items": items[::-1] if reverse_order else items})
+
+    assert inventory.item("lamp").relationships[0].target == "chair"
+    assert inventory.item("chair").relationships == ()  # exact self-id must not fall back to another item's name
+    assert Inventory.from_dict(inventory.to_dict()) == inventory
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_relationship_names_resolve_only_when_unambiguous(reverse_order):
+    items = [
+        {"id": "chair_01", "name": "Dining Chair"},
+        {"id": "chair_02", "name": "DINING CHAIR"},
+        {"id": "chair_03", "name": "dining chair"},
+        {"id": "table", "name": "Side table"},
+        {"id": "lamp", "name": "Lamp", "relationships": [
+            {"type": "next_to", "target": "Dining Chair"},
+            {"type": "on", "target": "SIDE TABLE"},
+            {"type": "next_to", "target": "chair_02"},
+            {"type": "next_to", "target": "missing"},
+            {"type": "next_to", "target": "Lamp"},
+        ]},
+    ]
+    inventory = Inventory.from_dict({"items": items[::-1] if reverse_order else items})
+
+    assert [(rel.kind, rel.target) for rel in inventory.item("lamp").relationships] == [
+        ("on", "table"), ("next_to", "chair_02"),
+    ]
+
+
 def test_duplicates_are_modelled_once(sample_inventory_dict):
     data = dict(sample_inventory_dict)
     chair = {"name": "Dining chair", "description": "Oak chair", "dimensions_m": [0.45, 0.5, 0.9]}
@@ -36,6 +72,64 @@ def test_duplicates_are_modelled_once(sample_inventory_dict):
     assert [i.id for i in inventory.modelled_items()] == ["wooden_crate", "ceramic_mug", "chair_01"]
     without = inventory.without("wooden_crate")
     assert without.item("ceramic_mug").relationships == ()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {"materials_hint": ["metal", "brown"]},
+        {"materials_hint": []},
+        {"category": "decor"},
+        {"dimensions_m": [0.46, 0.5, 0.9]},
+        {"dimensions_m": [0.45, 0.51, 0.9]},
+        {"dimensions_m": [0.45, 0.5, 0.91]},
+    ],
+    ids=["material", "unknown-material", "category", "width", "depth", "height"],
+)
+def test_duplicate_linking_keeps_variants_separate(variant):
+    chair = {
+        "name": "Chair",
+        "description": "Dining chair",
+        "category": "furniture",
+        "materials_hint": ["wood", "brown"],
+        "dimensions_m": [0.45, 0.5, 0.9],
+    }
+    inventory = Inventory.from_dict({"items": [
+        {**chair, "id": "chair"},
+        {**chair, **variant, "id": "variant"},
+        {**chair, **variant, "id": "variant_copy"},
+    ]}).with_duplicates_linked()
+
+    assert [item.asset_key for item in inventory.items] == ["chair", "variant", "variant"]
+    assert [item.id for item in inventory.modelled_items()] == ["chair", "variant"]
+    assert inventory.with_duplicates_linked() == inventory
+
+
+def test_duplicate_linking_normalizes_identity_but_ignores_placement():
+    chair = {
+        "name": "Chair",
+        "description": "Dining chair",
+        "category": "furniture",
+        "materials_hint": ["wood", "brown"],
+        "dimensions_m": [0.45, 0.5, 0.9],
+    }
+    inventory = Inventory.from_dict({"items": [
+        {**chair, "id": "chair"},
+        {
+            **chair,
+            "id": "copy",
+            "name": " CHAIR ",
+            "description": " DINING CHAIR ",
+            "category": " FURNITURE ",
+            "materials_hint": [" BROWN ", "WOOD"],
+            "position": {"location_m": [2, 0, 0], "rotation_deg": [0, 0, 90]},
+        },
+    ]}).with_duplicates_linked()
+
+    assert inventory.item("copy").asset_key == "chair"
+    assert [item.id for item in inventory.modelled_items()] == ["chair"]
+    assert inventory.item("copy").position.location == (2, 0, 0)
+    assert inventory.item("copy").position.rotation_deg == (0, 0, 90)
 
 
 def test_unrecognized_items(sample_inventory_dict):
