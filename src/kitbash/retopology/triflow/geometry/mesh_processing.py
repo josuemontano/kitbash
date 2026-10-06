@@ -277,9 +277,10 @@ def get_precise_occupancy(mesh, resolution, verbose=True):
 def compute_sparse_sdf(mesh, occupied_indices, resolution, verbose=True):
     """Compute SDF values at voxel centers for a given set of occupied indices.
 
-    Uses mrmesh's ``findSignedDistances`` for the actual query and normalizes
-    the result by ``resolution`` so the SDF is expressed in normalized grid
-    units.
+    Uses mrmesh's ``findSignedDistances`` for distance magnitudes and generalized
+    winding numbers for signs. Closest-face normals can misclassify exterior
+    points near self-intersections, even after boundary holes are closed.
+    Distances are normalized by ``resolution``.
 
     Args:
         mesh: ``mrmesh.Mesh``.
@@ -300,6 +301,12 @@ def compute_sparse_sdf(mesh, occupied_indices, resolution, verbose=True):
     testPoints_mrmesh = mrmeshnumpy.fromNumpyArray(voxel_centers)
     signed_distances_mrmesh = mrmesh.findSignedDistances(mesh, testPoints_mrmesh)
     sdf_values = np.array(signed_distances_mrmesh.vec)
+    winding_numbers = mrmesh.std_vector_float()
+    mrmesh.FastWindingNumber(mesh).calcFromVector(
+        winding_numbers, testPoints_mrmesh, 2.0, mrmesh.FaceId(), mrmesh.func_bool_from_float(),
+    )
+    np.abs(sdf_values, out=sdf_values)
+    sdf_values[np.asarray(winding_numbers) > 0.5] *= -1
     sdf_values = sdf_values.reshape(-1, 1)
     sdf_values /= resolution
 
@@ -798,8 +805,8 @@ def process_one_mesh(
 ):
     """End-to-end preprocessing of a single mesh file for training or inference.
 
-    Loads a mesh, scales and discretizes it into a fine voxel grid, and
-    computes the sparse payload used throughout the codebase:
+    Loads a mesh, scales and discretizes it into a fine voxel grid, closes
+    boundary holes, and computes the sparse payload used throughout the codebase:
 
     * ``occ_fine`` / ``nvv_fine`` — source occupancy and vectors, included only
       when ``compute_source_field`` is true (inference generates its own NVF).
@@ -894,6 +901,28 @@ def process_one_mesh(
 
     if decimate_length > 0.0:
         decimate_mrmesh(mesh, min_edge_length=decimate_length)
+
+    # Repair before occupancy so both the encoder and proxy sample the closed
+    # surface, including new patches. Voxel repair handles fragmented Trellis
+    # meshes without triangulating hundreds of thousands of boundary loops.
+    hole_count = mesh.topology.findNumHoles()
+    if hole_count:
+        if verbose:
+            print(f"Closing {hole_count} boundary holes at one-voxel resolution...")
+        settings = mrmesh.RebuildMeshSettings()
+        settings.voxelSize = 1.0
+        settings.signMode = mrmesh.SignDetectionModeShort.HoleWindingNumber
+        settings.closeHolesInHoleWindingNumber = True
+        settings.preSubdivide = False
+        settings.decimate = False
+        mesh = mrmesh.rebuildMesh(mesh, settings)
+        if mesh.topology.numValidFaces() == 0:
+            raise ValueError("Input mesh has no enclosed surface after repair")
+        # Voxel extraction can leave a few residual boundary loops.
+        fill_hole_mrmesh(mesh)
+        if mesh.topology.findNumHoles():
+            raise ValueError("Input mesh still has boundary holes after surface repair")
+        mesh.pack()
 
     verts_np = mrmeshnumpy.getNumpyVerts(mesh)
     faces_np = mrmeshnumpy.getNumpyFaces(mesh.topology)
