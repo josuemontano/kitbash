@@ -71,17 +71,16 @@ log = logging.getLogger("kitbash")
 def create_workspace(
     output: Path, run_input: RunInput, config_path: Path | None, rubric_path: Path | None, overrides: Mapping[str, Any]
 ) -> tuple[Config, OutputLayout, RunInput]:
-    """Validate everything, then snapshot config, rubric and input into a (new or matching) output dir."""
+    """Validate and snapshot a new run; existing run files must only be opened through resume."""
+    layout = OutputLayout.at(output)
+    if any(path.exists() for path in (layout.state_db, layout.config_snapshot, layout.rubric_snapshot)):
+        raise ConfigError(
+            f"{layout.root} already contains kitbash run files",
+            hint="Use `kitbash resume --output ...` to continue it, or choose another --output.",
+        )
     config = load_config(config_path, overrides)
     rubric_source = rubric_path or default_rubric_path()
     Rubric.load(rubric_source)
-    layout = OutputLayout.at(output)
-    stored = _stored_input(layout)
-    if stored and not _same_input(stored, run_input):
-        raise ConfigError(
-            f"{layout.root} already holds a run for {stored.describe()}",
-            hint="Use `kitbash resume --output ...` to continue it, or choose another --output.",
-        )
     layout.create()
     local_input = _copy_input(layout, run_input)
     layout.config_snapshot.write_text(config.snapshot_toml(), encoding="utf-8")
@@ -119,14 +118,6 @@ def _copy_input(layout: OutputLayout, run_input: RunInput) -> RunInput:
     if run_input.image.resolve() != target.resolve():
         shutil.copy2(run_input.image, target)
     return RunInput(run_input.mode, image=target, prompt=None)
-
-
-def _same_input(stored: RunInput, new: RunInput) -> bool:
-    if stored.mode is not new.mode:
-        return False
-    if stored.image and new.image:
-        return stored.image.name.startswith("reference") and stored.image.read_bytes() == new.image.read_bytes()
-    return stored.prompt == new.prompt
 
 
 def configure_logging(layout: OutputLayout) -> None:
