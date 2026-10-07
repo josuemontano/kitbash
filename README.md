@@ -394,10 +394,11 @@ ratio, predicts a nearest-vertex vector field. Watershed clustering plus a const
 simplification then extract the mesh. kitbash vendors and adapts the code (`src/kitbash/retopology/triflow/`),
 so it runs in-process and no separate checkout is needed.
 
-Before SDF sampling, inputs with boundary holes are rebuilt at one fine-grid voxel resolution using
-MeshLib's hole-aware winding reconstruction, then any residual boundary loops are filled. Already-closed
-inputs skip this repair. This closes broken surface patches rather than capping a cup cavity or handle
-tunnel; features smaller than a voxel can change during repair.
+Before SDF sampling, inputs with boundary holes have inconsistent face winding corrected by ray parity,
+then are rebuilt at one fine-grid voxel resolution using MeshLib's hole-aware winding reconstruction.
+Any residual boundary loops are filled. Already-closed inputs skip this repair. This closes broken
+surface patches rather than capping a cup cavity or handle tunnel; features smaller than a voxel can
+change during repair.
 
 The SDF uses generalized winding numbers for inside/outside signs, avoiding false negative exterior
 distances near self-intersections. The encoder's samples include a halo around surface cells to cover

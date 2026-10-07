@@ -35,8 +35,9 @@ generated meshes in-process, on CUDA or Apple MPS (never the CPU).
 * Extraction follows the paper's SDF marching-cubes proxy rather than upstream inference's adaptive remesh.
   The sparse SDF includes a full narrow-band halo; watershed roots use transferred mesh displacements.
   Unseeded components receive their deterministic minimum-displacement vertex as a recovery root.
-* Before SDF sampling, open inputs are repaired with MeshLib's hole-aware voxel reconstruction at one fine-grid
-  voxel resolution, followed by filling residual boundary loops. Closed inputs skip reconstruction.
+* Before SDF sampling, open inputs have inverted faces corrected by ray parity, then are repaired with
+  MeshLib's hole-aware voxel reconstruction at one fine-grid voxel resolution, followed by filling residual
+  boundary loops. Closed inputs skip reconstruction.
   SDF signs use generalized winding numbers instead of the closest-face normal, which is unreliable near
   self-intersections. The encoder and extraction proxy share the repaired field.
 * Sparse pooling and neighbor maps are cached by coordinate set across diffusion steps; coordinate caches

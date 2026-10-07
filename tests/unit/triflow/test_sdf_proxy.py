@@ -81,8 +81,9 @@ def test_preparation_encloses_box_without_changing_input_frame(missing_face):
     assert output.volume == pytest.approx(1.0, rel=0.02)
 
 
+@pytest.mark.parametrize("mixed_winding", [False, True])
 @pytest.mark.parametrize("shape", ["cup", "torus"])
-def test_hole_repair_preserves_cup_cavity_and_handle_tunnel(shape):
+def test_hole_repair_preserves_cup_cavity_and_handle_tunnel(shape, mixed_winding):
     if shape == "cup":
         source = trimesh.creation.revolve(np.array([[0, 0], [2, 0], [2, 3], [1.6, 3], [1.6, 0.4], [0, 0.4]]))
         source = source.subdivide().subdivide()
@@ -97,6 +98,8 @@ def test_hole_repair_preserves_cup_cavity_and_handle_tunnel(shape):
     expected_volume = source.volume
     missing = np.argmin(np.linalg.norm(source.triangles_center - puncture, axis=1))
     source.update_faces(np.arange(len(source.faces)) != missing)
+    if mixed_winding:
+        source.faces[::3] = source.faces[::3, ::-1]
 
     results, prepared, _, metadata = _prepare(source)
     assert prepared.is_watertight and prepared.is_winding_consistent

@@ -909,6 +909,17 @@ def process_one_mesh(
     if hole_count:
         if verbose:
             print(f"Closing {hole_count} boundary holes at one-voxel resolution...")
+        # Only correct inconsistent winding: rays through an open boundary can
+        # misclassify correctly oriented faces on the opposite side of a hole.
+        if not discretized_mesh.is_winding_consistent:
+            flipped = mrmeshnumpy.getNumpyBitSet(mrmesh.findDisorientedFaces(mesh))
+            if flipped.any():
+                faces = mrmeshnumpy.getNumpyFaces(mesh.topology)
+                faces[flipped] = faces[flipped, ::-1]
+                oriented = pack_trimesh(trimesh.Trimesh(mrmeshnumpy.getNumpyVerts(mesh), faces, process=False))
+                mesh = mrmeshnumpy.meshFromFacesVerts(oriented.faces, oriented.vertices)
+                del oriented, faces
+            del flipped
         settings = mrmesh.RebuildMeshSettings()
         settings.voxelSize = 1.0
         settings.signMode = mrmesh.SignDetectionModeShort.HoleWindingNumber
