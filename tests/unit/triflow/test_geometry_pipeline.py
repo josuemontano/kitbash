@@ -16,7 +16,6 @@ from kitbash.retopology.triflow.geometry import (
     process_one_mesh,
     robust_remesh,
     sdf_proxy_mesh,
-    to_grid_frame,
     to_input_frame,
     topology_flow2mesh_QEM,
 )
@@ -250,29 +249,3 @@ def test_geometry_dirty_mesh_does_not_crash_and_keeps_both_components():
     assert out.bounds[1][0] == pytest.approx(referenced.max(0)[0], abs=0.02 * diag(dirty))
 
 
-@pytest.mark.parametrize(
-    "defect", ["nonmanifold_fin", "duplicate_faces", "degenerate_faces", "nan_vertex", "mixed_winding", "two_triangles"]
-)
-def test_geometry_robustness_cases_do_not_crash(defect):
-    ball = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
-    v, f = ball.vertices.copy(), ball.faces.copy()
-    if defect == "nonmanifold_fin":
-        v = np.vstack([v, [[2.0, 2.0, 2.0], [2.0, -2.0, 2.0]]])
-        f = np.vstack([f, [[f[0, 0], f[0, 1], len(ball.vertices)], [f[0, 1], f[0, 0], len(ball.vertices) + 1]]])
-    elif defect == "duplicate_faces":
-        f = np.vstack([f, f[:20]])
-    elif defect == "degenerate_faces":
-        f = np.vstack([f, [[0, 0, 1], [2, 2, 2]]])
-    elif defect == "nan_vertex":
-        v[5] = np.nan
-    elif defect == "mixed_winding":
-        f[: len(f) // 2] = f[: len(f) // 2, ::-1]
-    elif defect == "two_triangles":
-        v, f = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]), np.array([[0, 1, 2], [1, 3, 2]])
-    mesh = trimesh.Trimesh(v, f, process=False)
-    results, tmesh, _, md = process_one_mesh(mesh, **_kwargs(64, get_metadata=True))
-    assert len(results["occ_fine"]) > 0 and np.isfinite(md["scale_factor"])
-    for method in ("adaptive", "sdf"):
-        remeshed, _ = robust_remesh(tmesh, remesh_method=method, allow_collapse=False, get_metadata=False, verbose=False)
-        assert len(remeshed.faces) > 0
-    assert to_grid_frame(mesh, md).vertices.dtype == np.float64

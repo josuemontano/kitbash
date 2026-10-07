@@ -277,9 +277,10 @@ def get_precise_occupancy(mesh, resolution, verbose=True):
 def compute_sparse_sdf(mesh, occupied_indices, resolution, verbose=True):
     """Compute SDF values at voxel centers for a given set of occupied indices.
 
-    Uses mrmesh's ``findSignedDistances`` for the actual query and normalizes
-    the result by ``resolution`` so the SDF is expressed in normalized grid
-    units.
+    Uses mrmesh's ``findSignedDistances`` for distance magnitudes and generalized
+    winding numbers for signs. Closest-face normals can misclassify exterior
+    points near self-intersections, even after boundary holes are closed.
+    Distances are normalized by ``resolution``.
 
     Args:
         mesh: ``mrmesh.Mesh``.
@@ -300,6 +301,12 @@ def compute_sparse_sdf(mesh, occupied_indices, resolution, verbose=True):
     testPoints_mrmesh = mrmeshnumpy.fromNumpyArray(voxel_centers)
     signed_distances_mrmesh = mrmesh.findSignedDistances(mesh, testPoints_mrmesh)
     sdf_values = np.array(signed_distances_mrmesh.vec)
+    winding_numbers = mrmesh.std_vector_float()
+    mrmesh.FastWindingNumber(mesh).calcFromVector(
+        winding_numbers, testPoints_mrmesh, 2.0, mrmesh.FaceId(), mrmesh.func_bool_from_float(),
+    )
+    np.abs(sdf_values, out=sdf_values)
+    sdf_values[np.asarray(winding_numbers) > 0.5] *= -1
     sdf_values = sdf_values.reshape(-1, 1)
     sdf_values /= resolution
 
@@ -642,38 +649,13 @@ def robust_remesh(
     return mesh, metadata
 
 
-def _compute_fine_nvv(
-    mesh,
-    augmented_mrmesh,
-    res_fine,
-    augment,
-    remeshed_mesh,
-    augmented_mesh,
-    get_metadata,
-    verbose,
-):
-    """Compute fine-resolution occupancy + NVV for one processed mesh.
-
-    The occupancy mask is taken from the (possibly augmented) mrmesh, while
-    the NVV direction field is queried against the pre-augmentation
-    ``mesh`` — :func:`compute_sparse_direction` remaps each augmented voxel
-    back through the pre/post vertex pair when ``augment`` is ``True``.
-
-    Returns:
-        ``(occ_fine, dir_fine, dir_metadata)``.
-    """
+def _compute_fine_nvv(mesh, res_fine, get_metadata, verbose):
+    """Sample source occupancy and nearest-vertex vectors in the fine grid."""
     if verbose:
         print(f"\n--- Processing Fine Resolution ({res_fine}) ---")
-    occ_fine = get_precise_occupancy(augmented_mrmesh, res_fine, verbose=verbose)
+    occ_fine = get_precise_occupancy(mesh, res_fine, verbose=verbose)
     dir_fine, dir_metadata = compute_sparse_direction(
-        mesh,
-        occ_fine,
-        res_fine,
-        augmented=augment,
-        prev_verts=remeshed_mesh.vertices if augment else None,
-        post_verts=augmented_mesh.vertices if augment else None,
-        get_metadata=get_metadata,
-        verbose=verbose,
+        mesh, occ_fine, res_fine, get_metadata=get_metadata, verbose=verbose,
     )
     return occ_fine, dir_fine, dir_metadata
 
@@ -779,6 +761,153 @@ def load_mesh(input_file):
     )
 
 
+def _mesh_counts(mesh, stage):
+    """Describe a preparation stage without changing its geometry."""
+    return {
+        f"{stage}_num_vertices": len(mesh.vertices),
+        f"{stage}_num_faces": len(mesh.faces),
+        f"{stage}_num_edges": len(mesh.edges),
+    }
+
+
+def _repair_surface(mesh, discretized_mesh, verbose):
+    """Close input boundaries before either the encoder or proxy samples the surface."""
+    hole_count = mesh.topology.findNumHoles()
+    if not hole_count:
+        return mesh
+    if verbose:
+        print(f"Closing {hole_count} boundary holes at one-voxel resolution...")
+    # Only correct inconsistent winding: rays through an open boundary can
+    # misclassify correctly oriented faces on the opposite side of a hole.
+    if not discretized_mesh.is_winding_consistent:
+        flipped = mrmeshnumpy.getNumpyBitSet(mrmesh.findDisorientedFaces(mesh))
+        if flipped.any():
+            faces = mrmeshnumpy.getNumpyFaces(mesh.topology)
+            faces[flipped] = faces[flipped, ::-1]
+            oriented = pack_trimesh(trimesh.Trimesh(mrmeshnumpy.getNumpyVerts(mesh), faces, process=False))
+            mesh = mrmeshnumpy.meshFromFacesVerts(oriented.faces, oriented.vertices)
+            del oriented, faces
+        del flipped
+    # Voxel repair avoids triangulating hundreds of thousands of input loops.
+    settings = mrmesh.RebuildMeshSettings()
+    settings.voxelSize = 1.0
+    settings.signMode = mrmesh.SignDetectionModeShort.HoleWindingNumber
+    settings.closeHolesInHoleWindingNumber = True
+    settings.preSubdivide = False
+    settings.decimate = False
+    mesh = mrmesh.rebuildMesh(mesh, settings)
+    if mesh.topology.numValidFaces() == 0:
+        raise ValueError("Input mesh has no enclosed surface after repair")
+    # Voxel extraction can leave a few residual boundary loops.
+    fill_hole_mrmesh(mesh)
+    if mesh.topology.findNumHoles():
+        raise ValueError("Input mesh still has boundary holes after surface repair")
+    mesh.pack()
+    return mesh
+
+
+def _measure_preparation(mesh, discretized_mesh, prepared_mesh, remesh_method, verbose):
+    """Measure preparation error and optional remesh quality without replacing the input."""
+    points = mrmeshnumpy.fromNumpyArray(discretized_mesh.sample(100000))
+    distances = np.array(mrmesh.findSignedDistances(mesh, points).vec)
+    metadata = {
+        "decimated_chamfer_dist": np.mean(np.abs(distances)),
+        "decimated_max_dist": np.max(np.abs(distances)),
+    }
+    # Upstream remeshing is used only for statistics, never as the inference proxy.
+    _, remesh_metadata = robust_remesh(
+        prepared_mesh, remesh_voxel_size=1, remesh_method=remesh_method,
+        get_metadata=True, verbose=verbose,
+    )
+    metadata.update(remesh_metadata)
+    return metadata
+
+
+def _prepare_mesh(
+    input_file, *, res_fine, pad_voxels, round_verts, decimate_length,
+    vertex_merge_threshold, remesh_method, get_metadata, verbose,
+):
+    """Load an input into the grid frame and prepare its surface for field sampling."""
+    if verbose:
+        print(f"Loading {input_file}...")
+    try:
+        original = load_mesh(input_file)
+    except Exception as exc:
+        if verbose:
+            print(f"Error loading mesh {input_file}: {exc}")
+        raise
+    metadata = _mesh_counts(original, "original")
+    mesh = mrmeshnumpy.meshFromFacesVerts(original.faces, original.vertices)
+    mesh, frame_metadata = discretize_mesh(
+        mesh, res_fine, pad_voxels, merge_threshold=vertex_merge_threshold,
+        round_verts=round_verts, verbose=verbose,
+    )
+    metadata.update(frame_metadata)
+    discretized = trimesh.Trimesh(
+        vertices=mrmeshnumpy.getNumpyVerts(mesh), faces=mrmeshnumpy.getNumpyFaces(mesh.topology),
+    )
+    if decimate_length > 0.0:
+        decimate_mrmesh(mesh, min_edge_length=decimate_length)
+    mesh = _repair_surface(mesh, discretized, verbose)
+    prepared = trimesh.Trimesh(
+        vertices=mrmeshnumpy.getNumpyVerts(mesh), faces=mrmeshnumpy.getNumpyFaces(mesh.topology),
+    )
+    metadata.update(_mesh_counts(discretized, "discretized"))
+    metadata.update(_mesh_counts(prepared, "decimated"))
+    if get_metadata:
+        metadata.update(_measure_preparation(mesh, discretized, prepared, remesh_method, verbose))
+    return mesh, prepared, metadata
+
+
+def _sample_mesh_fields(mesh, res_fine, res_coarse, compute_source_field, get_metadata, verbose):
+    """Build the sparse SDF payload and optional source NVV from one prepared surface."""
+    results = {}
+    metadata = {}
+    if compute_source_field:
+        occ_fine, dir_fine, metadata = _compute_fine_nvv(mesh, res_fine, get_metadata, verbose)
+        results["occ_fine"] = occ_fine
+        results["nvv_fine"] = dir_fine
+    results["res_fine"] = res_fine
+    occ_coarse, sdf_coarse = _compute_coarse_sdf(
+        mesh, res_fine, res_coarse, int(res_fine / res_coarse), verbose,
+    )
+    results["occ_coarse"] = occ_coarse
+    results["sdf_coarse2fine"] = sdf_coarse
+    results["res_coarse"] = res_coarse
+    return results, metadata
+
+
+def _cast_mesh_fields(results):
+    """Compact sparse fields in place for storage, preserving resolution-dependent index widths."""
+    for name in ("nvv_fine", "sdf_coarse2fine"):
+        if name in results:
+            results[name] = results[name].astype(np.float16)
+    for name, resolution_key in (("occ_coarse", "res_coarse"), ("occ_fine", "res_fine")):
+        if name not in results:
+            continue
+        resolution = results[resolution_key]
+        if resolution <= 2**8:
+            dtype = np.uint8
+        elif resolution <= 2**16:
+            dtype = np.uint16
+        else:
+            dtype = np.uint32
+        results[name] = results[name].astype(dtype)
+
+
+def _sample_metadata(mesh, results):
+    """Describe sampled support and optional quad pairing for the prepared mesh."""
+    metadata = {"num_occ_coarse": len(results["occ_coarse"])}
+    if "occ_fine" in results:
+        metadata["num_occ_fine"] = len(results["occ_fine"])
+    # meshiki is optional; inference supplies an explicit quad-ratio condition.
+    try:
+        metadata["quad_ratio"] = compute_quad_ratio(mesh)
+    except ImportError:
+        metadata["quad_ratio"] = None
+    return metadata
+
+
 def process_one_mesh(
     input_file,
     res_coarse=64,
@@ -796,196 +925,49 @@ def process_one_mesh(
     verbose=True,
     compute_source_field=True,
 ):
-    """End-to-end preprocessing of a single mesh file for training or inference.
+    """Coordinate mesh preparation, field sampling, and output packing.
 
-    Loads a mesh, scales and discretizes it into a fine voxel grid, and
-    computes the sparse payload used throughout the codebase:
+    ``input_file`` accepts a mesh path, ``trimesh.Trimesh``, or scene. Preparation
+    preserves its axes, centers it in the fine grid, and closes boundary holes.
+    ``res_fine`` must be an integer multiple of ``res_coarse``; ``pad`` is measured
+    in coarse voxels. ``round_verts`` snaps to voxel centers, while
+    ``vertex_merge_threshold`` and ``decimate_length`` control grid-space merging
+    and short-edge collapse (zero disables each).
 
-    * ``occ_fine`` / ``nvv_fine`` — source occupancy and vectors, included only
-      when ``compute_source_field`` is true (inference generates its own NVF).
-    * ``occ_coarse`` — coarse-resolution occupancy mask.
-    * ``sdf_coarse2fine`` — per coarse voxel, ``r^3`` SDF values at its
-      fine children (packed into one row).
+    ``compute_source_field=False`` omits source occupancy/NVV for inference,
+    which instead voxelizes its SDF proxy. ``cast`` compacts the sparse arrays to
+    float16 and resolution-appropriate unsigned indices. ``get_metadata`` enables
+    distance, face-sampling, and remesh statistics; ``remesh_method`` selects the
+    statistics-only remesher. ``verbose`` controls stage progress output.
 
-    Training-time data augmentation is not part of the kitbash port (``augment=True`` raises ``NotImplementedError``).
+    Augmentation is not ported: ``augment=True`` raises ``NotImplementedError``;
+    ``augment_density`` and ``augment_strength`` are unused.
 
-    Coordinate frames (added for kitbash): the returned meshes and arrays are in the *grid frame* (voxel units, ``[0, res_fine]``;
-    axes are the input mesh's axes, no permutation). ``metadata`` carries ``scale_factor``, ``center`` and ``grid_resolution``
-    so that :func:`kitbash.retopology.triflow.geometry.frames.to_input_frame` can map any mesh in grid units back to the
-    input mesh's coordinates.
-
-    Args:
-        input_file: Path to the input mesh (anything ``trimesh.load`` understands: .obj/.glb/.ply/...; scenes are flattened by
-            concatenation with node transforms applied, raw vertex coordinates are kept, no Y-up/Z-up conversion). A
-            ``trimesh.Trimesh`` / ``trimesh.Scene`` is also accepted.
-        res_coarse: Coarse grid resolution.
-        res_fine: Fine grid resolution. Must be an integer multiple of
-            ``res_coarse``.
-        pad: Number of coarse voxels of padding around the bounding box.
-        round_verts: If ``True``, snap discretized vertices to voxel
-            centers.
-        decimate_length: Minimum edge length threshold for post-
-            discretization decimation. ``0`` disables decimation.
-        vertex_merge_threshold: Minimum vertex distance for the merge step
-            in :func:`discretize_mesh`.
-        augment: Not supported in kitbash; must be ``False``.
-        augment_density: Ignored (augmentation only).
-        augment_strength: Ignored (augmentation only).
-        remesh_method: ``"sdf"`` or ``"adaptive"``; passed through to
-            :func:`robust_remesh`.
-        cast: If ``True``, cast the output arrays to compact dtypes
-            (float16 / uint{8,16,32}) before returning to save memory
-            during on-disk caching.
-        get_metadata: If ``True``, populate the metadata dict with chamfer,
-            max-distance, face-sampling, and remesh statistics.
-        verbose: Print per-stage progress.
-        compute_source_field: Include source fine occupancy and NVV. Disable for
-            inference, which voxelizes its SDF proxy and generates the field.
-
-    Returns:
-        ``(results, trimesh_mesh, augmented_mesh, metadata)``:
-
-        * ``results``: dict of sparse tensors (``occ_fine``, ``nvv_fine``,
-          ``res_fine``, ``occ_coarse``, ``sdf_coarse2fine``, ``res_coarse``).
-        * ``trimesh_mesh``: the decimated discretized mesh as a
-          ``trimesh.Trimesh`` (float64, grid frame).
-        * ``augmented_mesh``: ``trimesh_mesh`` (the augmentation is not ported).
-        * ``metadata``: dict of per-sample statistics.
+    Returns ``(results, mesh, mesh, metadata)``. The two mesh entries are the same
+    prepared float64 grid-frame mesh. Results contain ``res_fine``, ``res_coarse``,
+    ``occ_coarse``, ``sdf_coarse2fine`` and, when requested, ``occ_fine``/``nvv_fine``.
+    Metadata includes counts and the frame transform (``scale_factor``, ``center``,
+    ``grid_resolution``) consumed by :func:`to_input_frame`.
     """
-    t0 = time.time()
-
-    ratio = int(res_fine / res_coarse)
-    results = {}
-    metadata = {}
-
+    started = time.time()
     if augment:
         raise NotImplementedError("mesh augmentation is training-only and was not ported to kitbash")
-
-    if verbose:
-        print(f"Loading {input_file}...")
-    try:
-        orig_trimesh_mesh = load_mesh(input_file)
-    except Exception as e:
-        if verbose:
-            print(f"Error loading mesh {input_file}: {e}")
-        raise e
-
-    metadata["original_num_vertices"] = len(orig_trimesh_mesh.vertices)
-    metadata["original_num_faces"] = len(orig_trimesh_mesh.faces)
-    metadata["original_num_edges"] = len(orig_trimesh_mesh.edges)
-
-    mesh = mrmeshnumpy.meshFromFacesVerts(
-        orig_trimesh_mesh.faces, orig_trimesh_mesh.vertices
+    mesh, prepared, metadata = _prepare_mesh(
+        input_file, res_fine=res_fine, pad_voxels=pad * int(res_fine / res_coarse),
+        round_verts=round_verts, decimate_length=decimate_length,
+        vertex_merge_threshold=vertex_merge_threshold, remesh_method=remesh_method,
+        get_metadata=get_metadata, verbose=verbose,
     )
-
-    mesh, metadata_discretize = discretize_mesh(
-        mesh,
-        res_fine,
-        pad * ratio,
-        merge_threshold=vertex_merge_threshold,
-        round_verts=round_verts,
-        verbose=verbose,
+    results, field_metadata = _sample_mesh_fields(
+        mesh, res_fine, res_coarse, compute_source_field, get_metadata, verbose,
     )
-    metadata.update(metadata_discretize)
-
-    verts_np = mrmeshnumpy.getNumpyVerts(mesh)
-    faces_np = mrmeshnumpy.getNumpyFaces(mesh.topology)
-    discretized_mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_np)
-
-    if decimate_length > 0.0:
-        decimate_mrmesh(mesh, min_edge_length=decimate_length)
-
-    verts_np = mrmeshnumpy.getNumpyVerts(mesh)
-    faces_np = mrmeshnumpy.getNumpyFaces(mesh.topology)
-    trimesh_mesh = trimesh.Trimesh(vertices=verts_np, faces=faces_np)
-
-    metadata["discretized_num_vertices"] = len(discretized_mesh.vertices)
-    metadata["discretized_num_faces"] = len(discretized_mesh.faces)
-    metadata["discretized_num_edges"] = len(discretized_mesh.edges)
-
-    metadata["decimated_num_vertices"] = len(trimesh_mesh.vertices)
-    metadata["decimated_num_faces"] = len(trimesh_mesh.faces)
-    metadata["decimated_num_edges"] = len(trimesh_mesh.edges)
-
-    if get_metadata:
-        orig_points = discretized_mesh.sample(100000)
-        testPoints_mrmesh = mrmeshnumpy.fromNumpyArray(orig_points)
-        signed_distances_mrmesh = mrmesh.findSignedDistances(mesh, testPoints_mrmesh)
-        sdf_values = np.array(signed_distances_mrmesh.vec)
-        chamfer_dist = np.mean(np.abs(sdf_values))
-        max_dist = np.max(np.abs(sdf_values))
-
-        metadata["decimated_chamfer_dist"] = chamfer_dist
-        metadata["decimated_max_dist"] = max_dist
-
-    # Modified for kitbash: the augmentation branch is dropped; upstream still ran a robust_remesh here for its metadata
-    # only (``remeshed_mesh`` is unused when ``augment`` is False), so it is skipped unless statistics were requested.
-    if get_metadata:
-        _, remesh_metadata = robust_remesh(
-            trimesh_mesh,
-            remesh_voxel_size=1,
-            remesh_method=remesh_method,
-            get_metadata=get_metadata,
-            verbose=verbose,
-        )
-        metadata.update(remesh_metadata)
-    augmented_mesh = trimesh_mesh
-    augmented_mrmesh = mesh
-
-    # --- Fine-resolution occupancy + NVV ---
-    if compute_source_field:
-        occ_fine, dir_fine, dir_metadata = _compute_fine_nvv(
-            mesh, augmented_mrmesh, res_fine, False, None, augmented_mesh, get_metadata, verbose,
-        )
-        metadata.update(dir_metadata)
-        results["occ_fine"] = occ_fine
-        results["nvv_fine"] = dir_fine
-    results["res_fine"] = res_fine
-
-    # --- Coarse-resolution occupancy + packed SDF payload ---
-    occ_coarse, sdf_coarse = _compute_coarse_sdf(
-        augmented_mrmesh, res_fine, res_coarse, ratio, verbose
-    )
-
-    results["occ_coarse"] = occ_coarse
-    results["sdf_coarse2fine"] = sdf_coarse
-    results["res_coarse"] = res_coarse
-
     if cast:
-        if compute_source_field:
-            results["nvv_fine"] = results["nvv_fine"].astype(np.float16)
-        results["sdf_coarse2fine"] = results["sdf_coarse2fine"].astype(np.float16)
-
-        if res_coarse <= 2**8:
-            results["occ_coarse"] = results["occ_coarse"].astype(np.uint8)
-        elif res_coarse <= 2**16:
-            results["occ_coarse"] = results["occ_coarse"].astype(np.uint16)
-        else:
-            results["occ_coarse"] = results["occ_coarse"].astype(np.uint32)
-
-        if compute_source_field:
-            if res_fine <= 2**8:
-                results["occ_fine"] = results["occ_fine"].astype(np.uint8)
-            elif res_fine <= 2**16:
-                results["occ_fine"] = results["occ_fine"].astype(np.uint16)
-            else:
-                results["occ_fine"] = results["occ_fine"].astype(np.uint32)
-
-    metadata["num_occ_coarse"] = len(results["occ_coarse"])
-    if compute_source_field:
-        metadata["num_occ_fine"] = len(results["occ_fine"])
-
-    # Modified for kitbash: meshiki is optional. Without it ``metadata["quad_ratio"]`` is ``None`` and callers must pass an
-    # explicit quad_ratio (inference.py's default does).
-    try:
-        metadata["quad_ratio"] = compute_quad_ratio(trimesh_mesh)
-    except ImportError:
-        metadata["quad_ratio"] = None
-
+        _cast_mesh_fields(results)
+    metadata.update(field_metadata)
+    metadata.update(_sample_metadata(prepared, results))
     if verbose:
-        print(f"Done processing mesh in {time.time() - t0:.2f} seconds.")
-
-    return results, trimesh_mesh, augmented_mesh, metadata
+        print(f"Done processing mesh in {time.time() - started:.2f} seconds.")
+    return results, prepared, prepared, metadata
 
 
 def compute_quad_ratio(mesh: trimesh.Trimesh):
