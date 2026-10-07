@@ -40,6 +40,8 @@ generated meshes in-process, on CUDA or Apple MPS (never the CPU).
   boundary loops. Closed inputs skip reconstruction.
   SDF signs use generalized winding numbers instead of the closest-face normal, which is unreliable near
   self-intersections. The encoder and extraction proxy share the repaired field.
+* `process_one_mesh` only coordinates preprocessing; grid preparation, surface repair, sparse field sampling,
+  compact casting, and metadata collection are separate helpers with an unchanged public return contract.
 * Sparse pooling and neighbor maps are cached by coordinate set across diffusion steps; coordinate caches
   release without cyclic garbage collection. Inference does not construct source NVF, or retain the unused
   SDF decoder and NVF encoder weights on the accelerator. Cached checkpoint hashes are verified before use.
